@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TREC RAGTIME 2025 Reproduction Playbook</title>
+  <style>
+    :root {
+      --bg: #f6f8fa;
+      --paper: #ffffff;
+      --ink: #17202a;
+      --muted: #596775;
+      --line: #d8e1ea;
+      --teal: #0f766e;
+      --blue: #2f5f9f;
+      --amber: #95690f;
+      --red: #9f3e43;
+      --soft: #eef3f7;
+      --soft-teal: #e7f4f2;
+      --shadow: 0 18px 50px rgba(31, 45, 61, 0.08);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    a { color: var(--blue); font-weight: 800; text-decoration-thickness: 0.08em; text-underline-offset: 0.16em; }
+    .layout { max-width: 1280px; margin: 0 auto; padding: 24px; }
+    header, section, .candidate-card { border: 1px solid var(--line); border-radius: 8px; background: var(--paper); box-shadow: var(--shadow); }
+    header { padding: 36px; margin-bottom: 20px; }
+    .kicker { margin: 0 0 10px; color: var(--teal); font-size: 0.78rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
+    h1, h2, h3, h4 { margin: 0 0 12px; line-height: 1.16; letter-spacing: 0; }
+    h1 { max-width: 940px; font-size: clamp(2.2rem, 5vw, 4.8rem); }
+    h2 { font-size: clamp(1.55rem, 3vw, 2.45rem); }
+    h3 { font-size: clamp(1.25rem, 2vw, 1.75rem); }
+    h4 { margin-top: 20px; font-size: 1rem; }
+    p, li { line-height: 1.62; }
+    .lede { max-width: 900px; color: var(--muted); font-size: 1.07rem; }
+    .hero-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 22px; }
+    .hero-card { padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; }
+    .hero-card b { display: block; font-size: 1.55rem; }
+    .hero-card span { color: var(--muted); font-size: 0.9rem; }
+    section { padding: 26px; margin-bottom: 20px; }
+    .toc { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .toc a { display: inline-flex; min-height: 34px; align-items: center; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--soft); color: #263443; text-decoration: none; font-size: 0.9rem; }
+    .callout { margin: 18px 0; padding: 16px; border-left: 4px solid var(--teal); border-radius: 8px; background: var(--soft-teal); }
+    .map-svg, .pipeline-svg { width: 100%; height: auto; display: block; }
+    .candidate-card { padding: 26px; margin-bottom: 22px; scroll-margin-top: 16px; }
+    .candidate-head { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 18px; align-items: start; }
+    .why { color: var(--muted); }
+    .score-badges { display: grid; gap: 8px; }
+    .score-badges span { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; color: var(--muted); }
+    .score-badges b { color: var(--ink); }
+    .card-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr); gap: 20px; margin-top: 12px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 10px; }
+    .subsection { min-width: 0; }
+    .pill-list { display: flex; flex-wrap: wrap; gap: 8px; }
+    .pill { display: inline-flex; align-items: center; min-height: 30px; padding: 5px 9px; border-radius: 999px; background: #edf3fb; color: #254c80; font-weight: 800; font-size: 0.82rem; }
+    pre { overflow-x: auto; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #f1f5f8; }
+    code { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88em; overflow-wrap: anywhere; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; margin: 14px 0; }
+    table { width: 100%; min-width: 760px; border-collapse: collapse; background: #fff; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 0.9rem; line-height: 1.42; }
+    th { background: #eef3f7; color: #263443; font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .small table { min-width: 700px; }
+    .compact table { min-width: 520px; }
+    .compact th, .compact td { font-size: 0.86rem; }
+    .muted { color: var(--muted); }
+    .run-desc { color: var(--muted); }
+    .source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .source-grid a { display: block; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; }
+    @media (max-width: 860px) {
+      .layout { padding: 14px; }
+      header, section, .candidate-card { padding: 20px; }
+      .hero-grid, .candidate-head, .card-grid, .detail-grid, .source-grid { grid-template-columns: 1fr; }
+      table { min-width: 680px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <header>
+      <p class="kicker">Reproduction-focused revision</p>
+      <h1>TREC RAGTIME 2025 Reproduction Playbook</h1>
+      <p class="lede">A clearer, selective report for deciding which 2025 RAGTIME systems are worth reproducing. This version drops the 148-run archive view and focuses on the strongest, most instructive methods: what they did, why they worked, what to build first, and where each method is likely to fail.</p>
+      <div class="hero-grid">
+        <div class="hero-card"><b>8</b><span>systems or system families worth studying</span></div>
+        <div class="hero-card"><b>4</b><span>primary reproduction targets</span></div>
+        <div class="hero-card"><b>0</b><span>giant run-id archive tables in the main reading path</span></div>
+      </div>
+      <nav class="toc">
+        <a href="#start">Start Here</a>
+        <a href="#implementation-depth">Implementation Detail</a>
+        <a href="#map">Method Map</a>
+        <a href="#order">Build Order</a>
+        <a href="#amu">AMU Minimal Baseline</a><a href="#genaius">GenAIus Question-Driven RAG</a><a href="#wuerag">WueRAG Citation-Strict English Pipeline</a><a href="#hltcoe-rerank">HLTCOE Rerank Fusion</a><a href="#crucible">HLTCOE Crucible Nugget-First Generation</a><a href="#idaccs">IDACCS Hybrid Extractive-LLM System</a><a href="#duth">DUTH Lightweight MLIR Fusion</a><a href="#agentic">LAS / Multiagent Research Workflows</a>
+        <a href="#sources">Sources</a>
+      </nav>
+    </header>
+
+    <section id="start">
+      <h2>Start With A Reproduction Ladder, Not The Leaderboard</h2>
+      <p><strong>The best next report should help you build.</strong> I would not start by cloning every high-scoring run. I would reproduce a small ladder: AMU as the baseline, GenAIus as the coverage-oriented planner, WueRAG as the citation-strict English system, HLTCOE rerank or Crucible as the high-score advanced target, then IDACCS/DUTH/agentic variants as focused component studies.</p>
+      <div class="callout"><strong>Recommended first three builds:</strong> AMU baseline for plumbing, GenAIus question-driven retrieval for multilingual coverage, and WueRAG for citation discipline. Those three expose most of the core RAGTIME trade-off before you spend weeks on multi-model rerank fusion or agentic workflows.</div>
+      <p><strong>Selection criteria.</strong> I kept systems that are either officially strong, methodologically distinct, or especially useful as a component you can reuse. I intentionally removed most dry-run and low-signal run IDs from the main body.</p>
+    </section>
+
+    <section id="implementation-depth">
+      <h2>What This Revision Adds</h2>
+      <p>This version is written as a build brief. Each system now separates strategy from implementation: source-grounded parameter values, prompt or API contracts, reproduction acceptance checks, and unresolved details that should be pinned before claiming a faithful clone.</p>
+      <div class="callout"><strong>How to use it:</strong> read the Reproduction Spec table first, then the Prompt / API Contracts, then the Acceptance Checks. The pseudocode is intentionally compact; the surrounding implementation notes carry the details that usually decide whether the reproduction is actually comparable.</div>
+    </section>
+
+    <section id="map">
+      <h2>Method Map: Payoff Versus Complexity</h2>
+      <p>The visual below is schematic, not an official score plot. It is meant to guide build sequencing: left-to-right means implementation complexity, bottom-to-top means expected reproduction payoff for a 2026-style system.</p>
+      <svg class="map-svg" viewBox="0 0 980 460" role="img" aria-label="Map of reproduction candidates by complexity and expected payoff"><line x1="70" y1="390" x2="930" y2="390" stroke="#9aa8b5" stroke-width="2"/><line x1="70" y1="390" x2="70" y2="40" stroke="#9aa8b5" stroke-width="2"/><text x="500" y="434" text-anchor="middle" font-size="14" font-weight="800">Implementation complexity →</text><text x="18" y="220" transform="rotate(-90 18 220)" text-anchor="middle" font-size="14" font-weight="800">Expected reproduction payoff →</text><circle cx="90" cy="240" r="16" fill="#2f5f9f" opacity="0.88"/><text x="114" y="246" font-size="13" font-weight="800" fill="#1f2b38">Dense baseline</text><text x="114" y="263" font-size="12" fill="#596775">AMU</text><circle cx="330" cy="320" r="16" fill="#0f766e" opacity="0.88"/><text x="354" y="326" font-size="13" font-weight="800" fill="#1f2b38">Question planning</text><text x="354" y="343" font-size="12" fill="#596775">GenAIus</text><circle cx="560" cy="265" r="16" fill="#0f766e" opacity="0.88"/><text x="584" y="271" font-size="13" font-weight="800" fill="#1f2b38">Citation strictness</text><text x="584" y="288" font-size="12" fill="#596775">WueRAG</text><circle cx="790" cy="320" r="16" fill="#0f766e" opacity="0.88"/><text x="814" y="326" font-size="13" font-weight="800" fill="#1f2b38">Rerank fusion</text><text x="814" y="343" font-size="12" fill="#596775">HLTCOE rerank</text><circle cx="720" cy="135" r="16" fill="#0f766e" opacity="0.88"/><text x="744" y="141" font-size="13" font-weight="800" fill="#1f2b38">Nugget-first</text><text x="744" y="158" font-size="12" fill="#596775">Crucible</text><circle cx="430" cy="90" r="16" fill="#2f5f9f" opacity="0.88"/><text x="454" y="96" font-size="13" font-weight="800" fill="#1f2b38">Hybrid extraction</text><text x="454" y="113" font-size="12" fill="#596775">IDACCS</text><circle cx="190" cy="75" r="16" fill="#2f5f9f" opacity="0.88"/><text x="214" y="81" font-size="13" font-weight="800" fill="#1f2b38">Lightweight MLIR</text><text x="214" y="98" font-size="12" fill="#596775">DUTH</text><circle cx="830" cy="60" r="16" fill="#2f5f9f" opacity="0.88"/><text x="854" y="66" font-size="13" font-weight="800" fill="#1f2b38">Agentic research</text><text x="854" y="83" font-size="12" fill="#596775">LAS / multiagent</text></svg>
+    </section>
+
+    <section id="order">
+      <h2>Build Order</h2>
+      <div class="table-wrap"><table><thead><tr><th>Order</th><th>System</th><th>Tier</th><th>Difficulty</th><th>Payoff</th><th>Timebox</th><th>Reason</th></tr></thead><tbody><tr><td>1</td><td><a href="#amu">AMU Minimal Baseline</a></td><td>Foundation</td><td>Low</td><td>Medium</td><td>1-2 days</td><td>Best first reproduction target: the method is simple, well described, and gives a sanity-check baseline for schema, citations, and multilingual retrieval.</td></tr><tr><td>2</td><td><a href="#genaius">GenAIus Question-Driven RAG</a></td><td>Primary</td><td>Medium</td><td>High</td><td>3-5 days</td><td>Most useful high-performing reproduction target: it turns report generation into explicit question planning, which is easy to inspect and adapt.</td></tr><tr><td>3</td><td><a href="#wuerag">WueRAG Citation-Strict English Pipeline</a></td><td>Primary</td><td>Medium</td><td>High</td><td>2-4 days</td><td>Best target if you want a clean citation-grounding system: it separates recall from local precision and aggressively removes unsupported sentences.</td></tr><tr><td>4</td><td><a href="#hltcoe-rerank">HLTCOE Rerank Fusion</a></td><td>Primary</td><td>High</td><td>High</td><td>1-2 weeks</td><td>Best leaderboard target for retrieval and long-report scoring, but harder to reproduce because the method is mostly documented through run descriptions and overview tables.</td></tr><tr><td>5</td><td><a href="#crucible">HLTCOE Crucible Nugget-First Generation</a></td><td>Primary</td><td>High</td><td>High</td><td>1-2 weeks</td><td>Best target for studying why coverage improves: it makes predicted nugget quality the main planning artifact before generation.</td></tr><tr><td>6</td><td><a href="#idaccs">IDACCS Hybrid Extractive-LLM System</a></td><td>Component</td><td>Medium</td><td>Medium</td><td>4-6 days</td><td>Best cost-controlled attribution target: it uses extraction as context compression, then lets an LLM refine or nuggetize the extract.</td></tr><tr><td>7</td><td><a href="#duth">DUTH Lightweight MLIR Fusion</a></td><td>Component</td><td>Low</td><td>Medium</td><td>2-3 days</td><td>Best lightweight retrieval component target: useful if you want a reproducible MLIR baseline without heavy agent or LLM generation machinery.</td></tr><tr><td>8</td><td><a href="#agentic">LAS / Multiagent Research Workflows</a></td><td>Later</td><td>High</td><td>Medium</td><td>1-2 weeks</td><td>Worth reproducing after the simpler systems: agentic workflows can improve coverage but are expensive, fragile, and harder to attribute.</td></tr></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>System Recipes</h2>
+      <p>Each card below has the method description rewritten as a reproducible recipe: pipeline, components, implementation skeleton, score evidence, and pitfalls.</p>
+    </section>
+
+    
+    <article class="candidate-card" id="amu">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Foundation reproduction target</p>
+          <h3>AMU Minimal Baseline</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Best first reproduction target: the method is simple, well described, and gives a sanity-check baseline for schema, citations, and multilingual retrieval.</p>
+        </div>
+        <div class="score-badges"><span><b>Low</b> difficulty</span><span><b>Medium</b> payoff</span><span><b>1-2 days</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-amu" viewBox="0 0 980 128"><title id="title-amu">Pipeline diagram for amu</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Chunk corpus</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">bge-m3 embeddings</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Qdrant search</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Reconstruct docs</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Schema-bound GPT</text><text x="735.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">report</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Chunk every document into roughly 5-10 sentence windows, with an 8k-character hard cap for edge cases.</li><li>Embed chunks with BAAI/bge-m3 and store them in Qdrant.</li><li>Build the query from title, background, and problem statement.</li><li>Retrieve top chunks by cosine similarity and reconstruct source documents from their chunks.</li><li>Generate JSON with GPT-5-family schema enforcement and citation dictionaries.</li><li>Validate character budget, JSON schema, and citation ids before scoring.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">Qdrant</span><span class="pill">BAAI/bge-m3</span><span class="pill">GPT-5 family</span><span class="pill">JSON schema</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>Dense-only retrieval undercovers facets, so nugget coverage is the expected weakness.</li><li>Citations must map back to document ids, not chunk ids.</li><li>Do not tune against this system; keep it as the baseline control.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>Corpus unit</td><td>Semantic chunks stored in JSONL-style batches</td></tr><tr><td>Chunk size</td><td>Approximately 5-10 sentences; edge-case maximum 8,000 characters</td></tr><tr><td>Embedding</td><td>BAAI/bge-m3 with GPU acceleration</td></tr><tr><td>Vector store</td><td>Qdrant collection</td></tr><tr><td>Similarity</td><td>Cosine similarity</td></tr><tr><td>Query fields</td><td>title + background + problem statement</td></tr><tr><td>Retrieval depth</td><td>Top 15 chunks</td></tr><tr><td>Reconstructed context</td><td>Maximum 5-7 original documents</td></tr><tr><td>Document reconstruction</td><td>Qdrant scroll API; sort by chunk id; concatenate chunks</td></tr><tr><td>Generation</td><td>GPT-5 or GPT-5-mini with Pydantic JSON schema enforcement</td></tr><tr><td>Output contract</td><td>Valid JSON; factual sentence plus citation dictionary {doc id: confidence}</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>Aggregate retrieved chunk scores by original document before deciding which documents enter the LLM context.</li><li>Pass each reconstructed source as Document ID, merged content, and relevance score; do not expose chunk ids as citation ids.</li><li>Set temperature to 0 and cap max tokens to about 75 percent of the requested character budget so the model has room but still respects the limit.</li><li>After decoding, normalize any list-style citations into dictionary form to match the RAGTIME submission schema.</li><li>Keep this implementation intentionally dense-only and no-rerank; its value is as a control system for ingestion, citation plumbing, and scoring.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>System prompt: output strictly valid JSON conforming to the report schema; every factual statement must be supported by provided context.</li><li>User prompt payload: title, background, problem statement, character limit, and reconstructed documents formatted with document id, content, and relevance score.</li><li>Citation rule: citations are dictionaries of document ids to confidence or score; never cite chunk identifiers.</li><li>Conclusion rule: include a standalone conclusion only if it is grounded in cited context.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>For a sample topic, confirm every cited id exists in the reconstructed document set.</li><li>Confirm top-15 chunk retrieval reconstructs no more than 7 documents unless you intentionally change the context budget.</li><li>Run the official JSON validator or an equivalent schema check before any scoring run.</li><li>Compare AMU-style dense retrieval against a simple BM25 baseline to quantify how much recall you lose before adding advanced methods.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>chunks = chunk_documents(corpus, by=&#x27;5-10 sentences&#x27;, max_chars=8000)
+qdrant.upsert(embed_bge_m3(chunks))
+query = title + background + problem_statement
+docs = reconstruct_documents(qdrant.search(embed(query), top_k=15))
+report = llm.generate_json(request, docs, schema=cited_report_schema)</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>The exact full system and user prompts are shown in the AMU paper, but any unavailable private prompt wording should be treated as non-essential if the schema, citation, and length constraints are preserved.</li><li>The paper does not make the exact Qdrant collection schema mandatory; document id, chunk id, language, text, and score metadata are the minimum needed for faithful behavior.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>Short multilingual human F1 0.113 for both AMU1ENG and AMU1ML; long Auto-ARGUE F1 0.525 for AMU1ENG and 0.478 for AMU1ML.</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short multilingual report generation</td><td><code>AMU1ML</code></td><td>Human F1</td><td>0.113</td><td>Human nugget 0.181, support 0.505; Auto F1 0.450</td></tr><tr><td>Short multilingual report generation</td><td><code>AMU1ENG</code></td><td>Human F1</td><td>0.113</td><td>Human nugget 0.178, support 0.496; Auto F1 0.478</td></tr><tr><td>Long report generation</td><td><code>AMU1ENG</code></td><td>Auto-ARGUE F1</td><td>0.525</td><td>Subtask M; nugget 0.447, support 0.789</td></tr><tr><td>Long report generation</td><td><code>AMU1ML</code></td><td>Auto-ARGUE F1</td><td>0.478</td><td>Subtask M; nugget 0.396, support 0.797</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#amu1eng"><code>AMU1ENG</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#amu1ml"><code>AMU1ML</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/AMU.ragtime.pdf">paper</a></p>
+      <ul class="run-desc"><li><code>AMU1ENG</code>: The entire retrieval phase was performed on a locally hosted vector database. During the process of inserting texts into the database, they were divided into chunks of approximately 5 to 10 sentences, depending on their length. In edge cases, the maximum chunk size was set to 8k characters. These chunks were then vectorized using the base model BAAI/BGE-m3 with GPU acceleration. Retrieval was conducted using a standard similarity search based on the cosine similarity score.</li><li><code>AMU1ML</code>: The entire retrieval phase was performed on a locally hosted vector database. During the process of inserting texts into the database, they were divided into chunks of approximately 5 to 10 sentences, depending on their length. In edge cases, the maximum chunk size was set to 8k characters. These chunks were then vectorized using the base model BAAI/BGE-m3 with GPU acceleration. Retrieval was conducted using a standard similarity search based on the cosine similarity score without reranking process</li></ul>
+    </article>
+    
+
+    <article class="candidate-card" id="genaius">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Primary reproduction target</p>
+          <h3>GenAIus Question-Driven RAG</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Most useful high-performing reproduction target: it turns report generation into explicit question planning, which is easy to inspect and adapt.</p>
+        </div>
+        <div class="score-badges"><span><b>Medium</b> difficulty</span><span><b>High</b> payoff</span><span><b>3-5 days</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-genaius" viewBox="0 0 980 128"><title id="title-genaius">Pipeline diagram for genaius</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Generate</text><text x="95.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">questions</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Retrieve per</text><text x="255.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">question</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Merge repeated</text><text x="415.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">docs</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Answer or extract</text><text x="575.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">nuggets</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Synthesize cited</text><text x="735.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">report</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Use GPT-4o or a strong open model to generate targeted questions from title, background, and problem statement.</li><li>Retrieve a fixed budget of documents per generated question through the search API or your own retriever.</li><li>Merge duplicate documents and boost documents retrieved by multiple questions.</li><li>For question mode, answer each question from retrieved evidence, then synthesize the final report.</li><li>For cluster mode, extract nuggets from top documents, cluster semantically similar nuggets, then write from clusters.</li><li>Compare question mode for coverage against cluster mode for citation support.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">Question generator</span><span class="pill">RAGTIME search API or local retriever</span><span class="pill">GPT-4o</span><span class="pill">Nugget clustering</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>Question quality is the control surface; broad or generic questions waste retrieval budget.</li><li>Per-question retrieval quotas need a cap so long question lists do not explode cost.</li><li>Cluster mode may ground better but lose breadth if only one document per question is used.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>Question inputs</td><td>title + background + description/problem statement; omit character limit for question generation</td></tr><tr><td>Question model</td><td>GPT-4o for the submitted report-generation variants; GPT-4o, gpt-oss, or Llama3.3-70B for MLIR variants</td></tr><tr><td>Question temperature</td><td>0.5</td></tr><tr><td>MLIR retrieval budget</td><td>Maximum 1,000 documents per report request</td></tr><tr><td>Per-question allocation</td><td>Equal quota per generated question; example: 20 questions means top 50 per question</td></tr><tr><td>Merge policy</td><td>Deduplicate by document id; sum relevance scores across repeated appearances</td></tr><tr><td>Question-mode evidence</td><td>Top 10 retrieved documents per generated question</td></tr><tr><td>Question-mode answer</td><td>Maximum 3 sentences per question, with a direct citation to the most relevant supporting document</td></tr><tr><td>Cluster-mode evidence</td><td>Top-ranked document per question; generate nuggets, cluster semantically with an LLM, then write from clusters</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>Treat question generation as the main control surface: log every generated question and attach downstream retrieved documents to it.</li><li>The score-summing merge is not just deduplication; it intentionally boosts documents retrieved by multiple question formulations.</li><li>For report generation, keep the intermediate answers or nuggets as auditable artifacts so you can diagnose whether failures came from planning, retrieval, or synthesis.</li><li>Question mode is likely the first reproduction because the intermediate Q/A table is easy to inspect; cluster mode is better for testing organization and citation support.</li><li>Keep MLIR and report-generation reproductions separate: MLIR uses the question-driven retrieval pipeline alone; report generation adds answer/nugget synthesis.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>Question prompt: generate a diverse set of targeted search questions from title, background, and description; reflect the requester&#x27;s role and audience; avoid generic or overly broad questions.</li><li>Question output format: one plain-text question per line, prefixed as Question &lt;number&gt;: &lt;question text&gt;.</li><li>Answer prompt: answer a generated question using only its retrieved evidence and the original request; keep each answer to at most three sentences and cite the best supporting document.</li><li>Cluster prompt: group nuggets by semantic similarity into distinct aspects or dimensions, discard irrelevant nuggets, and produce an interpretable label for each cluster.</li><li>Final prompt: write the report from original request plus Q/A answers or clustered nuggets; every sentence should carry an appropriate citation and respect the character limit.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>For each topic, verify total requested retrieval depth does not exceed 1,000 before deduplication.</li><li>Inspect whether repeated-document score summing changes the top 20 compared with simple max-score merging.</li><li>Measure coverage loss when using one document per question in cluster mode versus top 10 per question in question mode.</li><li>Store question, retrieved ids, intermediate answers/nuggets, and final report so failures are reproducible topic-by-topic.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>questions = llm.generate_questions(title, background, problem)
+for q in questions: results += search(q, k=budget_per_question)
+docs = merge_by_docid(results, score=sum_repeated_scores)
+answers = [answer_question(q, top_docs(q)) for q in questions]
+report = synthesize_cited_report(answers, docs)</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>The organizer search API internals were not publicly documented by GenAIus; a faithful reproduction should either use the same API if available or report the replacement retriever clearly.</li><li>The paper gives prompt figures, but exact deployed system messages and retry logic may not be fully recoverable.</li><li>The exact number of generated questions is model-dependent; reproduce by pinning model, temperature, and prompt, then logging generated question counts.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>genaius-cluster was second on short multilingual human F1 (0.137). genaius-question was second on long multilingual Auto-ARGUE F1 (0.678). GenAIus MLIR runs were also top-tier.</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short multilingual report generation</td><td><code>genaius-cluster</code></td><td>Human F1</td><td>0.137</td><td>Human nugget 0.218, support 0.521; Auto F1 0.493</td></tr><tr><td>Short multilingual report generation</td><td><code>genaius-question</code></td><td>Human F1</td><td>0.071</td><td>Human nugget 0.124, support 0.265; Auto F1 0.513</td></tr><tr><td>Long report generation</td><td><code>genaius-question</code></td><td>Auto-ARGUE F1</td><td>0.678</td><td>Subtask M; nugget 0.644, support 0.758</td></tr><tr><td>Long report generation</td><td><code>genaius-cluster</code></td><td>Auto-ARGUE F1</td><td>0.585</td><td>Subtask M; nugget 0.488, support 0.825</td></tr><tr><td>MLIR</td><td><code>genaius-llama3-3-70B</code></td><td>nDCG@20</td><td>0.589</td><td>MAP 0.359, R@1000 0.640, judged@20 0.974</td></tr><tr><td>MLIR</td><td><code>genaius-gpt-4o</code></td><td>nDCG@20</td><td>0.585</td><td>MAP 0.375, R@1000 0.642, judged@20 0.975</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#genaius-question"><code>genaius-question</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#genaius-cluster"><code>genaius-cluster</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#genaius-llama3-3-70b"><code>genaius-llama3-3-70B</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#genaius-gpt-4o"><code>genaius-gpt-4o</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/GenAIus.ragtime.pdf">paper</a></p>
+      <ul class="run-desc"><li><code>genaius-question</code>: (1) Generate questions using GPT-4o, (2) retrieve relevant documents for these questions using the provided search API</li><li><code>genaius-cluster</code>: (1) Generate questions using GPT-4o, (2) retrieve relevant documents for these questions using the provided search API</li><li><code>genaius-llama3-3-70B</code>: (1) Generate questions using Llama3.3-70B, (2) retrieve relevant documents for these questions using the provided search API, (3) merge the retrieved documents</li><li><code>genaius-gpt-4o</code>: (1) Generate questions using GPT-4o, (2) retrieve relevant documents for these questions using the provided search API, (3) merge the retrieved documents</li></ul>
+    </article>
+    
+
+    <article class="candidate-card" id="wuerag">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Primary reproduction target</p>
+          <h3>WueRAG Citation-Strict English Pipeline</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Best target if you want a clean citation-grounding system: it separates recall from local precision and aggressively removes unsupported sentences.</p>
+        </div>
+        <div class="score-badges"><span><b>Medium</b> difficulty</span><span><b>High</b> payoff</span><span><b>2-4 days</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-wuerag" viewBox="0 0 980 128"><title id="title-wuerag">Pipeline diagram for wuerag</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Query</text><text x="95.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">reformulation</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">API recall</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Temporary index</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Dense + BM25</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">RRF top passages</text><path d="M 810 63 L 820 63" stroke="#7b8794" stroke-width="2"/><path d="M 820 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="824" y="32" width="142" height="62" rx="10" fill="#eef3f7" stroke="#cbd8e3"/><text x="895.0" y="41" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38"></text><text x="895.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Citation-filtered</text><text x="895.0" y="73" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">report</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Reformulate the report request into a concise retrieval query.</li><li>Use the RAGTIME API for first-stage recall, restricted to English for this reproduction.</li><li>Build a per-topic temporary passage index from retrieved documents.</li><li>Run both dense all-MiniLM retrieval and BM25 over the temporary index.</li><li>Fuse dense and BM25 rankings with reciprocal rank fusion and pass top passages to GPT-4o.</li><li>Require citations after every factual sentence and drop any sentence with unresolved citations.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">RAGTIME API</span><span class="pill">BM25</span><span class="pill">all-MiniLM-L6-v2</span><span class="pill">RRF</span><span class="pill">GPT-4o</span><span class="pill">LlamaIndex-style citation mapping</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>Strict postprocessing can delete useful but weakly cited content, hurting coverage.</li><li>Single-query retrieval is brittle for multifaceted topics.</li><li>Three no-output topics in the paper suggest citation filtering needs fallback handling.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>Input fields</td><td>background + problem_statement + limit; title intentionally excluded</td></tr><tr><td>Query reformulation</td><td>Concise single-line search query; preserve actors, timeframe, and key details</td></tr><tr><td>Stage-1 recall</td><td>RAGTIME API, English subset</td></tr><tr><td>Stage-2 index</td><td>Per-topic temporary in-memory passage index built from retrieved documents</td></tr><tr><td>Dense retriever</td><td>sentence-transformers/all-MiniLM-L6-v2</td></tr><tr><td>Sparse retriever</td><td>BM25</td></tr><tr><td>Fusion</td><td>Reciprocal rank fusion over dense and BM25 rankings</td></tr><tr><td>Generation context</td><td>Top k=10 fused passages, with CitationQueryEngine selecting top 5</td></tr><tr><td>Generator</td><td>GPT-4o through LlamaIndex-style CitationQueryEngine</td></tr><tr><td>Postprocessing</td><td>Drop sentences without resolved bracket citations; map source numbers back to document ids</td></tr><tr><td>Length check</td><td>Hard assertion before writing results</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>Separate recall and precision exactly as the paper does: remote API first, then local topic-specific dense/sparse reranking.</li><li>The local index is per topic, not a global corpus index, so you can implement it cheaply and inspect it for each request.</li><li>Citation filtering is deliberately harsh; implement a no-output fallback or at least log topics where every sentence is removed.</li><li>Use a sentence splitter that preserves bracket citations; stripping citations too early will destroy the document-id mapping.</li><li>This is English-only in the submitted run, so use it as a citation-grounding baseline before extending multilingual coverage.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>Reformulation prompt: return only a search query; do not include phrases like create a report, explain, or should include.</li><li>Generation prompt: answer using only provided sources; every factual statement must end with a bracket citation such as [2].</li><li>Generation prompt: keep the answer under the supplied character limit and include no uncited facts.</li><li>Postprocessor contract: remove uncited sentences, resolve citation numbers to source document ids, strip bracket markers, and store citation dictionaries.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>On a held-out topic, verify every retained sentence has at least one citation id that resolves to a retrieved document.</li><li>Track sentence deletion rate; if it is high, inspect retrieval or citation prompt failures before changing the generator.</li><li>Confirm character budget is checked after citation-marker removal and before result serialization.</li><li>Compare nugget coverage before and after strict sentence deletion to quantify the faithfulness-recall trade-off.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>query = reformulate(request)
+docs = ragtime_api.search(query, subset=&#x27;eng&#x27;)
+passages = build_topic_index(docs)
+rank_dense = dense_retrieve(passages, query)
+rank_bm25 = bm25(passages, query)
+context = rrf(rank_dense, rank_bm25)[:10]
+report = drop_uncited_sentences(generate_with_required_citations(context))</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>The exact RAGTIME API response fields and any API-side ranking settings need to be mirrored or replaced explicitly.</li><li>The paper names LlamaIndex CitationQueryEngine behavior, but implementation details such as passage chunking and source-node metadata should be pinned in your reproduction.</li><li>The official paper reports three no-output topics; decide whether to reproduce that strictness or add a fallback as an experimental variant.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>Top short English human F1 row (0.107) and long English Auto-ARGUE F1 0.493; paper reports strong sentence support and explicit citation policy.</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short English report generation</td><td><code>WueRAG_2025_08_22</code></td><td>Human F1</td><td>0.107</td><td>Human nugget 0.152, support 0.530; Auto F1 0.466</td></tr><tr><td>Long report generation</td><td><code>WueRAG_2025_08_22</code></td><td>Auto-ARGUE F1</td><td>0.493</td><td>Subtask E; nugget 0.384, support 0.844</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#wuerag_2025_08_22"><code>WueRAG_2025_08_22</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/WueRAG.ragtime.pdf">paper</a></p>
+      <ul class="run-desc"><li><code>WueRAG_2025_08_22</code>: The retrieval process starts by reformulating the user query for better search relevance. Depending on configuration, the system either queries a remote RAGTIME API or searches local indices (for the last submission the RAGTIME API was used with subset set to &quot;eng&quot;). Retrieved documents are converted into a temporary index and processed via an embedding-based and BM25 retriever, in an hybrid setting.</li></ul>
+    </article>
+    
+
+    <article class="candidate-card" id="hltcoe-rerank">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Primary reproduction target</p>
+          <h3>HLTCOE Rerank Fusion</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Best leaderboard target for retrieval and long-report scoring, but harder to reproduce because the method is mostly documented through run descriptions and overview tables.</p>
+        </div>
+        <div class="score-badges"><span><b>High</b> difficulty</span><span><b>High</b> payoff</span><span><b>1-2 weeks</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-hltcoe-rerank" viewBox="0 0 980 128"><title id="title-hltcoe-rerank">Pipeline diagram for hltcoe-rerank</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">PLAID-X</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Qwen embeddings</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Multilingual LSR</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Rerank</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">RRF fusion</text><path d="M 810 63 L 820 63" stroke="#7b8794" stroke-width="2"/><path d="M 820 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="824" y="32" width="142" height="62" rx="10" fill="#eef3f7" stroke="#cbd8e3"/><text x="895.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Generator</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Assemble three first-stage or reranking signals: PLAID-X, Qwen-Embedding-8B, and multilingual LSR.</li><li>Use translations for reranking where available, but keep first-stage retrieval over original multilingual material when matching the run description.</li><li>Add pointwise or listwise rerankers such as jina-reranker-m0 or Qwen-based reranking.</li><li>Fuse rank lists with reciprocal rank fusion.</li><li>Feed the fused evidence set into a strong report generator, including GPT-5-family variants for the top long run.</li><li>Score retrieval and report generation separately so retrieval gains are not hidden by generation choices.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">PLAID-X</span><span class="pill">Qwen-Embedding-8B</span><span class="pill">multilingual LSR</span><span class="pill">jina-reranker-m0</span><span class="pill">RRF</span><span class="pill">GPT-5 family</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>This is the highest-scoring but least paper-transparent target.</li><li>Model availability, embedding dimensions, and translation use need to be pinned before reproduction.</li><li>Start with the MLIR run before full report generation.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>Evidence type</td><td>Run descriptions plus overview metrics; less paper-transparent than Crucible</td></tr><tr><td>Core retrieval signals</td><td>PLAID-X, Qwen-Embedding-8B, multilingual learned sparse retrieval</td></tr><tr><td>Top MLIR run</td><td>hltime-qwen-jina: fusion of jina-reranker-m0 and Qwen-Embedding-8B reranking over RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR</td></tr><tr><td>Top long run</td><td>hltime-gpt5.searcher: Searcher II pointwise reranking over RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR</td></tr><tr><td>Translation use</td><td>Translations used for reranking, not for first-stage retrieval, according to run description</td></tr><tr><td>Fusion</td><td>Reciprocal rank fusion</td></tr><tr><td>Generation</td><td>GPT-5-family for hltime-gpt5.searcher-style long report generation</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>Reproduce MLIR first because retrieval scores can be validated without the report generator confounding the result.</li><li>Keep each retrieval/rerank signal as a separate run file before fusion; this is the only way to debug whether RRF helps or just averages away a strong model.</li><li>Treat Searcher II, Qwen reranking, and jina-reranker-m0 as swappable layers with logged inputs and outputs.</li><li>When translations are used, log both original-language document ids and translated text ids so citation provenance remains on the original documents.</li><li>For the report-generation variant, freeze the fused retrieval set before changing generator prompts or model families.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>Reranker input contract: query or report request plus candidate document text; output a pointwise score or reordered list with stable document ids.</li><li>Fusion contract: accept independent ranked lists, not raw scores; use ranks so heterogeneous model scales do not require calibration.</li><li>Generator contract: consume the fused evidence set with original document ids preserved for citation mapping.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>Confirm you can reproduce a plausible MLIR ranking file with 1,000 documents per topic before any generation work.</li><li>Evaluate PLAID-X-only, Qwen-only, LSR-only, and fused variants to isolate the contribution of each signal.</li><li>Run an ablation with translations disabled during reranking to estimate how much of the gain depends on translation.</li><li>For long reports, score the same fused retrieval set with at least two generators to separate retrieval quality from generation quality.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>rankings = [plaidx(query), qwen_embed(query), multilingual_lsr(query)]
+reranked = [rerank_with_jina_or_qwen(r) for r in rankings]
+fused = rrf(reranked)
+report = generate_report(request, fused[:k])</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>Searcher II is named in run descriptions but not fully specified in the available paper; pin the exact model and scoring prompt before claiming faithful reproduction.</li><li>Exact RRF constants, candidate depths, and per-language pooling settings are not all recoverable from the public run descriptions.</li><li>The generated-report prompting for the top hltime-gpt5.searcher run is less transparent than the retrieval recipe.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>hltime-gpt5.searcher was first on long multilingual Auto-ARGUE F1 (0.694). hltime-qwen-jina was first on MLIR nDCG@20 (0.661).</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short multilingual report generation</td><td><code>hltime-lg.crux.jsonl</code></td><td>Human F1</td><td>0.112</td><td>Human nugget 0.183, support 0.441; Auto F1 0.542</td></tr><tr><td>Short multilingual report generation</td><td><code>hltime-gpt5.searcher</code></td><td>Human F1</td><td>0.102</td><td>Human nugget 0.176, support 0.338; Auto F1 0.508</td></tr><tr><td>Long report generation</td><td><code>hltime-gpt5.searcher</code></td><td>Auto-ARGUE F1</td><td>0.694</td><td>Subtask M; nugget 0.638, support 0.805</td></tr><tr><td>Long report generation</td><td><code>hltime-lg.crux.jsonl</code></td><td>Auto-ARGUE F1</td><td>0.636</td><td>Subtask M; nugget 0.555, support 0.792</td></tr><tr><td>MLIR</td><td><code>hltime-qwen-jina</code></td><td>nDCG@20</td><td>0.661</td><td>MAP 0.454, R@1000 0.610, judged@20 0.982</td></tr><tr><td>MLIR</td><td><code>hltime-fsrrfprf</code></td><td>nDCG@20</td><td>0.607</td><td>MAP 0.459, R@1000 0.801, judged@20 0.979</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#hltime-gpt5searcher"><code>hltime-gpt5.searcher</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#hltime-qwen-jina"><code>hltime-qwen-jina</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#hltime-fsrrfprf"><code>hltime-fsrrfprf</code></a> · <code>hltime-lg.crux.jsonl</code></p>
+      <ul class="run-desc"><li><code>hltime-gpt5.searcher</code>: Searcher II pointwise reranking RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR.</li><li><code>hltime-qwen-jina</code>: Fusion of jina-reranker-m0 and Qwen-Embedding-8B reranking RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR. Translations were used for reranking but not used for first-stage retrieval.</li><li><code>hltime-fsrrfprf</code>: RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR using PRF with each. Translations were not used.</li></ul>
+    </article>
+    
+
+    <article class="candidate-card" id="crucible">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Primary reproduction target</p>
+          <h3>HLTCOE Crucible Nugget-First Generation</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Best target for studying why coverage improves: it makes predicted nugget quality the main planning artifact before generation.</p>
+        </div>
+        <div class="score-badges"><span><b>High</b> difficulty</span><span><b>High</b> payoff</span><span><b>1-2 weeks</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-crucible" viewBox="0 0 980 128"><title id="title-crucible">Pipeline diagram for crucible</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Retrieve pool</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Generate nuggets</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38"></text><text x="415.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Merge/filter/select</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Extract support</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Verify citations</text><path d="M 810 63 L 820 63" stroke="#7b8794" stroke-width="2"/><path d="M 820 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="824" y="32" width="142" height="62" rx="10" fill="#eef3f7" stroke="#cbd8e3"/><text x="895.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Write report</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Retrieve a broad document pool with BM25, PLAID-X, Qwen3, or LSR.</li><li>Summarize documents, then prompt an LLM to generate 1-6 nugget question-answer pairs per document.</li><li>Merge paraphrased nugget questions using embeddings plus LLM verification.</li><li>Filter non-answers and irrelevant nuggets; select the 10-20 most useful nuggets.</li><li>For each nugget, extract supporting sentences from source documents.</li><li>Generate the report from selected nuggets and citations, optionally verifying support with argue_eval.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">BM25/PLAID-X/Qwen3/LSR</span><span class="pill">LLM nugget generation</span><span class="pill">bge paraphrase model</span><span class="pill">argue_eval</span><span class="pill">Citation verifier</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>There is circularity risk if the same LLM behavior is used for generation and evaluation-like support checks.</li><li>The nugget selector is the system: weak nugget selection limits every downstream step.</li><li>Chunking for sentence extraction must avoid losing evidence across boundaries.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>Retrieval pool</td><td>Top 100 documents for most retrieval variants; BM25 top 25 per language for some multilingual RAGTIME runs</td></tr><tr><td>Retrieval models</td><td>BM25, PLAID-X, Qwen3 dense retrieval, learned sparse retrieval</td></tr><tr><td>Nugget generation</td><td>Per-document summary, then LLM generates 1-6 question-answer nugget pairs</td></tr><tr><td>Paraphrase merge</td><td>bge-large-en-v1.5 initialized paraphrase model; shortlist cosine similarity above 0.9; LLM verification; single-link clustering</td></tr><tr><td>Filtering</td><td>Remove None, No information, Not discussed, irrelevant, or unreasonable answers</td></tr><tr><td>Selection</td><td>Top 10-20 nuggets via Most Common or SVC trained on 19 handcrafted nugget-quality features from the NeuCLIR 2024 pilot</td></tr><tr><td>Document chunking for extraction</td><td>1,000-character chunks split at sentence boundaries</td></tr><tr><td>Extraction prompts</td><td>SupportedAnswerExtractorRequest with answer list, or SupportedAnswerabilityExtractorRequest without answer list</td></tr><tr><td>Support verification</td><td>argue_eval check_sentence_attested; optional check_nugget_matches</td></tr><tr><td>Final trim</td><td>If over 2,000 characters, remove sentences in ascending extraction confidence</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>The report is assembled sentence-by-sentence from selected nuggets, not written as one freeform answer from a large context window.</li><li>Preserve nugget provenance through all stages: source document, cluster id, selected canonical nugget, extracted sentence, confidence, and citation ids.</li><li>The SVC selector is a core component; if you cannot reproduce it, use Most Common as a transparent baseline and label the difference.</li><li>Citation verification is tightly coupled to the evaluation style, so include an ablation with verification disabled to understand the support/coverage trade-off.</li><li>The paper notes a DSPy misconception where some prompts ran without instructions; reproduce the intended field-level contract and document any divergence.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>Nugget ideation prompt: summarize each document and produce 1-6 question-answer nuggets that capture report-relevant facts.</li><li>SupportedAnswerExtractorRequest: given a document chunk, a nugget question, and candidate answers, extract a passage that substantiates an answer and rewrite it as a concise sentence.</li><li>SupportedAnswerabilityExtractorRequest: same extraction task but without an answer list; determine answerability directly from the chunk.</li><li>Verification prompt/API: remove citations where check_sentence_attested returns NO; optionally require check_nugget_matches for nugget coverage verification.</li><li>Report assembly: include at most one best sentence per selected nugget, remove low-confidence or duplicate sentences, then chop to length.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>For one topic, print a full nugget lineage table from source document through final sentence.</li><li>Run Most Common versus SVC selection on the same ideated nuggets and compare selected nugget overlap.</li><li>Measure sentence support before and after check_sentence_attested filtering.</li><li>Confirm the final report preserves the length budget after sentence-level chopping and metadata removal.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>docs = retrieve_pool(request)
+nuggets = merge_filter_select(generate_nuggets(summarize(docs)))
+evidence = {n: extract_supporting_sentences(n, docs) for n in nuggets}
+evidence = verify_citations(evidence)
+report = write_from_nuggets(evidence, length_limit)</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>The public paper describes the SVC features at a high level but not necessarily enough to recreate every feature exactly.</li><li>Model choices for every submitted Crucible variant differ; reproduce one named run first rather than blending variants.</li><li>Because support verification resembles the Auto-ARGUE support check, report both verified and unverified ablations to avoid over-crediting evaluator-shaped filtering.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>cru-ablR-PlaidX- was a top short multilingual human F1 system (0.127). Multiple Crucible variants scored above 0.60 long multilingual Auto-ARGUE F1.</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short multilingual report generation</td><td><code>cru-ablR-PlaidX-</code></td><td>Human F1</td><td>0.127</td><td>Human nugget 0.178, support 0.643; Auto F1 0.481</td></tr><tr><td>Short multilingual report generation</td><td><code>cru-ablR-</code></td><td>Human F1</td><td>0.117</td><td>Human nugget 0.174, support 0.559; Auto F1 0.498</td></tr><tr><td>Short multilingual report generation</td><td><code>cru-ansR-</code></td><td>Human F1</td><td>0.106</td><td>Human nugget 0.157, support 0.549; Auto F1 0.466</td></tr><tr><td>Short multilingual report generation</td><td><code>cru-ansR-conf-</code></td><td>Human F1</td><td>0.105</td><td>Human nugget 0.155, support 0.541; Auto F1 0.475</td></tr><tr><td>Long report generation</td><td><code>cru-ansR-conf-</code></td><td>Auto-ARGUE F1</td><td>0.634</td><td>Subtask M; nugget 0.514, support 0.929</td></tr><tr><td>Long report generation</td><td><code>cru-ansR-</code></td><td>Auto-ARGUE F1</td><td>0.623</td><td>Subtask M; nugget 0.506, support 0.936</td></tr><tr><td>Long report generation</td><td><code>cru-ablR-</code></td><td>Auto-ARGUE F1</td><td>0.611</td><td>Subtask M; nugget 0.488, support 0.953</td></tr><tr><td>Long report generation</td><td><code>cru-ablR-PlaidX-</code></td><td>Auto-ARGUE F1</td><td>0.605</td><td>Subtask M; nugget 0.480, support 0.943</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ablr-plaidx-"><code>cru-ablR-PlaidX-</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ansr-conf-"><code>cru-ansR-conf-</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ansr-"><code>cru-ansR-</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ablr-"><code>cru-ablR-</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/HLTCOE.dragun.rag.ragtime.pdf">paper</a></p>
+      
+    </article>
+    
+
+    <article class="candidate-card" id="idaccs">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Component reproduction target</p>
+          <h3>IDACCS Hybrid Extractive-LLM System</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Best cost-controlled attribution target: it uses extraction as context compression, then lets an LLM refine or nuggetize the extract.</p>
+        </div>
+        <div class="score-badges"><span><b>Medium</b> difficulty</span><span><b>Medium</b> payoff</span><span><b>4-6 days</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-idaccs" viewBox="0 0 980 128"><title id="title-idaccs">Pipeline diagram for idaccs</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">PLAID-X retrieval</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">GPT-4o rerank</text><text x="255.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">query</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">mxbai rerank</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">occams extract</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">GPT-4.1 refine</text><path d="M 810 63 L 820 63" stroke="#7b8794" stroke-width="2"/><path d="M 820 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="824" y="32" width="142" height="62" rx="10" fill="#eef3f7" stroke="#cbd8e3"/><text x="895.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Blame citations</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Use PLAID-X to retrieve top documents per language from background plus problem statement.</li><li>Generate a better reranking query from title, background, and problem statement with GPT-4o.</li><li>Rerank 10-sentence chunks with mxbai-rerank-large-v1 and keep the top documents.</li><li>Create an occams extractive summary at roughly 2x target length or per-language budget.</li><li>Ask GPT-4.1 to produce nuggets, a fluent summary, or a direct extract from occams output.</li><li>Assign citations with the blame/miniblame attribution method.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">PLAID-X</span><span class="pill">GPT-4o query generation</span><span class="pill">mxbai-rerank-large-v1</span><span class="pill">occams</span><span class="pill">GPT-4.1</span><span class="pill">blame/miniblame</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>Extractive summaries can preserve attribution but miss cross-document synthesis.</li><li>Per-language budgets matter for 10k-character multilingual topics.</li><li>The paper found GPT-4o tended to undergenerate relative to GPT-4.1.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>First-stage retrieval</td><td>PLAID-X top 30 documents in each language</td></tr><tr><td>First-stage query</td><td>background + problem statement</td></tr><tr><td>Rerank query</td><td>GPT-4o generated from title + background + problem statement</td></tr><tr><td>Reranker</td><td>mxbai-rerank-large-v1</td></tr><tr><td>Rerank unit</td><td>10-sentence chunks with overlap of 5 sentences</td></tr><tr><td>Rerank output</td><td>Top 10 documents</td></tr><tr><td>Compression</td><td>occams extractive summary at 2x target length</td></tr><tr><td>10,000-character multilingual budget</td><td>2,500 characters per language before combination</td></tr><tr><td>2,000-character budget</td><td>Pool top 30 translated documents from each language, then use top 10</td></tr><tr><td>LLM refinement</td><td>GPT-4.1 for submitted variants; GPT-4o tested but tended to undergenerate</td></tr><tr><td>Attribution</td><td>blame/miniblame; sentence-t5-base performed about as well as sentence-t5-large in NeuCLIR pilot attribution</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>The extractive summary is a context-compression layer, not just a baseline; it is how the LLM sees salient evidence cheaply.</li><li>Keep the three GPT-4.1 modes separate: nugget formation, fluent summary composition, and extract-from-occams.</li><li>For multilingual long reports, maintain per-language extracts before synthesis so the 2,500-character per-language budget is enforceable.</li><li>The paper reports hybrid cost around one cent versus roughly fifty cents for an agentic system in related RAG submissions; track cost as a first-class metric.</li><li>The authors found occams default bigram behavior stronger than SPLADE-tokenized occams in their experiments; start with default occams before experimenting.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>GPT-4o rerank-query prompt: rewrite title, background, and problem statement into a focused query for reranking retrieved chunks.</li><li>GPT-4.1 nugget mode: form concise nuggets from the occams extract without exceeding the target length.</li><li>GPT-4.1 fluent mode: rewrite the extractive summary into a readable report while preserving cited facts.</li><li>GPT-4.1 extract mode: form an extract from the occams extract, favoring trivial attribution over abstraction.</li><li>Attribution contract: assign sentence-level citations after generation using blame/miniblame over the source document set.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>Verify chunk construction uses 10 sentences with 5-sentence overlap before reranking.</li><li>Compare GPT-4o and GPT-4.1 output lengths on the same occams extract to reproduce the undergeneration observation.</li><li>Score attribution separately from nugget coverage; the paper flags puzzling RAGTIME attribution behavior despite strong prior attribution performance.</li><li>Run a no-LLM extract-only variant to isolate how much GPT refinement helps or hurts coverage and support.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>docs = plaidx.search(background + problem, top=30, per_language=True)
+rerank_query = gpt4o_query(title, background, problem)
+top_docs = mxbai_rerank(chunk10(docs), rerank_query)[:10]
+extract = occams(top_docs, target_chars=2*limit)
+report = gpt41_refine_or_nuggetize(extract, limit)
+report = assign_blame_citations(report, top_docs)</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>The exact occams version, tokenizer configuration, and blame/miniblame implementation details should be pinned from the repositories before a faithful reproduction.</li><li>The RAGTIME paper gives strong pipeline detail, but exact GPT prompts are summarized rather than fully specified.</li><li>The authors could not fully explain some low RAGTIME attribution results; treat attribution scores as a risk area to investigate, not a solved component.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>IDACCS_hybrid_4.1_combined reached 0.587 long multilingual Auto-ARGUE F1. The paper emphasizes stronger attribution and length control than agentic workflows.</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short multilingual report generation</td><td><code>IDACCS_extract_4.1_combined</code></td><td>Human F1</td><td>0.084</td><td>Human nugget 0.127, support 0.469; Auto F1 0.413</td></tr><tr><td>Short multilingual report generation</td><td><code>IDACCS_hybrid_4.1_combined</code></td><td>Human F1</td><td>0.084</td><td>Human nugget 0.122, support 0.439; Auto F1 0.388</td></tr><tr><td>Short multilingual report generation</td><td><code>IDACCS_hybridtb_4.1_combined</code></td><td>Human F1</td><td>0.074</td><td>Human nugget 0.108, support 0.432; Auto F1 0.372</td></tr><tr><td>Long report generation</td><td><code>IDACCS_hybrid_4.1_combined</code></td><td>Auto-ARGUE F1</td><td>0.587</td><td>Subtask M; nugget 0.506, support 0.792</td></tr><tr><td>Long report generation</td><td><code>IDACCS_hybridtb_4.1_combined</code></td><td>Auto-ARGUE F1</td><td>0.579</td><td>Subtask M; nugget 0.521, support 0.740</td></tr><tr><td>Long report generation</td><td><code>IDACCS_extract_4.1_combined</code></td><td>Auto-ARGUE F1</td><td>0.564</td><td>Subtask M; nugget 0.604, support 0.563</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#idaccs_hybrid_41"><code>IDACCS_hybrid_4.1</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#idaccs_extract_41"><code>IDACCS_extract_4.1</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#idaccs_hybridtb_41"><code>IDACCS_hybridtb_4.1</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/IDACCS.rag.ragtime.pdf">paper</a></p>
+      <ul class="run-desc"><li><code>IDACCS_hybrid_4.1</code>: The following steps were done.</li><li><code>IDACCS_extract_4.1</code>: \item The organizers served to retrieve the top 30 documents using the background and problem statement as a query. \item We reranked the documents to get the top 10 using \texttt{mxbai-rerank-large-v1} on 10 sentence chunks with an overlap of 5, using a query generated by GPT-4o based on the title, background, and problem statement.</li><li><code>IDACCS_hybridtb_4.1</code>: \item The organizers served to retrieve the top 30 documents using the background and problem statement as a query. \item We reranked the documents to get the top 10 using \texttt{mxbai-rerank-large-v1} on 10 sentence chunks with an overlap of 5, using a query generated by title, and background</li></ul>
+    </article>
+    
+
+    <article class="candidate-card" id="duth">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Component reproduction target</p>
+          <h3>DUTH Lightweight MLIR Fusion</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Best lightweight retrieval component target: useful if you want a reproducible MLIR baseline without heavy agent or LLM generation machinery.</p>
+        </div>
+        <div class="score-badges"><span><b>Low</b> difficulty</span><span><b>Medium</b> payoff</span><span><b>2-3 days</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-duth" viewBox="0 0 980 128"><title id="title-duth">Pipeline diagram for duth</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">BM25 candidates</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">MiniLM rerank</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="49" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">TinyBERT/ELECTRA</text><text x="415.0" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">rerank</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Normalize</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Fuse</text><path d="M 810 63 L 820 63" stroke="#7b8794" stroke-width="2"/><path d="M 820 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="824" y="32" width="142" height="62" rx="10" fill="#eef3f7" stroke="#cbd8e3"/><text x="895.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">TREC run file</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Build a BM25 first-stage index and retrieve top 1,000 passages per topic.</li><li>Rerank candidates with compact cross-encoders such as MiniLM, ELECTRA, and TinyBERT.</li><li>Normalize scores where needed.</li><li>Fuse selected rank lists with linear fusion or reciprocal rank fusion.</li><li>Deduplicate and truncate to top 1,000 per topic in TREC run format.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">BM25/Whoosh</span><span class="pill">MiniLM</span><span class="pill">ELECTRA</span><span class="pill">TinyBERT</span><span class="pill">RRF/linear fusion</span><span class="pill">TREC eval</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>English-only cross-encoders in zero-shot mode are interpretable but not competitive with multilingual heavy rerankers.</li><li>Good for retrieval diagnosis, not a full report generator.</li><li>Keep preprocessing identical across runs or fusion comparisons become noisy.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>Task focus</td><td>MLIR retrieval only; no LLM generation</td></tr><tr><td>Corpus focus</td><td>English subset in the DUTH submission paper</td></tr><tr><td>First-stage retrieval</td><td>Whoosh/Pyserini-style BM25 top 1,000 candidate passages per topic</td></tr><tr><td>Cross-encoders</td><td>MiniLM-L6, MiniLM-L12, TinyBERT, ELECTRA</td></tr><tr><td>Model regime</td><td>Compact English cross-encoders used zero-shot or with local fine-tuning variants</td></tr><tr><td>Fusion option 1</td><td>Linear fusion via normalized score averaging</td></tr><tr><td>Fusion option 2</td><td>Reciprocal rank fusion over independently produced rank lists</td></tr><tr><td>Submission shape</td><td>&lt;topic-id&gt; Q0 &lt;doc-id&gt; &lt;rank&gt; &lt;score&gt; &lt;run-tag&gt;</td></tr><tr><td>Output depth</td><td>Top 1,000 passages per topic</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>This is a useful diagnostic baseline because every stage is cheap enough to rerun often.</li><li>Normalize score ranges before linear fusion; use RRF when score calibration is unreliable.</li><li>Keep single-model reranker outputs as separate run files so fusion gains can be attributed.</li><li>Because the cross-encoders are English-centric, do not interpret weak multilingual performance as evidence against the fusion recipe itself.</li><li>Use the same preprocessing across BM25, reranking, and fusion variants or the comparison will be noisy.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>No generation prompt is needed; this system&#x27;s interface is the query/topic text plus ranked passage output.</li><li>Cross-encoder input contract: pair the topic/query with candidate passage text and output a relevance score.</li><li>Run-file contract: stable topic id, Q0 literal, document id, rank, score, and run tag for every output row.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>Validate every topic has at most 1,000 unique document ids after deduplication.</li><li>Run BM25-only, each reranker-only, linear fusion, and RRF as separate evaluable files.</li><li>Check that fused ranks are stable under deterministic sorting when scores tie.</li><li>Use this baseline to smoke-test evaluation scripts before spending GPU time on heavier rerankers.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>candidates = bm25.search(query, top_k=1000)
+rank_mlm = cross_encoder_rerank(&#x27;MiniLM&#x27;, candidates)
+rank_tb = cross_encoder_rerank(&#x27;TinyBERT&#x27;, candidates)
+run = dedupe_truncate(rrf([rank_mlm, rank_tb, candidates]), 1000)</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>DUTH is transparent but not top-performing; do not expect this reproduction to match HLTCOE or GenAIus without stronger multilingual reranking.</li><li>The public text does not fully specify every fine-tuning detail for local variants, so start with zero-shot cross-encoder reranking.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>DUTH did not match the top HLTCOE/GenAIus MLIR systems, but the methods are compact and transparent; duth_mlir_xenc and mlir-pybm25 led DUTH rows in nDCG@20.</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>MLIR</td><td><code>duth_mlir_xenc</code></td><td>nDCG@20</td><td>0.164</td><td>MAP 0.041, R@1000 0.095, judged@20 0.375</td></tr><tr><td>MLIR</td><td><code>mlir-pybm25</code></td><td>nDCG@20</td><td>0.164</td><td>MAP 0.041, R@1000 0.095, judged@20 0.375</td></tr><tr><td>MLIR</td><td><code>mlir-fused</code></td><td>nDCG@20</td><td>0.163</td><td>MAP 0.041, R@1000 0.092, judged@20 0.372</td></tr><tr><td>MLIR</td><td><code>duth-mlir-mlm6</code></td><td>nDCG@20</td><td>0.114</td><td>MAP 0.031, R@1000 0.092, judged@20 0.419</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#duth_mlir_xenc"><code>duth_mlir_xenc</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#mlir-pybm25"><code>mlir-pybm25</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#mlir-fused"><code>mlir-fused</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#duth-mlir-mlm6"><code>duth-mlir-mlm6</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/DUTH.ragtime.pdf">paper</a></p>
+      <ul class="run-desc"><li><code>duth_mlir_xenc</code>: English-only retrieval with a cross-lingual transformer encoder (“x-encoder”) for dense retrieval over the RAGTIME1 English subset. Results are scored by dot-product similarity, deduplicated, and truncated to top-1000 per topic.</li><li><code>mlir-pybm25</code>: English-only BM25 baseline on the RAGTIME1 English subset (standard parameters). We output a single ranked list per topic, deduplicated and truncated to top-1000.</li><li><code>mlir-fused</code>: English-only linear fusion of BM25 with selected dense runs (score-normalized then combined) on the RAGTIME1 English subset. The merged list is deduplicated and truncated to top-1000 per topic.</li><li><code>duth-mlir-mlm6</code>: English-only dense retrieval using a MiniLM 6-layer encoder on the RAGTIME1 English subset. We index document embeddings and rank by vector similarity; outputs are deduplicated and cut to top-1000.</li></ul>
+    </article>
+    
+
+    <article class="candidate-card" id="agentic">
+      <div class="candidate-head">
+        <div>
+          <p class="kicker">Later reproduction target</p>
+          <h3>LAS / Multiagent Research Workflows</h3>
+          <p class="why"><strong>Why reproduce it:</strong> Worth reproducing after the simpler systems: agentic workflows can improve coverage but are expensive, fragile, and harder to attribute.</p>
+        </div>
+        <div class="score-badges"><span><b>High</b> difficulty</span><span><b>Medium</b> payoff</span><span><b>1-2 weeks</b> timebox</span></div>
+      </div>
+      <svg class="pipeline-svg" role="img" aria-labelledby="title-agentic" viewBox="0 0 980 128"><title id="title-agentic">Pipeline diagram for agentic</title><rect x="24" y="32" width="142" height="62" rx="10" fill="#e8f3f1" stroke="#cbd8e3"/><text x="95.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Planner</text><path d="M 170 63 L 180 63" stroke="#7b8794" stroke-width="2"/><path d="M 180 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="184" y="32" width="142" height="62" rx="10" fill="#eef2fb" stroke="#cbd8e3"/><text x="255.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Research agents</text><path d="M 330 63 L 340 63" stroke="#7b8794" stroke-width="2"/><path d="M 340 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="344" y="32" width="142" height="62" rx="10" fill="#f4f0e8" stroke="#cbd8e3"/><text x="415.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Retrieval tools</text><path d="M 490 63 L 500 63" stroke="#7b8794" stroke-width="2"/><path d="M 500 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="504" y="32" width="142" height="62" rx="10" fill="#edf7ee" stroke="#cbd8e3"/><text x="575.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Writer</text><path d="M 650 63 L 660 63" stroke="#7b8794" stroke-width="2"/><path d="M 660 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="664" y="32" width="142" height="62" rx="10" fill="#f7eded" stroke="#cbd8e3"/><text x="735.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Citation reviewer</text><path d="M 810 63 L 820 63" stroke="#7b8794" stroke-width="2"/><path d="M 820 63 l -6 -5 m 6 5 l -6 5" stroke="#7b8794" stroke-width="2" fill="none"/><rect x="824" y="32" width="142" height="62" rx="10" fill="#eef3f7" stroke="#cbd8e3"/><text x="895.0" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2b38">Report</text></svg>
+      <div class="card-grid">
+        <div class="subsection">
+          <h4>What To Build</h4>
+          <ul><li>Start with a single agent using search as a tool, then add planner/researcher/writer roles.</li><li>Expose retrieval tools for PLAID-X, SPLADE/BM25, and dense retrieval.</li><li>Let a planner decompose the report request and assign research tasks.</li><li>Have a writer synthesize cited claims from collected evidence.</li><li>Add a reviewer or miniblame-style citation pass after writing.</li><li>Track cost, latency, output variance, and citation support separately from coverage.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Stack</h4>
+          <div class="pill-list"><span class="pill">Autogen-style agents</span><span class="pill">PLAID-X</span><span class="pill">SPLADE/BM25</span><span class="pill">Dense retrieval</span><span class="pill">GPT-4.1/GPT-4o-mini</span><span class="pill">miniblame</span></div>
+          <h4>Known Pitfalls</h4>
+          <ul><li>More agents do not automatically improve official scores.</li><li>The paper reports fragility, nondeterminism, and higher cost.</li><li>Use this only after you have a strong non-agentic baseline.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Reproduction Spec</h4>
+          <div class="table-wrap compact"><table><thead><tr><th>Knob</th><th>Source-grounded value</th></tr></thead><tbody><tr><td>Framework</td><td>Microsoft Autogen-style team structures</td></tr><tr><td>Team structures</td><td>Single agent; Directed Graph Planner -&gt; Research Assistant -&gt; Writer; Swarm Planner/Research Assistant/Writer/Reviewer; Selector Group Chat; Round Robin</td></tr><tr><td>Sparse retrieval</td><td>BM25 and SPLADEv3 through Solr/Lucene/Anserini-style impact similarity</td></tr><tr><td>Dense retrieval</td><td>T5 embeddings stored in Qdrant</td></tr><tr><td>Additional retrieval</td><td>PLAID-X search service and full-document retrieval tools</td></tr><tr><td>Agent roles</td><td>Planner decomposes; Research Assistant gathers relevant information; Writer composes cited answer; Reviewer checks completeness and citation consistency</td></tr><tr><td>Nugget-augmented retrieval</td><td>GPT-4o generates subquestions, SPLADEv3 retrieves top n=20, castorini/nuggetizer creates 10-20 word self-contained vital nuggets</td></tr><tr><td>Nugget fusion</td><td>Search vital nuggets separately and merge by RRF with k=10 in one LAS variant</td></tr></tbody></table></div>
+        </div>
+        <div class="subsection">
+          <h4>Implementation Details That Matter</h4>
+          <ul><li>Reproduce a single-agent baseline first; then add Directed Graph, Swarm, Selector, and Round Robin variants one at a time.</li><li>Expose retrieval as tools with auditable inputs/outputs rather than letting agents call opaque search code.</li><li>Agentic systems can raise nugget coverage while hurting citation support, so evaluate those metrics separately.</li><li>The LAS paper reports considerable fragility, nondeterminism, and cost; run each configuration multiple times with fixed seeds or logged traces where possible.</li><li>For hltcoe-multiagt-style long systems, isolate whether gains come from multi-query planning, larger retrieval depth, or stronger generator models.</li></ul>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="subsection">
+          <h4>Prompt / API Contracts</h4>
+          <ul><li>Planner prompt: decompose the report request into research tasks and decide which tool or role should handle each task.</li><li>Research Assistant prompt: use available retrieval tools and return a compact list of relevant, source-linked facts.</li><li>Writer prompt: synthesize the collected evidence into a cited report under the character budget.</li><li>Reviewer prompt: check completeness against the plan and check citation consistency against retrieved evidence.</li><li>Nuggetizer prompt: generate self-contained 10-20 word vital nuggets from top retrieved results for additional searches.</li></ul>
+        </div>
+        <div class="subsection">
+          <h4>Acceptance Checks</h4>
+          <ul><li>Record a full agent trace for every topic: role messages, tool calls, retrieved ids, and final citations.</li><li>Run at least three repeats per configuration to estimate output variance before comparing scores.</li><li>Compare single-agent versus multi-agent scores using the same retrieval tools and model family.</li><li>Track cost and latency per topic; agentic systems are not worth reproducing if the gain over GenAIus/WueRAG is small.</li></ul>
+        </div>
+      </div>
+      <h4>Implementation Skeleton</h4>
+      <pre><code>plan = planner.decompose(request)
+evidence = parallel([researcher.search(task) for task in plan])
+draft = writer.compose(evidence, citations=True)
+report = reviewer.fix_coverage_and_citations(draft, evidence)</code></pre>
+      <h4>Open Reproduction Unknowns</h4>
+      <ul><li>Exact production prompts and orchestration settings for every submitted multiagent run are not fully recoverable from public papers.</li><li>The strongest hltcoe-multiagt runs combine multi-query/rerank ideas with generation choices; reproduce agent structure separately from retrieval fusion.</li><li>Nondeterminism is part of the system behavior, so a single run is weak evidence.</li></ul>
+      <h4>Official Evidence</h4>
+      <p>las_ag_round_robin had high short multilingual nugget coverage (0.232 human) but weak support. hltcoe-multiagt runs scored strongly on long multilingual Auto-ARGUE F1.</p>
+      <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short multilingual report generation</td><td><code>lg_nt_4q12r3l_mt_c</code></td><td>Human F1</td><td>0.124</td><td>Human nugget 0.201, support 0.487; Auto F1 0.577</td></tr><tr><td>Short multilingual report generation</td><td><code>auto_swarm_mt</code></td><td>Human F1</td><td>0.123</td><td>Human nugget 0.190, support 0.511; Auto F1 0.526</td></tr><tr><td>Short multilingual report generation</td><td><code>las_ag_round_robin</code></td><td>Human F1</td><td>0.116</td><td>Human nugget 0.232, support 0.312; Auto F1 0.510</td></tr><tr><td>Long report generation</td><td><code>lg_nt_4q12r3l_mt_c</code></td><td>Auto-ARGUE F1</td><td>0.647</td><td>Subtask M; nugget 0.535, support 0.918</td></tr><tr><td>Long report generation</td><td><code>auto_swarm_mt</code></td><td>Auto-ARGUE F1</td><td>0.597</td><td>Subtask M; nugget 0.489, support 0.945</td></tr><tr><td>Long report generation</td><td><code>las_ag_round_robin</code></td><td>Auto-ARGUE F1</td><td>0.586</td><td>Subtask M; nugget 0.573, support 0.651</td></tr></tbody></table></div>
+      <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#las_ag_round_robin"><code>las_ag_round_robin</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#lg_nt_4q12r3l_mt_c"><code>lg_nt_4q12r3l_mt_c</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#auto_swarm_mt"><code>auto_swarm_mt</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/ncsu-las.rag.ragtime.pdf">paper</a></p>
+      <ul class="run-desc"><li><code>las_ag_round_robin</code>: track provided plaidx one</li><li><code>lg_nt_4q12r3l_mt_c</code>: Reciprocal ranked fusion over multilingual retrieval using plaid-x, multilingual LSR, and Qwen3 single dense vectors with ANN search.</li><li><code>auto_swarm_mt</code>: Reciprocal ranked fusion over multilingual retrieval using plaid-x, multilingual LSR, and Qwen3 single dense vectors with ANN search.</li></ul>
+    </article>
+    
+
+    <section id="not-first">
+      <h2>What I Would Not Reproduce First</h2>
+      <ul>
+        <li><strong>All 148 run records.</strong> They are useful for audit, but not for deciding what to build.</li>
+        <li><strong>Full agent swarms before baselines.</strong> The LAS and multiagent systems are interesting, but the papers warn about cost, fragility, and nondeterminism.</li>
+        <li><strong>DUTH report-generation variants as primary systems.</strong> DUTH is valuable as a lightweight MLIR component, but its English report-generation rows are not competitive.</li>
+        <li><strong>Coordinator extractive_rag as a target.</strong> Use it as a sanity check if you can get its exact implementation, but it is less instructive than AMU or IDACCS for a new system.</li>
+      </ul>
+    </section>
+
+    <section id="sources">
+      <h2>Sources Used</h2>
+      <div class="source-grid">
+        <a href="https://arxiv.org/html/2602.10024v2">Overview of the TREC 2025 RAGTIME Track</a><a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/">TREC Browser RAGTIME 2025 runs page</a><a href="https://pages.nist.gov/trec-browser/trec34/ragtime/proceedings/">TREC Browser RAGTIME 2025 proceedings page</a><a href="https://trec-ragtime.github.io/2025.html">Archived RAGTIME 2025 track site</a>
+        <a href="https://trec.nist.gov/pubs/trec34/papers/AMU.ragtime.pdf">AMU proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/WueRAG.ragtime.pdf">WueRAG proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/GenAIus.ragtime.pdf">GenAIus proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/HLTCOE.dragun.rag.ragtime.pdf">HLTCOE proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/IDACCS.rag.ragtime.pdf">IDACCS proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/ncsu-las.rag.ragtime.pdf">ncsu-las proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/DUTH.ragtime.pdf">DUTH proceedings paper</a>
+      </div>
+      <p class="muted">Generated 2026-07-05. Source evidence came from the cached official TREC Browser pages, the RAGTIME overview paper, and the participant PDFs already downloaded in the local workspace.</p>
+    </section>
+  </div>
+</body>
+</html>
