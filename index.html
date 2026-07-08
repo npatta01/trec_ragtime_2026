@@ -24,6 +24,8 @@
     html { scroll-behavior: smooth; }
     body { margin: 0; background: var(--bg); color: var(--ink); }
     a { color: var(--blue); font-weight: 800; text-decoration-thickness: 0.08em; text-underline-offset: 0.16em; }
+    .skip-link { position: absolute; left: 16px; top: 12px; transform: translateY(-160%); padding: 10px 12px; border-radius: 6px; background: var(--ink); color: #fff; z-index: 10; }
+    .skip-link:focus { transform: translateY(0); }
     .layout { max-width: 1280px; margin: 0 auto; padding: 24px; }
     header, section, .candidate-card { border: 1px solid var(--line); border-radius: 8px; background: var(--paper); box-shadow: var(--shadow); }
     header { padding: 36px; margin-bottom: 20px; }
@@ -97,7 +99,8 @@
   </style>
 </head>
 <body>
-  <div class="layout">
+  <a class="skip-link" href="#main-content">Skip to report content</a>
+  <main id="main-content" class="layout">
     <header>
       <p class="kicker">Accessible reproduction guide</p>
       <h1>TREC RAGTIME 2025 Reproduction Playbook</h1>
@@ -770,6 +773,6 @@ report = reviewer.fix_coverage_and_citations(draft, evidence)</code></pre>
       </div>
       <p class="muted">Generated 2026-07-08. Source evidence came from the cached official TREC Browser pages, the RAGTIME overview paper, and the participant PDFs already downloaded in the local workspace.</p>
     </section>
-  </div>
+  </main>
 </body>
 </html>
