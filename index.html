@@ -1,9 +1,9 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TREC RAGTIME 2025 Reproduction Playbook</title>
+  <title>TREC RAGTIME 2026 Quick Reference and 2025 Reproduction Playbook</title>
   <style>
     :root {
       --bg: #f6f8fa;
@@ -45,6 +45,14 @@
     .toc { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
     .toc a { display: inline-flex; min-height: 34px; align-items: center; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--soft); color: #263443; text-decoration: none; font-size: 0.9rem; }
     .callout { margin: 18px 0; padding: 16px; border-left: 4px solid var(--teal); border-radius: 8px; background: var(--soft-teal); }
+    .quick-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+    .quick-box { min-width: 0; padding: 14px 16px; border-left: 4px solid var(--blue); border-radius: 6px; background: #f7faff; }
+    .quick-box h3 { font-size: 1.05rem; }
+    .quick-box p, .quick-box li { color: var(--muted); font-size: 0.92rem; }
+    .quick-box ul { margin: 0; padding-left: 18px; }
+    .inline-code-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+    .inline-code-list li { padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; }
+    .api-example { margin-top: 14px; }
     .map-svg, .pipeline-svg { width: 100%; height: auto; display: block; }
     .candidate-card { padding: 26px; margin-bottom: 22px; scroll-margin-top: 16px; }
     .candidate-head { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 18px; align-items: start; }
@@ -93,7 +101,7 @@
     @media (max-width: 860px) {
       .layout { padding: 14px; }
       header, section, .candidate-card { padding: 20px; }
-      .hero-grid, .candidate-head, .plain-grid, .card-grid, .detail-grid, .glossary, .source-grid { grid-template-columns: 1fr; }
+      .hero-grid, .candidate-head, .plain-grid, .card-grid, .detail-grid, .glossary, .source-grid, .quick-grid { grid-template-columns: 1fr; }
       table { min-width: 680px; }
     }
   </style>
@@ -103,14 +111,15 @@
   <main id="main-content" class="layout">
     <header>
       <p class="kicker">Accessible reproduction guide</p>
-      <h1>TREC RAGTIME 2025 Reproduction Playbook</h1>
-      <p class="lede">A beginner-friendly guide to the 2025 RAGTIME competition and the few systems worth reproducing. The short explanations are visible by default; the implementation knobs, prompts, scores, and run IDs are collapsed until you want them.</p>
+      <h1>TREC RAGTIME 2026 Quick Reference</h1>
+      <p class="lede">A practical capture of the 2026 track dataset, retrieval API, submission formats, dates, and scoring notes, followed by the existing 2025 reproduction playbook for system-building context.</p>
       <div class="hero-grid">
-        <div class="hero-card"><b>8</b><span>systems or system families worth studying</span></div>
-        <div class="hero-card"><b>2</b><span>reading layers: simple first, technical on demand</span></div>
-        <div class="hero-card"><b>16</b><span>collapsed detail drawers for specs and evidence</span></div>
+        <div class="hero-card"><b>RAGTIME2</b><span>2026 document collection on Hugging Face and via NIST</span></div>
+        <div class="hero-card"><b>3</b><span>tasks: report generation, MLIR, and autonuggetization</span></div>
+        <div class="hero-card"><b>Aug 12</b><span>2026 final submission deadline</span></div>
       </div>
       <nav class="toc">
+        <a href="#track-2026">2026 Capture</a>
         <a href="#executive-summary">Executive Summary</a>
         <a href="#start">Start Here</a>
         <a href="#glossary">Glossary</a>
@@ -120,6 +129,127 @@
         <a href="#sources">Sources</a>
       </nav>
     </header>
+
+    <section id="track-2026">
+      <p class="kicker">Captured from the 2026 website and guidelines</p>
+      <h2>2026 Track Setup, Data, API, And Submission Notes</h2>
+      <p>RAGTIME 2026 asks systems to write English reports from multilingual news-style evidence in Chinese, English, Russian, and Spanish. Each factual sentence in the generated report should cite supporting document IDs, and evaluation centers on whether the report covers required nuggets while keeping sentence-level citations accurate.</p>
+      <div class="quick-grid">
+        <div class="quick-box">
+          <h3>Dataset</h3>
+          <ul>
+            <li><strong>Name:</strong> <a href="https://huggingface.co/datasets/trec-ragtime/ragtime2"><code>trec-ragtime/ragtime2</code></a>, also available directly from NIST for participating teams.</li>
+            <li><strong>Collection:</strong> jointly called <code>RAGTIME2</code>; report requests use <code>collection_id: "ragtime/2/all"</code>.</li>
+            <li><strong>Scale:</strong> Hugging Face exposes 7,000,665 rows across original and machine-translated configs.</li>
+            <li><strong>Original docs:</strong> config <code>default</code> with splits <code>eng</code>, <code>spa</code>, <code>rus</code>, <code>zho</code>; each split has 1,000,095 rows.</li>
+            <li><strong>Translated docs:</strong> config <code>mt_docs</code> with <code>spa.mt.eng</code>, <code>rus.mt.eng</code>, <code>zho.mt.eng</code>; each split has 1,000,095 rows.</li>
+          </ul>
+        </div>
+        <div class="quick-box">
+          <h3>Document Fields</h3>
+          <ul>
+            <li><code>id</code>: document ID used for citations and retrieval submissions.</li>
+            <li><code>text</code>: complete document text.</li>
+            <li><code>date</code>: source date, documented as <code>YYYY-MM-DD</code> or empty; Hugging Face rows currently expose timestamp strings.</li>
+            <li><code>url</code>: source URL at crawl time.</li>
+          </ul>
+        </div>
+        <div class="quick-box">
+          <h3>Inputs</h3>
+          <ul>
+            <li>Report requests are JSONL, one request per line.</li>
+            <li>Fields: <code>request_id</code>, <code>collection_id</code>, <code>title</code>, <code>background</code>, <code>problem_statement</code>, and <code>limit</code>.</li>
+            <li>The <code>limit</code> is a maximum count of NFKC-normalized Unicode characters. Sentences past the limit are truncated before scoring.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="quick-grid">
+        <div class="quick-box">
+          <h3>Search API</h3>
+          <p>The hosted search service is private to registered participants. After registering at TREC, teams receive the base URL and bearer token.</p>
+          <ul class="inline-code-list">
+            <li><code>POST {base_url}/pipeline</code> with <code>{"pipeline":"ragtime2%20","query":"your query"}</code></li>
+            <li><code>POST {base_url}/content</code> with <code>{"collection":"ragtime2","id":"document-id"}</code></li>
+          </ul>
+        </div>
+        <div class="quick-box">
+          <h3>API Pipelines</h3>
+          <ul>
+            <li><code>ragtime2</code> aliases a fused multilingual search over <code>zho</code>, <code>spa</code>, <code>rus</code>, and <code>eng</code>.</li>
+            <li>Single-language retrieval can be requested by using a single language pipeline in the <code>pipeline</code> field.</li>
+            <li>The 2026 service uses Qwen3-8B embeddings, a FAISS index, and RoutIR.</li>
+          </ul>
+        </div>
+        <div class="quick-box">
+          <h3>Useful Software</h3>
+          <ul>
+            <li><strong>Patapsco:</strong> CLIR framework for getting started with cross-language retrieval.</li>
+            <li><strong>PLAID-X:</strong> neural MLIR system installable with <code>pip</code>; models are on Hugging Face.</li>
+            <li><strong>ir-measures:</strong> MLIR evaluation command uses <code>nDCG@20 MAP RBP(rel=1) R@100 R@1000</code>.</li>
+          </ul>
+        </div>
+      </div>
+      <details class="detail-toggle"><summary>Show submission formats and validation details</summary><div>
+        <div class="detail-grid">
+          <div class="subsection">
+            <h4>Report Generation Output</h4>
+            <ul>
+              <li>Submission is JSONL, one report object per line.</li>
+              <li><code>metadata</code> includes <code>team_id</code>, <code>topic_id</code>, <code>run_id</code>, and <code>run_desc</code>; <code>run_id</code> max is 25 characters.</li>
+              <li><code>responses</code> is an ordered array of sentence objects with <code>text</code> and <code>citations</code>.</li>
+              <li><code>citations</code> maps document IDs to numeric confidence/priority scores.</li>
+              <li><code>references</code> is the union of all cited document IDs.</li>
+            </ul>
+          </div>
+          <div class="subsection">
+            <h4>MLIR Ranked Results</h4>
+            <ul>
+              <li>Use standard TREC ad hoc run format: <code>request_id Q0 doc_id rank score run_id</code>.</li>
+              <li>Rows for each topic must be contiguous.</li>
+              <li>Scores must be non-increasing within each topic.</li>
+              <li>Up to 1,000 results per query are accepted; longer lists are truncated.</li>
+            </ul>
+          </div>
+        </div>
+        <div class="detail-grid">
+          <div class="subsection">
+            <h4>Autonuggetization Output</h4>
+            <ul>
+              <li>Submission is JSONL, one nugget set per topic.</li>
+              <li><code>metadata</code> mirrors report metadata with <code>team_id</code>, <code>topic_id</code>, <code>run_id</code>, and <code>run_desc</code>.</li>
+              <li><code>nugget_bank</code> contains nugget dictionaries with <code>question</code>, <code>aggregator_type</code>, and <code>answers</code>.</li>
+              <li><code>aggregator_type</code> is <code>AND</code> or <code>OR</code>; each answer carries answer text plus supporting document IDs.</li>
+              <li>Nuggets and answers are treated as unordered sets.</li>
+            </ul>
+          </div>
+          <div class="subsection">
+            <h4>Validation And Assessment</h4>
+            <ul>
+              <li>A validator will be posted in the TREC Active Participants area; runs that fail validation are rejected outright.</li>
+              <li>Sentence segmentation may be done by the team; segmentation corrections are allowed without making a run manual, as long as system software is unchanged.</li>
+              <li>Reports are assessed by nugget recall and sentence citation precision.</li>
+              <li>At least the first citation for each report sentence is assessed; citation scores set assessment priority.</li>
+            </ul>
+          </div>
+        </div>
+      </div></details>
+      <details class="detail-toggle"><summary>Show timeline and coordination details</summary><div>
+        <div class="table-wrap compact"><table><thead><tr><th>Date</th><th>Milestone</th></tr></thead><tbody><tr><td>March 2026</td><td>Registration opens at <a href="http://ir.nist.gov/evalbase">NIST EvalBase</a>.</td></tr><tr><td>April-May 2026</td><td>Evaluation collection and track guidelines released.</td></tr><tr><td>Late June 2026</td><td>Final topics released.</td></tr><tr><td>August 12, 2026</td><td>Final submissions due to NIST.</td></tr><tr><td>October 2026</td><td>Results and feedback distributed to participants.</td></tr><tr><td>December 2026</td><td>TREC 2026 conference.</td></tr></tbody></table></div>
+        <p class="muted"><strong>Coordinators:</strong> Dawn Lawrie, Sean MacAvaney, James Mayfield, Luca Soldaini, Eugene Yang, and Andrew Yates. General questions go to <a href="mailto:ragtime-organizers@googlegroups.com">ragtime-organizers@googlegroups.com</a> or the TREC Slack.</p>
+      </div></details>
+      <div class="api-example">
+        <h3>Minimal API Shape</h3>
+        <pre><code>curl -X POST "$RAGTIME_BASE_URL/pipeline" \
+  -H "Authorization: $RAGTIME_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"pipeline":"ragtime2%20","query":"your query"}'
+
+curl -X POST "$RAGTIME_BASE_URL/content" \
+  -H "Authorization: $RAGTIME_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"collection":"ragtime2","id":"01f01b3d-89c7-4f97-9d14-bd2dcdff190b"}'</code></pre>
+      </div>
+    </section>
 
     <section id="executive-summary">
       <h2>Executive Summary</h2>
@@ -170,7 +300,7 @@
       <p>Each card starts with what the method is doing and how to begin. The technical implementation specs and official evidence are collapsed by default so you can choose when to zoom in.</p>
     </section>
 
-    
+
     <article class="candidate-card" id="amu">
       <div class="candidate-head">
         <div>
@@ -242,7 +372,7 @@ report = llm.generate_json(request, docs, schema=cited_report_schema)</code></pr
       <ul class="run-desc"><li><code>AMU1ENG</code>: The entire retrieval phase was performed on a locally hosted vector database. During the process of inserting texts into the database, they were divided into chunks of approximately 5 to 10 sentences, depending on their length. In edge cases, the maximum chunk size was set to 8k characters. These chunks were then vectorized using the base model BAAI/BGE-m3 with GPU acceleration. Retrieval was conducted using a standard similarity search based on the cosine similarity score.</li><li><code>AMU1ML</code>: The entire retrieval phase was performed on a locally hosted vector database. During the process of inserting texts into the database, they were divided into chunks of approximately 5 to 10 sentences, depending on their length. In edge cases, the maximum chunk size was set to 8k characters. These chunks were then vectorized using the base model BAAI/BGE-m3 with GPU acceleration. Retrieval was conducted using a standard similarity search based on the cosine similarity score without reranking process</li></ul>
     </div></details>
     </article>
-    
+
 
     <article class="candidate-card" id="genaius">
       <div class="candidate-head">
@@ -315,7 +445,7 @@ report = synthesize_cited_report(answers, docs)</code></pre>
       <ul class="run-desc"><li><code>genaius-question</code>: (1) Generate questions using GPT-4o, (2) retrieve relevant documents for these questions using the provided search API</li><li><code>genaius-cluster</code>: (1) Generate questions using GPT-4o, (2) retrieve relevant documents for these questions using the provided search API</li><li><code>genaius-llama3-3-70B</code>: (1) Generate questions using Llama3.3-70B, (2) retrieve relevant documents for these questions using the provided search API, (3) merge the retrieved documents</li><li><code>genaius-gpt-4o</code>: (1) Generate questions using GPT-4o, (2) retrieve relevant documents for these questions using the provided search API, (3) merge the retrieved documents</li></ul>
     </div></details>
     </article>
-    
+
 
     <article class="candidate-card" id="wuerag">
       <div class="candidate-head">
@@ -390,7 +520,7 @@ report = drop_uncited_sentences(generate_with_required_citations(context))</code
       <ul class="run-desc"><li><code>WueRAG_2025_08_22</code>: The retrieval process starts by reformulating the user query for better search relevance. Depending on configuration, the system either queries a remote RAGTIME API or searches local indices (for the last submission the RAGTIME API was used with subset set to &quot;eng&quot;). Retrieved documents are converted into a temporary index and processed via an embedding-based and BM25 retriever, in an hybrid setting.</li></ul>
     </div></details>
     </article>
-    
+
 
     <article class="candidate-card" id="hltcoe-rerank">
       <div class="candidate-head">
@@ -462,7 +592,7 @@ report = generate_report(request, fused[:k])</code></pre>
       <ul class="run-desc"><li><code>hltime-gpt5.searcher</code>: Searcher II pointwise reranking RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR.</li><li><code>hltime-qwen-jina</code>: Fusion of jina-reranker-m0 and Qwen-Embedding-8B reranking RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR. Translations were used for reranking but not used for first-stage retrieval.</li><li><code>hltime-fsrrfprf</code>: RRF of PLAID-X, Qwen-Embedding-8B, and multilingual LSR using PRF with each. Translations were not used.</li></ul>
     </div></details>
     </article>
-    
+
 
     <article class="candidate-card" id="crucible">
       <div class="candidate-head">
@@ -532,10 +662,10 @@ report = write_from_nuggets(evidence, length_limit)</code></pre>
       <p>cru-ablR-PlaidX- was a top short multilingual human F1 system (0.127). Multiple Crucible variants scored above 0.60 long multilingual Auto-ARGUE F1.</p>
       <div class="table-wrap small"><table><thead><tr><th>Evidence table</th><th>Run</th><th>Metric</th><th>Value</th><th>Context</th></tr></thead><tbody><tr><td>Short multilingual report generation</td><td><code>cru-ablR-PlaidX-</code></td><td>Human F1</td><td>0.127</td><td>Human nugget 0.178, support 0.643; Auto F1 0.481</td></tr><tr><td>Short multilingual report generation</td><td><code>cru-ablR-</code></td><td>Human F1</td><td>0.117</td><td>Human nugget 0.174, support 0.559; Auto F1 0.498</td></tr><tr><td>Short multilingual report generation</td><td><code>cru-ansR-</code></td><td>Human F1</td><td>0.106</td><td>Human nugget 0.157, support 0.549; Auto F1 0.466</td></tr><tr><td>Short multilingual report generation</td><td><code>cru-ansR-conf-</code></td><td>Human F1</td><td>0.105</td><td>Human nugget 0.155, support 0.541; Auto F1 0.475</td></tr><tr><td>Long report generation</td><td><code>cru-ansR-conf-</code></td><td>Auto-ARGUE F1</td><td>0.634</td><td>Subtask M; nugget 0.514, support 0.929</td></tr><tr><td>Long report generation</td><td><code>cru-ansR-</code></td><td>Auto-ARGUE F1</td><td>0.623</td><td>Subtask M; nugget 0.506, support 0.936</td></tr><tr><td>Long report generation</td><td><code>cru-ablR-</code></td><td>Auto-ARGUE F1</td><td>0.611</td><td>Subtask M; nugget 0.488, support 0.953</td></tr><tr><td>Long report generation</td><td><code>cru-ablR-PlaidX-</code></td><td>Auto-ARGUE F1</td><td>0.605</td><td>Subtask M; nugget 0.480, support 0.943</td></tr></tbody></table></div>
       <p class="muted"><strong>Run ids:</strong> <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ablr-plaidx-"><code>cru-ablR-PlaidX-</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ansr-conf-"><code>cru-ansR-conf-</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ansr-"><code>cru-ansR-</code></a> · <a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/#cru-ablr-"><code>cru-ablR-</code></a> · <a href="https://trec.nist.gov/pubs/trec34/papers/HLTCOE.dragun.rag.ragtime.pdf">paper</a></p>
-      
+
     </div></details>
     </article>
-    
+
 
     <article class="candidate-card" id="idaccs">
       <div class="candidate-head">
@@ -609,7 +739,7 @@ report = assign_blame_citations(report, top_docs)</code></pre>
       <ul class="run-desc"><li><code>IDACCS_hybrid_4.1</code>: The following steps were done.</li><li><code>IDACCS_extract_4.1</code>: \item The organizers served to retrieve the top 30 documents using the background and problem statement as a query. \item We reranked the documents to get the top 10 using \texttt{mxbai-rerank-large-v1} on 10 sentence chunks with an overlap of 5, using a query generated by GPT-4o based on the title, background, and problem statement.</li><li><code>IDACCS_hybridtb_4.1</code>: \item The organizers served to retrieve the top 30 documents using the background and problem statement as a query. \item We reranked the documents to get the top 10 using \texttt{mxbai-rerank-large-v1} on 10 sentence chunks with an overlap of 5, using a query generated by title, and background</li></ul>
     </div></details>
     </article>
-    
+
 
     <article class="candidate-card" id="duth">
       <div class="candidate-head">
@@ -681,7 +811,7 @@ run = dedupe_truncate(rrf([rank_mlm, rank_tb, candidates]), 1000)</code></pre>
       <ul class="run-desc"><li><code>duth_mlir_xenc</code>: English-only retrieval with a cross-lingual transformer encoder (“x-encoder”) for dense retrieval over the RAGTIME1 English subset. Results are scored by dot-product similarity, deduplicated, and truncated to top-1000 per topic.</li><li><code>mlir-pybm25</code>: English-only BM25 baseline on the RAGTIME1 English subset (standard parameters). We output a single ranked list per topic, deduplicated and truncated to top-1000.</li><li><code>mlir-fused</code>: English-only linear fusion of BM25 with selected dense runs (score-normalized then combined) on the RAGTIME1 English subset. The merged list is deduplicated and truncated to top-1000 per topic.</li><li><code>duth-mlir-mlm6</code>: English-only dense retrieval using a MiniLM 6-layer encoder on the RAGTIME1 English subset. We index document embeddings and rank by vector similarity; outputs are deduplicated and cut to top-1000.</li></ul>
     </div></details>
     </article>
-    
+
 
     <article class="candidate-card" id="agentic">
       <div class="candidate-head">
@@ -753,7 +883,7 @@ report = reviewer.fix_coverage_and_citations(draft, evidence)</code></pre>
       <ul class="run-desc"><li><code>las_ag_round_robin</code>: track provided plaidx one</li><li><code>lg_nt_4q12r3l_mt_c</code>: Reciprocal ranked fusion over multilingual retrieval using plaid-x, multilingual LSR, and Qwen3 single dense vectors with ANN search.</li><li><code>auto_swarm_mt</code>: Reciprocal ranked fusion over multilingual retrieval using plaid-x, multilingual LSR, and Qwen3 single dense vectors with ANN search.</li></ul>
     </div></details>
     </article>
-    
+
 
     <section id="not-first">
       <h2>What I Would Not Reproduce First</h2>
@@ -768,10 +898,11 @@ report = reviewer.fix_coverage_and_citations(draft, evidence)</code></pre>
     <section id="sources">
       <h2>Sources Used</h2>
       <div class="source-grid">
+        <a href="https://trec-ragtime.github.io/">Official TREC RAGTIME 2026 website</a><a href="https://trec-ragtime.github.io/search_api.html">RAGTIME 2026 Search API documentation</a><a href="https://docs.google.com/document/d/1XqypNTHxIdazxfnUebrp-EsUuGNhodhQGrJIDnYGaB4/edit?tab=t.0">RAGTIME 2026 Track Guidelines Google Doc</a><a href="https://huggingface.co/datasets/trec-ragtime/ragtime2">RAGTIME2 Hugging Face dataset</a>
         <a href="https://arxiv.org/html/2602.10024v2">Overview of the TREC 2025 RAGTIME Track</a><a href="https://pages.nist.gov/trec-browser/trec34/ragtime/runs/">TREC Browser RAGTIME 2025 runs page</a><a href="https://pages.nist.gov/trec-browser/trec34/ragtime/proceedings/">TREC Browser RAGTIME 2025 proceedings page</a><a href="https://trec-ragtime.github.io/2025.html">Archived RAGTIME 2025 track site</a>
         <a href="https://trec.nist.gov/pubs/trec34/papers/AMU.ragtime.pdf">AMU proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/WueRAG.ragtime.pdf">WueRAG proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/GenAIus.ragtime.pdf">GenAIus proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/HLTCOE.dragun.rag.ragtime.pdf">HLTCOE proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/IDACCS.rag.ragtime.pdf">IDACCS proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/ncsu-las.rag.ragtime.pdf">ncsu-las proceedings paper</a><a href="https://trec.nist.gov/pubs/trec34/papers/DUTH.ragtime.pdf">DUTH proceedings paper</a>
       </div>
-      <p class="muted">Generated 2026-07-08. Source evidence came from the cached official TREC Browser pages, the RAGTIME overview paper, and the participant PDFs already downloaded in the local workspace.</p>
+      <p class="muted">Updated 2026-07-08. The 2026 capture uses the official track website, Search API page, RAGTIME 2026 Guidelines Google Doc, and Hugging Face dataset metadata; the reproduction cards use the official 2025 TREC Browser pages, overview paper, and participant PDFs.</p>
     </section>
   </main>
 </body>

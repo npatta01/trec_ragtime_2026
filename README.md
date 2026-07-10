@@ -1,0 +1,63 @@
+# TREC RAGTIME 2026 Reference and Mini Viewer
+
+This repository is a small working companion for TREC RAGTIME 2026. It combines
+an at-a-glance track reference with a runnable notebook that previews the
+RAGTIME2 data without downloading the full collection.
+
+## Start Here
+
+1. Read the [hosted quick reference](https://npatta01.github.io/trec_ragtime_2026/)
+   for the dataset layout, retrieval API, submission formats, timeline, and
+   useful 2025 system context.
+2. Open the [mini data viewer](notebooks/ragtime2_mini_viewer.ipynb) to inspect
+   live original-language and machine-translated samples from Hugging Face.
+3. Use the optional notebook helper with participant credentials when you are
+   ready to query the private RAGTIME retrieval service.
+
+## Run the Notebook
+
+Install [uv](https://docs.astral.sh/uv/) and run:
+
+```bash
+uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
+```
+
+To execute the whole notebook without opening Jupyter:
+
+```bash
+uv run jupyter nbconvert \
+  --execute \
+  --to notebook \
+  --inplace notebooks/ragtime2_mini_viewer.ipynb
+```
+
+The notebook uses the Hugging Face Dataset Viewer API and loads only a small,
+configurable number of rows. It requires internet access, Python 3.11 or newer,
+and no Hugging Face token for the public samples.
+
+## Private Search API
+
+Registered TREC participants receive the base URL and bearer token separately.
+Set them in your shell before starting Jupyter:
+
+```bash
+export RAGTIME_BASE_URL="https://participant-api.example"
+export RAGTIME_BEARER_TOKEN="your-token"
+uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
+```
+
+The notebook skips private retrieval when either variable is absent. Do not add
+credentials to the notebook, repository, or saved cell outputs.
+
+## Repository Map
+
+- [`index.html`](index.html): static 2026 quick reference and 2025 reproduction
+  playbook, published with GitHub Pages.
+- [`notebooks/ragtime2_mini_viewer.ipynb`](notebooks/ragtime2_mini_viewer.ipynb):
+  bounded dataset preview and optional retrieval API example.
+- [`pyproject.toml`](pyproject.toml) and [`uv.lock`](uv.lock): reproducible Python
+  environment managed by uv.
+
+The RAGTIME2 corpus is accessed remotely and is not vendored in this repository.
+Track details can change, so use the linked official sources in `index.html` when
+making submission decisions.
