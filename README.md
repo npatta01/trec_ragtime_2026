@@ -6,7 +6,7 @@ RAGTIME2 data without downloading the full collection.
 
 ## Start Here
 
-1. Read the [hosted quick reference](https://npatta01.github.io/trec_ragtime_2026/)
+1. Read the [hosted quick reference and reproduction playbook](https://npatta01.github.io/trec_ragtime_2026/reports/2026-quick-reference-and-2025-reproduction-playbook/)
    for the dataset layout, retrieval API, submission formats, timeline, and
    useful 2025 system context.
 2. Open the [mini data viewer](notebooks/ragtime2_mini_viewer.ipynb) to inspect
@@ -51,13 +51,15 @@ credentials to the notebook, repository, or saved cell outputs.
 
 ## Repository Map
 
-- [`index.html`](index.html): static 2026 quick reference and 2025 reproduction
-  playbook, published with GitHub Pages.
+- [`index.html`](index.html): compact GitHub Pages landing page for the project.
+- [`reports/2026-quick-reference-and-2025-reproduction-playbook/index.html`](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html):
+  static 2026 quick reference and 2025 reproduction playbook.
 - [`notebooks/ragtime2_mini_viewer.ipynb`](notebooks/ragtime2_mini_viewer.ipynb):
   bounded dataset preview and optional retrieval API example.
 - [`pyproject.toml`](pyproject.toml) and [`uv.lock`](uv.lock): reproducible Python
   environment managed by uv.
 
 The RAGTIME2 corpus is accessed remotely and is not vendored in this repository.
-Track details can change, so use the linked official sources in `index.html` when
-making submission decisions.
+Track details can change, so use the official sources linked from the
+[reference report](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html)
+when making submission decisions.
