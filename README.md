@@ -55,6 +55,9 @@ sops decrypt --output .env config/secrets.sops.env
 uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
 ```
 
+Always decrypt first and then run code normally. Do not wrap notebook or
+application commands with `sops exec-env` or another SOPS execution wrapper.
+
 To change the encrypted values, edit them through SOPS and decrypt the updated
 file again:
 
@@ -68,6 +71,8 @@ the token. The plaintext `.env` file is ignored by Git.
 
 ## Repository Map
 
+- [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the
+  required decrypt-first secret workflow.
 - [`topics/topics.all.2026.v0625.jsonl`](topics/topics.all.2026.v0625.jsonl):
   [official June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625.jsonl),
   normalized to one JSON object per line.
