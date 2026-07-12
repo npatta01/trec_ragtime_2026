@@ -49,6 +49,25 @@ uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
 The notebook skips private retrieval when either variable is absent. Do not add
 credentials to the notebook, repository, or saved cell outputs.
 
+For local development, copy `.env.example` to the ignored `.env` file, add the
+token there, and load it into the shell with `set -a; source .env; set +a`
+before starting Jupyter. A shared encrypted copy is committed as
+`config/secrets.sops.env` using SOPS and the GCP KMS key configured in
+`.sops.yaml`. GCP Application Default Credentials must have decrypt access to
+that key. Edit the encrypted values with `sops config/secrets.sops.env`, or
+decrypt them without printing the secret to the terminal:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env
+```
+
+Alternatively, run a command directly with the decrypted values in its
+environment and without creating a plaintext file:
+
+```bash
+sops exec-env config/secrets.sops.env 'uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb'
+```
+
 ## Repository Map
 
 - [`topics/topics.all.2026.v0625.jsonl`](topics/topics.all.2026.v0625.jsonl):

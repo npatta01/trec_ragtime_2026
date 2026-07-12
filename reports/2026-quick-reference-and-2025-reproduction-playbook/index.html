@@ -167,7 +167,7 @@
       <div class="quick-grid">
         <div class="quick-box">
           <h3>Search API</h3>
-          <p>The hosted search service is private to registered participants. After registering at TREC, teams receive the base URL and bearer token.</p>
+          <p>The hosted search service is private to registered participants. After registering at TREC, teams receive the base URL and bearer token. The live service expects the standard <code>Authorization: Bearer &lt;token&gt;</code> header.</p>
           <ul class="inline-code-list">
             <li><code>POST {base_url}/pipeline</code> with <code>{"pipeline":"ragtime2%20","query":"your query"}</code></li>
             <li><code>POST {base_url}/content</code> with <code>{"collection":"ragtime2","id":"document-id"}</code></li>
@@ -241,12 +241,12 @@
       <div class="api-example">
         <h3>Minimal API Shape</h3>
         <pre><code>curl -X POST "$RAGTIME_BASE_URL/pipeline" \
-  -H "Authorization: $RAGTIME_BEARER_TOKEN" \
+  -H "Authorization: Bearer $RAGTIME_BEARER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"pipeline":"ragtime2%20","query":"your query"}'
 
 curl -X POST "$RAGTIME_BASE_URL/content" \
-  -H "Authorization: $RAGTIME_BEARER_TOKEN" \
+  -H "Authorization: Bearer $RAGTIME_BEARER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"collection":"ragtime2","id":"01f01b3d-89c7-4f97-9d14-bd2dcdff190b"}'</code></pre>
       </div>
