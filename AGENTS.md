@@ -12,7 +12,7 @@
 
 - Run code normally after decryption. Do not wrap notebook or application
   commands with `sops exec-env` or another SOPS execution wrapper.
-- The notebook loads the root `.env` automatically through `python-dotenv`.
+- The notebooks load the root `.env` automatically through `python-dotenv`.
   New Python entry points that require these credentials should do the same.
 - Keep `.env` and `.env.*` ignored by Git, while retaining the tracked
   `.env.example`. Confirm with `git check-ignore .env` when changing ignore
@@ -29,10 +29,11 @@
   sops decrypt --output .env config/secrets.sops.env
   ```
 
-## Running The Notebook
+## Running The Notebooks
 
-After decrypting `.env`, run the notebook without a SOPS wrapper:
+After decrypting `.env`, run notebooks without a SOPS wrapper:
 
 ```bash
 uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
+uv run jupyter lab notebooks/ragtime_single_query.ipynb
 ```

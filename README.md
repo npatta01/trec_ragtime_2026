@@ -38,8 +38,8 @@ and no Hugging Face token for the public samples.
 ## Private Search API
 
 Registered TREC participants receive the base URL and bearer token separately.
-The notebook loads the ignored root `.env` file automatically and skips private
-retrieval when either value is absent. Do not add credentials to the notebook,
+The notebooks load the ignored root `.env` file automatically and skip private
+retrieval when either value is absent. Do not add credentials to notebooks,
 repository, or saved cell outputs.
 
 The shared encrypted configuration is committed as
@@ -53,6 +53,13 @@ normally:
 ```bash
 sops decrypt --output .env config/secrets.sops.env
 uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
+```
+
+For a minimal one-query API check, open the single-query notebook and edit its
+`QUERY` value:
+
+```bash
+uv run jupyter lab notebooks/ragtime_single_query.ipynb
 ```
 
 Always decrypt first and then run code normally. Do not wrap notebook or
@@ -81,6 +88,8 @@ the token. The plaintext `.env` file is ignored by Git.
   static 2026 quick reference and 2025 reproduction playbook.
 - [`notebooks/ragtime2_mini_viewer.ipynb`](notebooks/ragtime2_mini_viewer.ipynb):
   bounded dataset preview and optional retrieval API example.
+- [`notebooks/ragtime_single_query.ipynb`](notebooks/ragtime_single_query.ipynb):
+  minimal one-query search against the private RAGTIME endpoint.
 - [`pyproject.toml`](pyproject.toml) and [`uv.lock`](uv.lock): reproducible Python
   environment managed by uv.
 
