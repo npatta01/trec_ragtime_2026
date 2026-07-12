@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from .client import DEFAULT_PIPELINE, RagtimeClient, RagtimeError
 from .huggingface import (
     DEFAULT_HF_DATASET,
+    DEFAULT_HF_MT_SPLITS,
     DEFAULT_HF_SPLITS,
     HuggingFaceCorpus,
     HuggingFaceHydrationError,
@@ -28,6 +29,8 @@ from .models import (
     RetrievalResult,
     RetrievedDocument,
 )
+
+DEFAULT_MAX_CONTENT_FALLBACKS = 5
 
 
 class DocumentCorpus(Protocol):
@@ -138,6 +141,7 @@ class RagtimeRetriever:
                 reserved_identity_options = {
                     "expected_dataset",
                     "expected_splits",
+                    "expected_translation_splits",
                 }.intersection(local_options)
                 if reserved_identity_options:
                     raise ValueError(
@@ -145,6 +149,7 @@ class RagtimeRetriever:
                     )
                 local_options["expected_dataset"] = DEFAULT_HF_DATASET
                 local_options["expected_splits"] = DEFAULT_HF_SPLITS
+                local_options["expected_translation_splits"] = DEFAULT_HF_MT_SPLITS
                 corpus: DocumentCorpus = LocalCorpusIndex(
                     index_path,
                     **local_options,
@@ -221,15 +226,16 @@ class RagtimeRetriever:
         top_k: int | None = None,
         refresh_search: bool = False,
         refresh_documents: bool = False,
-        max_content_fallbacks: int = 0,
+        max_content_fallbacks: int | None = DEFAULT_MAX_CONTENT_FALLBACKS,
         fallback_on_hf_error: bool = False,
     ) -> RetrievalResult:
         """Search, then join ranked IDs to original-language corpus text.
 
-        By default no private ``/content`` calls are made. IDs absent from the
-        configured corpus may use a bounded number of cached ``/content``
-        requests through ``max_content_fallbacks``. A broad Dataset Viewer
-        failure raises instead of fanning out; setting
+        IDs genuinely absent from the configured corpus automatically use up
+        to five forever-cached private ``/content`` requests. Set
+        ``max_content_fallbacks=0`` to disable this, a positive integer to set a
+        different bound, or ``None`` for unlimited true-miss fallback. A broad
+        Dataset Viewer failure raises instead of fanning out; setting
         ``fallback_on_hf_error=True`` explicitly permits the same bounded
         fallback for that remote-backend case.
         """
@@ -245,12 +251,18 @@ class RagtimeRetriever:
         ):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean")
-        if (
+        if max_content_fallbacks is not None and (
             isinstance(max_content_fallbacks, bool)
             or not isinstance(max_content_fallbacks, int)
             or max_content_fallbacks < 0
         ):
-            raise ValueError("max_content_fallbacks must be a non-negative integer")
+            raise ValueError(
+                "max_content_fallbacks must be a non-negative integer or None"
+            )
+        if fallback_on_hf_error and max_content_fallbacks is None:
+            raise ValueError(
+                "fallback_on_hf_error requires a finite max_content_fallbacks"
+            )
 
         search_result = self.client.search(
             query,
@@ -272,6 +284,7 @@ class RagtimeRetriever:
             raise HuggingFaceHydrationError(hydration.failures)
 
         failures = list(hydration.failures)
+        api_fallback_ids: list[str] = []
         fallback_ids = unresolved_ids[:max_content_fallbacks]
         for document_id in fallback_ids:
             try:
@@ -288,8 +301,9 @@ class RagtimeRetriever:
                         ),
                     )
                 )
-                continue
+                break
             hydrated_by_id[document_id] = document
+            api_fallback_ids.append(document_id)
 
         documents: list[RetrievedDocument] = []
         for hit in hits:
@@ -322,6 +336,7 @@ class RagtimeRetriever:
                         language=hydrated.language,
                         content_source=hydrated.source,
                         content_local_cache_hit=hydrated.local_cache_hit,
+                        english_text=hydrated.english_text,
                     )
                 )
             else:
@@ -339,11 +354,24 @@ class RagtimeRetriever:
                     )
                 )
 
+        missing_report_text_ids = {
+            *hydration.missing_translation_ids,
+            *api_fallback_ids,
+        }
         return RetrievalResult(
             search_result=search_result,
             documents=tuple(documents),
             hydration_failures=tuple(failures),
+            missing_translation_ids=tuple(
+                hit.document_id
+                for hit in hits
+                if hit.document_id in missing_report_text_ids
+            ),
         )
 
 
-__all__ = ["DocumentCorpus", "RagtimeRetriever"]
+__all__ = [
+    "DEFAULT_MAX_CONTENT_FALLBACKS",
+    "DocumentCorpus",
+    "RagtimeRetriever",
+]

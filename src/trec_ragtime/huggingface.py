@@ -27,6 +27,8 @@ DEFAULT_HF_BASE_URL = "https://datasets-server.huggingface.co"
 DEFAULT_HF_DATASET = "trec-ragtime/ragtime2"
 DEFAULT_HF_CONFIG = "default"
 DEFAULT_HF_SPLITS = ("eng", "spa", "rus", "zho")
+DEFAULT_HF_MT_CONFIG = "mt_docs"
+DEFAULT_HF_MT_SPLITS = ("spa.mt.eng", "rus.mt.eng", "zho.mt.eng")
 DEFAULT_HF_DOCUMENT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_HF_TIMEOUT = (5.0, 45.0)
 DEFAULT_HF_BATCH_SIZE = 20
@@ -580,6 +582,11 @@ class HuggingFaceCorpus:
                 document_id for document_id in ordered_ids if document_id not in found
             ),
             failures=tuple(failures),
+            missing_translation_ids=tuple(
+                document_id
+                for document_id in ordered_ids
+                if document_id in found and found[document_id].split != "eng"
+            ),
         )
 
     def enrich_documents(
@@ -598,6 +605,8 @@ __all__ = [
     "DEFAULT_HF_CONFIG",
     "DEFAULT_HF_DATASET",
     "DEFAULT_HF_DOCUMENT_CACHE_TTL_SECONDS",
+    "DEFAULT_HF_MT_CONFIG",
+    "DEFAULT_HF_MT_SPLITS",
     "DEFAULT_HF_SPLITS",
     "HuggingFaceApiError",
     "HuggingFaceConfigurationError",

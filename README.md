@@ -123,9 +123,9 @@ on the RAGTIME topics rather than inferred from generic benchmarks.
 ## Reusable Retrieval And Hydration
 
 Use `RagtimeRetriever` for the normal end-to-end path. It searches the private
-RAGTIME endpoint, then hydrates the ranked document IDs with original-language
-text, URL, date, and language from the public
-[Hugging Face corpus](https://huggingface.co/datasets/trec-ragtime/ragtime2):
+RAGTIME endpoint, then hydrates the ranked document IDs with canonical source
+text, URL, date, language, and—where needed—an English translation from the
+public [Hugging Face corpus](https://huggingface.co/datasets/trec-ragtime/ragtime2):
 
 ```python
 from trec_ragtime import RagtimeRetriever
@@ -144,7 +144,7 @@ for document in result.documents:
         document.score,
         document.language,
         document.url,
-        document.text,
+        document.report_text,
     )
 ```
 
@@ -155,20 +155,28 @@ limit. To request more than 20 from RoutIR, change the literal pipeline suffix,
 for example `ragtime2%100`. A `top_k` value can only truncate results that the
 endpoint already returned.
 
-The hydrator intentionally uses the original-language `default` configuration,
-not `mt_docs`. In a measured sample of eight retrieved documents—two from each
-of English, Spanish, Russian, and Chinese—the Hugging Face `default` text was
-byte-for-byte identical to the private API's `/content` text in all eight
-cases. The machine-translated rows reuse the same IDs but contain different
-text, so they are a separate representation and are not silently substituted.
+The `default` configuration remains canonical endpoint content. All 11 cached
+private `/content` samples matched it byte-for-byte, including two documents
+from each of English, Spanish, Russian, and Chinese. The `mt_docs` rows reuse
+the Spanish, Russian, and Chinese IDs with English machine translations, so the
+local index joins them as a second text representation rather than treating
+them as additional retrieval documents.
+
+`document.text` is always canonical; `document.english_text` is optional;
+`document.report_text` selects English when available and otherwise preserves
+the English source document. This is the representation intended for the
+track's required English report. The dataset card says HLTCOE produced these
+translations with Sockeye, but it does not identify an exact model checkpoint,
+so translated text remains explicitly distinguishable from source evidence.
 
 ### Build The Complete Local Corpus
 
 The corpus command resolves the generated Parquet branch to an immutable Hub
-commit, downloads all 25 `default/{eng,spa,rus,zho}` shards, materializes their
-4,000,380 documents into DuckDB, and creates a unique exact-ID index. Before
-indexing, it verifies the exact Hub manifest plus every shard's byte size and
-LFS SHA-256 digest:
+commit and downloads all 45 shards: 25 canonical `default` shards and 20
+`mt_docs` English-translation shards. It materializes 4,000,380 unique documents
+plus 3,000,285 ID-joined translations into DuckDB. Before indexing, it verifies
+the exact Hub manifest, every shard's byte size and LFS SHA-256 digest, unique
+IDs, source-language mapping, and bidirectional translation coverage:
 
 ```bash
 sops decrypt --output .env config/secrets.sops.env
@@ -176,11 +184,16 @@ uv run ragtime-corpus build
 uv run ragtime-corpus status
 ```
 
-The current source snapshot is about 6.93 GB and the materialized indexed
-database is about 15 GB. Both live outside the repository under
-`${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/`, so every worktree shares them.
-The source Parquet remains available for reproducible rebuilds. Override the
-database with an absolute `RAGTIME_LOCAL_CORPUS_PATH`.
+`status` performs a deep indexed-translation integrity check before reporting
+the corpus as canonical and English-complete.
+
+The pinned source snapshot is 11.62 GB and the unified DuckDB index is about
+24.90 GB. Project artifacts live at `<git-common-dir>/ragtime-cache/`, one
+untracked location shared by every worktree. Installed packages used outside
+this Git checkout fall back to
+`${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/`. Override the shared root with
+an absolute `RAGTIME_PROJECT_CACHE_DIR` or the database alone with
+`RAGTIME_LOCAL_CORPUS_PATH`.
 
 `RAGTIME_DOCUMENT_BACKEND=auto` is the default: it uses the default local index
 when present and otherwise falls back to the cached Dataset Viewer hydrator. An
@@ -199,36 +212,43 @@ with LocalCorpusIndex() as corpus:
     hydration = corpus.enrich_documents(document_ids)
 
 for document in hydration.documents:
-    print(document.document_id, document.text, document.url, document.date)
+    print(document.document_id, document.text, document.english_text)
+    if document.report_text is None:
+        raise RuntimeError(f"English text unavailable for {document.document_id}")
+    use_for_report = document.report_text
 ```
 
 The method deduplicates IDs for lookup, preserves first-seen order, chunks
-arbitrarily large batches, and reports absent IDs in
-`hydration.unresolved_ids`. The local index is revision-pinned, so
-`refresh=True` does not contact the network. The high-level retriever exposes
-the same operation as `retriever.enrich_documents(ids)` when a search client is
-already open.
+arbitrarily large batches, and reports absent base IDs in
+`hydration.unresolved_ids`. Any expected English-translation gap is reported
+separately in `hydration.missing_translation_ids`. The local index is
+revision-pinned, so `refresh=True` does not contact the network. The high-level
+retriever exposes the same operation as `retriever.enrich_documents(ids)` when
+a search client is already open.
 
-Private `/content` fallback remains disabled by default:
+True corpus misses automatically fall back to the private endpoint:
 
 ```python
 result = retriever.retrieve(
     "health benefits of Nordic walking",
-    max_content_fallbacks=2,
+    max_content_fallbacks=5,
 )
 ```
 
-`max_content_fallbacks` opts into at most that many cached `/content` requests
-for IDs absent from the configured corpus. Any fallback document has text but
-no URL, date, or language metadata. Remaining unresolved documents stay in
-rank order with `text=None`; inspect `result.fully_hydrated` and
-`result.unresolved_ids` before generation.
+The default permits at most five rank-ordered `/content` requests for IDs absent
+from an otherwise healthy corpus; those responses are cached without expiry.
+`0` disables fallback and `None` explicitly permits every true miss. The loop
+stops after its first endpoint error. Across all currently cached searches,
+130/130 unique returned IDs resolved locally, so this path has not yet been
+needed. Any fallback document has text but no URL, date, language, or verified
+English variant. Inspect `result.fully_hydrated`, `result.fully_report_ready`,
+`result.unresolved_ids`, and `result.missing_translation_ids` before generation.
 
 Dataset Viewer failures that leave IDs unresolved raise
 `HuggingFaceHydrationError` rather than causing a burst of private requests.
 Set `fallback_on_hf_error=True` only when the same bounded private fallback is
-desired after a remote hydration failure; inspect `result.hydration_failures`
-for any recorded failures.
+desired after a remote hydration failure; that mode requires a finite cap.
+Inspect `result.hydration_failures` for any recorded failures.
 
 Use the lower-level `RagtimeClient` when only document IDs and scores, or an
 explicit single `/content` lookup, are needed:
@@ -248,11 +268,11 @@ with RagtimeClient.from_env() as client:
 
 Private responses and Dataset Viewer fallback documents share the
 permission-restricted SQLite database at
-`${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`. The complete
-local corpus is a separate revision-pinned DuckDB database and does not use
-per-document response caching. Both locations are outside the repository and
-shared across worktrees. Cache overrides must be absolute paths inside a
-user-only directory.
+`<git-common-dir>/ragtime-cache/api-v1.sqlite3`. The complete local corpus is a
+separate revision-pinned DuckDB database and does not use
+per-document response caching. Both live in Git's untracked common metadata
+area and are shared across worktrees. Cache overrides must be absolute paths
+inside a user-only directory.
 
 Private `/pipeline` and `/content` entries do not expire by default because the
 participant endpoint is treated as immutable. Numeric
@@ -322,7 +342,7 @@ token.
 - [`tests`](tests): offline unit tests for HTTP, cache, corpus build, and local
   enrichment behavior.
 
-The RAGTIME2 snapshot and generated DuckDB index live in the user cache and are
-not vendored in this repository. Track details can change, so use the official
-sources linked from the [reference report](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html)
+The RAGTIME2 snapshot and generated DuckDB index live in the Git-common project
+cache, not in any tracked worktree. Track details can change, so use the
+official sources linked from the [reference report](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html)
 when making submission decisions.

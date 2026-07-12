@@ -15,6 +15,8 @@ from .huggingface import (
     DEFAULT_HF_CONFIG,
     DEFAULT_HF_DATASET,
     DEFAULT_HF_DOCUMENT_CACHE_TTL_SECONDS,
+    DEFAULT_HF_MT_CONFIG,
+    DEFAULT_HF_MT_SPLITS,
     DEFAULT_HF_SPLITS,
     HuggingFaceApiError,
     HuggingFaceConfigurationError,
@@ -44,7 +46,16 @@ from .models import (
     RetrievedDocument,
     SearchHit,
 )
-from .retriever import DocumentCorpus, RagtimeRetriever
+from .paths import (
+    PROJECT_CACHE_DIR_ENV,
+    default_project_cache_dir,
+    ensure_private_cache_dir,
+)
+from .retriever import (
+    DEFAULT_MAX_CONTENT_FALLBACKS,
+    DocumentCorpus,
+    RagtimeRetriever,
+)
 
 __all__ = [
     "DEFAULT_CONTENT_COLLECTION",
@@ -52,7 +63,10 @@ __all__ = [
     "DEFAULT_HF_CONFIG",
     "DEFAULT_HF_DATASET",
     "DEFAULT_HF_DOCUMENT_CACHE_TTL_SECONDS",
+    "DEFAULT_HF_MT_CONFIG",
+    "DEFAULT_HF_MT_SPLITS",
     "DEFAULT_HF_SPLITS",
+    "DEFAULT_MAX_CONTENT_FALLBACKS",
     "DEFAULT_PIPELINE",
     "Document",
     "DocumentCorpus",
@@ -73,6 +87,7 @@ __all__ = [
     "LocalCorpusReadError",
     "LocalCorpusValidationError",
     "PipelineResult",
+    "PROJECT_CACHE_DIR_ENV",
     "RagtimeApiError",
     "RagtimeClient",
     "RagtimeConfigurationError",
@@ -86,4 +101,6 @@ __all__ = [
     "build_from_parquet",
     "default_cache_path",
     "default_local_corpus_path",
+    "default_project_cache_dir",
+    "ensure_private_cache_dir",
 ]

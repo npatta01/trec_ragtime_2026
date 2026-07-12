@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .paths import default_project_cache_dir, ensure_private_cache_dir
+
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_CACHE_NAMESPACE = "ragtime2-2026-v1"
 DEFAULT_CACHE_FILENAME = "api-v1.sqlite3"
@@ -34,7 +36,7 @@ def _absolute_path(value: str | os.PathLike[str], setting: str) -> Path:
 
 
 def default_cache_path() -> Path:
-    """Return a user-level cache path that is independent of the worktree."""
+    """Return the project-level API cache shared by every worktree."""
 
     explicit_path = os.getenv("RAGTIME_CACHE_PATH", "").strip()
     if explicit_path:
@@ -46,13 +48,7 @@ def default_cache_path() -> Path:
             _absolute_path(explicit_dir, "RAGTIME_CACHE_DIR") / DEFAULT_CACHE_FILENAME
         )
 
-    xdg_cache_home = os.getenv("XDG_CACHE_HOME", "").strip()
-    cache_root = (
-        _absolute_path(xdg_cache_home, "XDG_CACHE_HOME")
-        if xdg_cache_home
-        else Path.home() / ".cache"
-    )
-    return cache_root / "trec-ragtime-2026" / DEFAULT_CACHE_FILENAME
+    return default_project_cache_dir() / DEFAULT_CACHE_FILENAME
 
 
 class SQLiteResponseCache:
@@ -88,12 +84,7 @@ class SQLiteResponseCache:
         return connection
 
     def _initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        parent_mode = stat.S_IMODE(self.path.parent.stat().st_mode)
-        if parent_mode & 0o077:
-            raise PermissionError(
-                f"cache directory must be user-only (chmod 700): {self.path.parent}"
-            )
+        ensure_private_cache_dir(self.path.parent)
 
         open_flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):

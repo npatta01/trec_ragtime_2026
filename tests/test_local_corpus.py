@@ -14,6 +14,7 @@ from trec_ragtime import HuggingFaceCorpus, RagtimeRetriever
 from trec_ragtime.local_corpus import (
     DOCUMENT_ID_INDEX_NAME,
     LOCAL_CORPUS_PATH_ENV,
+    TRANSLATION_DOCUMENT_ID_INDEX_NAME,
     LocalCorpusBuildError,
     LocalCorpusConfigurationError,
     LocalCorpusIndex,
@@ -42,6 +43,28 @@ def write_parquet(
         )
         if rows:
             connection.executemany("INSERT INTO source VALUES (?, ?, ?, ?)", rows)
+        connection.execute("COPY source TO ? (FORMAT PARQUET)", [str(path)])
+    finally:
+        connection.close()
+
+
+def write_translation_parquet(
+    path: Path,
+    rows: list[tuple[str, str, str | None]],
+) -> None:
+    connection = duckdb.connect()
+    try:
+        connection.execute(
+            """
+            CREATE TABLE source (
+                id VARCHAR,
+                text VARCHAR,
+                lang VARCHAR
+            )
+            """
+        )
+        if rows:
+            connection.executemany("INSERT INTO source VALUES (?, ?, ?)", rows)
         connection.execute("COPY source TO ? (FORMAT PARQUET)", [str(path)])
     finally:
         connection.close()
@@ -133,6 +156,151 @@ class LocalCorpusIndexTests(unittest.TestCase):
                     )
             finally:
                 connection.close()
+
+    def test_unified_index_keeps_original_text_and_exposes_english_report_text(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shards: dict[str, list[Path]] = {}
+            original_rows = {
+                "eng": ("doc-eng", "English original"),
+                "spa": ("doc-spa", "Texto original"),
+                "rus": ("doc-rus", "Исходный текст"),
+                "zho": ("doc-zho", "原文"),
+            }
+            for split, (document_id, text) in original_rows.items():
+                shard = root / f"{split}.parquet"
+                write_parquet(shard, [(document_id, text, None, None)])
+                shards[split] = [shard]
+
+            translations: dict[str, list[Path]] = {}
+            translated_rows = {
+                "spa.mt.eng": ("doc-spa", "Spanish document in English"),
+                "rus.mt.eng": ("doc-rus", "Russian document in English"),
+                "zho.mt.eng": ("doc-zho", "Chinese document in English"),
+            }
+            for split, (document_id, text) in translated_rows.items():
+                shard = root / f"{split}.parquet"
+                write_translation_parquet(shard, [(document_id, text, "eng")])
+                translations[split] = [shard]
+
+            destination = build_from_parquet(
+                shards,
+                root / "corpus.duckdb",
+                revision="revision-with-translations",
+                translations=translations,
+            )
+            index = LocalCorpusIndex(destination, batch_size=2)
+            result = index.enrich_documents(
+                ["doc-spa", "missing", "doc-eng", "doc-zho", "doc-rus"]
+            )
+
+            self.assertEqual(
+                [document.text for document in result.documents],
+                [
+                    "Texto original",
+                    "English original",
+                    "原文",
+                    "Исходный текст",
+                ],
+            )
+            self.assertEqual(
+                [document.english_text for document in result.documents],
+                [
+                    "Spanish document in English",
+                    None,
+                    "Chinese document in English",
+                    "Russian document in English",
+                ],
+            )
+            self.assertEqual(
+                [document.report_text for document in result.documents],
+                [
+                    "Spanish document in English",
+                    "English original",
+                    "Chinese document in English",
+                    "Russian document in English",
+                ],
+            )
+            self.assertEqual(result.unresolved_ids, ("missing",))
+            self.assertEqual(result.missing_translation_ids, ())
+            self.assertEqual(result.translation_unresolved_ids, ())
+            self.assertEqual(index.metadata.translation_config, "mt_docs")
+            self.assertEqual(index.metadata.translation_count, 3)
+            self.assertEqual(index.metadata.translation_shard_count, 3)
+            self.assertEqual(
+                index.metadata.translation_splits,
+                ("rus.mt.eng", "spa.mt.eng", "zho.mt.eng"),
+            )
+            self.assertEqual(index.verify_integrity(), index.metadata)
+
+            connection = duckdb.connect(str(destination), read_only=True)
+            try:
+                row = connection.execute(
+                    """
+                    SELECT is_unique
+                    FROM duckdb_indexes()
+                    WHERE index_name = ?
+                    """,
+                    [TRANSLATION_DOCUMENT_ID_INDEX_NAME],
+                ).fetchone()
+                self.assertEqual(row, (True,))
+            finally:
+                connection.close()
+
+    def test_missing_expected_translation_is_separate_from_unknown_base_id(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "spa.parquet"
+            translated = root / "spa.mt.eng.parquet"
+            write_parquet(
+                original,
+                [
+                    ("doc-1", "uno", None, None),
+                    ("doc-2", "dos", None, None),
+                ],
+            )
+            write_translation_parquet(
+                translated,
+                [
+                    ("doc-1", "one", "eng"),
+                    ("doc-2", "two", "eng"),
+                ],
+            )
+            destination = build_from_parquet(
+                {"spa": [original]},
+                root / "corpus.duckdb",
+                revision="revision-1",
+                translations={"spa.mt.eng": [translated]},
+            )
+
+            connection = duckdb.connect(str(destination))
+            try:
+                connection.execute(
+                    "DELETE FROM translations WHERE document_id = 'doc-2'"
+                )
+                connection.execute("UPDATE corpus_metadata SET translation_count = 1")
+            finally:
+                connection.close()
+
+            result = LocalCorpusIndex(destination).get_many(
+                ["doc-2", "unknown", "doc-1"]
+            )
+
+            self.assertEqual(result.unresolved_ids, ("unknown",))
+            self.assertEqual(result.missing_translation_ids, ("doc-2",))
+            self.assertEqual(result.translation_unresolved_ids, ("doc-2",))
+            self.assertEqual(result.documents[0].text, "dos")
+            self.assertIsNone(result.documents[0].english_text)
+            self.assertIsNone(result.documents[0].report_text)
+            with self.assertRaisesRegex(
+                LocalCorpusValidationError,
+                "missing an expected English translation",
+            ):
+                LocalCorpusIndex(destination).verify_integrity()
 
     def test_large_lookup_is_chunked_and_deduplicated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -283,6 +451,111 @@ class LocalCorpusIndexTests(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertEqual(list(root.glob(f".{destination.name}.*.tmp*")), [])
 
+    def test_translation_ids_must_be_unique_and_language_must_be_english(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "duplicate",
+                [("doc-1", "one", "eng"), ("doc-1", "again", "eng")],
+                "duplicate document IDs",
+            ),
+            ("language", [("doc-1", "uno", "spa")], "lang='eng'"),
+        )
+        for name, translated_rows, message in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = root / "spa.parquet"
+                translated = root / "spa.mt.eng.parquet"
+                destination = root / "corpus.duckdb"
+                write_parquet(original, [("doc-1", "uno", None, None)])
+                write_translation_parquet(translated, translated_rows)
+
+                with self.assertRaisesRegex(LocalCorpusBuildError, message):
+                    build_from_parquet(
+                        {"spa": [original]},
+                        destination,
+                        revision="revision-1",
+                        translations={"spa.mt.eng": [translated]},
+                    )
+
+                self.assertFalse(destination.exists())
+
+    def test_translation_split_must_match_canonical_document_split(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spa = root / "spa.parquet"
+            rus = root / "rus.parquet"
+            spa_translation = root / "spa.mt.eng.parquet"
+            rus_translation = root / "rus.mt.eng.parquet"
+            destination = root / "corpus.duckdb"
+            write_parquet(spa, [("doc-spa", "uno", None, None)])
+            write_parquet(rus, [("doc-rus", "один", None, None)])
+            write_translation_parquet(
+                spa_translation,
+                [("doc-rus", "Russian in English", "eng")],
+            )
+            write_translation_parquet(
+                rus_translation,
+                [("doc-spa", "Spanish in English", "eng")],
+            )
+
+            with self.assertRaisesRegex(
+                LocalCorpusBuildError,
+                "translation split does not match",
+            ):
+                build_from_parquet(
+                    {"spa": [spa], "rus": [rus]},
+                    destination,
+                    revision="revision-1",
+                    translations={
+                        "spa.mt.eng": [spa_translation],
+                        "rus.mt.eng": [rus_translation],
+                    },
+                )
+
+            self.assertFalse(destination.exists())
+
+    def test_translation_coverage_is_bidirectional(self) -> None:
+        cases = (
+            (
+                "missing",
+                [
+                    ("doc-1", "uno", None, None),
+                    ("doc-2", "dos", None, None),
+                ],
+                [("doc-1", "one", "eng")],
+                "does not cover every canonical document",
+            ),
+            (
+                "orphan",
+                [("doc-1", "uno", None, None)],
+                [
+                    ("doc-1", "one", "eng"),
+                    ("orphan", "orphan", "eng"),
+                ],
+                "without a canonical document",
+            ),
+        )
+        for name, original_rows, translated_rows, message in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = root / "spa.parquet"
+                translated = root / "spa.mt.eng.parquet"
+                destination = root / "corpus.duckdb"
+                write_parquet(original, original_rows)
+                write_translation_parquet(translated, translated_rows)
+
+                with self.assertRaisesRegex(LocalCorpusBuildError, message):
+                    build_from_parquet(
+                        {"spa": [original]},
+                        destination,
+                        revision="revision-1",
+                        translations={"spa.mt.eng": [translated]},
+                    )
+
+                self.assertFalse(destination.exists())
+
     def test_post_publication_sync_failure_reports_published_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -332,6 +605,21 @@ class LocalCorpusIndexTests(unittest.TestCase):
                     destination,
                     expected_splits=("eng", "spa", "rus", "zho"),
                 )
+            with self.assertRaisesRegex(
+                LocalCorpusValidationError,
+                "expected_translation_splits",
+            ):
+                LocalCorpusIndex(
+                    destination,
+                    expected_translation_splits=("spa.mt.eng",),
+                )
+            self.assertEqual(
+                LocalCorpusIndex(
+                    destination,
+                    expected_translation_splits=(),
+                ).metadata.translation_splits,
+                (),
+            )
 
             connection = duckdb.connect(str(destination))
             try:
@@ -362,6 +650,13 @@ class LocalCorpusIndexTests(unittest.TestCase):
                     root / "unused.duckdb",
                     revision="revision-1",
                 )
+            with self.assertRaisesRegex(ValueError, "translation splits"):
+                build_from_parquet(
+                    {"spa": [root / "unused.parquet"]},
+                    root / "unused.duckdb",
+                    revision="revision-1",
+                    translations={"rus.mt.eng": [root / "unused.parquet"]},
+                )
 
             shard = root / "eng.parquet"
             write_parquet(shard, [("doc-1", "one", None, None)])
@@ -386,13 +681,16 @@ class LocalCorpusIndexTests(unittest.TestCase):
                 os.environ,
                 {
                     LOCAL_CORPUS_PATH_ENV: "",
-                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "RAGTIME_PROJECT_CACHE_DIR": str(
+                        root / "cache" / "trec-ragtime-2026"
+                    ),
+                    "XDG_CACHE_HOME": "",
                 },
                 clear=False,
             ):
                 self.assertEqual(
                     default_local_corpus_path(),
-                    root / "cache" / "trec-ragtime-2026" / "ragtime2-default-v1.duckdb",
+                    root / "cache" / "trec-ragtime-2026" / "ragtime2-corpus-v2.duckdb",
                 )
 
             explicit = root / "shared" / "snapshot.duckdb"
@@ -417,6 +715,7 @@ class LocalCorpusIndexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shards = {}
+            translations = {}
             for split in ("eng", "spa", "rus", "zho"):
                 shard = root / f"{split}.parquet"
                 write_parquet(
@@ -424,10 +723,19 @@ class LocalCorpusIndexTests(unittest.TestCase):
                     [(f"doc-{split}", f"text {split}", None, None)],
                 )
                 shards[split] = [shard]
+                if split != "eng":
+                    translation_split = f"{split}.mt.eng"
+                    translation_shard = root / f"{translation_split}.parquet"
+                    write_translation_parquet(
+                        translation_shard,
+                        [(f"doc-{split}", f"English text {split}", "eng")],
+                    )
+                    translations[translation_split] = [translation_shard]
             destination = build_from_parquet(
                 shards,
                 root / "corpus.duckdb",
                 revision="revision-1",
+                translations=translations,
             )
             environment = {
                 "RAGTIME_BASE_URL": "https://api.example",
@@ -458,7 +766,10 @@ class LocalCorpusIndexTests(unittest.TestCase):
                 "RAGTIME_BEARER_TOKEN": "secret",
                 "RAGTIME_DOCUMENT_BACKEND": "auto",
                 "RAGTIME_LOCAL_CORPUS_PATH": "",
-                "XDG_CACHE_HOME": str(Path(directory) / "empty-cache"),
+                "RAGTIME_PROJECT_CACHE_DIR": str(
+                    Path(directory) / "empty-cache" / "trec-ragtime-2026"
+                ),
+                "XDG_CACHE_HOME": "",
             }
             with patch.dict(os.environ, environment, clear=False):
                 with RagtimeRetriever.from_env(use_cache=False) as retriever:

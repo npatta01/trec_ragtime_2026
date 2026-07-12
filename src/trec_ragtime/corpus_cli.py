@@ -12,12 +12,19 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 
-from .huggingface import DEFAULT_HF_CONFIG, DEFAULT_HF_DATASET, DEFAULT_HF_SPLITS
+from .huggingface import (
+    DEFAULT_HF_CONFIG,
+    DEFAULT_HF_DATASET,
+    DEFAULT_HF_MT_CONFIG,
+    DEFAULT_HF_MT_SPLITS,
+    DEFAULT_HF_SPLITS,
+)
 from .local_corpus import (
     LocalCorpusIndex,
     build_from_parquet,
     default_local_corpus_path,
 )
+from .paths import default_project_cache_dir, ensure_private_cache_dir
 
 DEFAULT_PARQUET_REVISION = "refs/convert/parquet"
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -29,6 +36,7 @@ class ParquetShard:
     """One canonical Hub shard and its immutable LFS identity."""
 
     path: str
+    config: str
     split: str
     size: int
     sha256: str
@@ -47,13 +55,19 @@ def _validate_manifest(
     if len({entry.path for entry in entries}) != len(entries):
         raise ValueError("manifest must contain unique shard paths")
 
-    represented_splits: set[str] = set()
+    canonical_splits = {
+        DEFAULT_HF_CONFIG: DEFAULT_HF_SPLITS,
+        DEFAULT_HF_MT_CONFIG: DEFAULT_HF_MT_SPLITS,
+    }
+    represented_splits: set[tuple[str, str]] = set()
     for entry in entries:
-        expected_prefix = f"{DEFAULT_HF_CONFIG}/{entry.split}/"
+        if not isinstance(entry.config, str) or not isinstance(entry.split, str):
+            raise ValueError(f"invalid canonical Parquet manifest entry: {entry.path}")
+        expected_prefix = f"{entry.config}/{entry.split}/"
         relative_name = entry.path.removeprefix(expected_prefix)
         if (
-            entry.split not in DEFAULT_HF_SPLITS
-            or not isinstance(entry.split, str)
+            entry.config not in canonical_splits
+            or entry.split not in canonical_splits.get(entry.config, ())
             or not entry.path.startswith(expected_prefix)
             or not relative_name
             or "/" in relative_name
@@ -65,11 +79,17 @@ def _validate_manifest(
             or SHA256_PATTERN.fullmatch(entry.sha256) is None
         ):
             raise ValueError(f"invalid canonical Parquet manifest entry: {entry.path}")
-        represented_splits.add(entry.split)
-    if represented_splits != set(DEFAULT_HF_SPLITS):
-        missing = sorted(set(DEFAULT_HF_SPLITS).difference(represented_splits))
+        represented_splits.add((entry.config, entry.split))
+    expected_splits = {
+        (config, split)
+        for config, splits in canonical_splits.items()
+        for split in splits
+    }
+    if represented_splits != expected_splits:
+        missing = sorted(expected_splits.difference(represented_splits))
         raise ValueError(
-            "manifest is missing canonical Parquet splits: " + ", ".join(missing)
+            "manifest is missing canonical Parquet splits: "
+            + ", ".join(f"{config}/{split}" for config, split in missing)
         )
     return tuple(sorted(entries, key=lambda entry: entry.path))
 
@@ -114,7 +134,12 @@ def fetch_parquet_manifest(revision: str) -> tuple[ParquetShard, ...]:
         raise RuntimeError("Hugging Face manifest revision does not match request")
 
     split_prefixes = {
-        f"{DEFAULT_HF_CONFIG}/{split}/": split for split in DEFAULT_HF_SPLITS
+        f"{config}/{split}/": (config, split)
+        for config, splits in (
+            (DEFAULT_HF_CONFIG, DEFAULT_HF_SPLITS),
+            (DEFAULT_HF_MT_CONFIG, DEFAULT_HF_MT_SPLITS),
+        )
+        for split in splits
     }
     manifest: list[ParquetShard] = []
     seen_paths: set[str] = set()
@@ -122,17 +147,18 @@ def fetch_parquet_manifest(revision: str) -> tuple[ParquetShard, ...]:
         path = sibling.rfilename
         if not isinstance(path, str):
             raise RuntimeError("Hugging Face returned a non-string repository path")
-        split = next(
+        identity = next(
             (
-                candidate
-                for prefix, candidate in split_prefixes.items()
+                candidate_identity
+                for prefix, candidate_identity in split_prefixes.items()
                 if path.startswith(prefix)
             ),
             None,
         )
-        if split is None or not path.endswith(".parquet"):
+        if identity is None or not path.endswith(".parquet"):
             continue
-        expected_prefix = f"{DEFAULT_HF_CONFIG}/{split}/"
+        config, split = identity
+        expected_prefix = f"{config}/{split}/"
         relative_name = path.removeprefix(expected_prefix)
         if not relative_name or "/" in relative_name:
             raise RuntimeError(f"unexpected canonical Parquet path: {path}")
@@ -153,6 +179,7 @@ def fetch_parquet_manifest(revision: str) -> tuple[ParquetShard, ...]:
         manifest.append(
             ParquetShard(
                 path=path,
+                config=config,
                 split=split,
                 size=sibling.size,
                 sha256=lfs.sha256,
@@ -176,7 +203,7 @@ def _sha256(path: Path) -> str:
 def verify_parquet_snapshot(
     snapshot: Path,
     manifest: Sequence[ParquetShard],
-) -> dict[str, tuple[Path, ...]]:
+) -> dict[str, dict[str, tuple[Path, ...]]]:
     """Verify exact paths, sizes, and LFS hashes before indexing a snapshot."""
 
     if not snapshot.is_absolute():
@@ -185,13 +212,17 @@ def verify_parquet_snapshot(
     expected = {shard.path: shard for shard in entries}
 
     actual_paths: set[str] = set()
-    for split in DEFAULT_HF_SPLITS:
-        split_root = snapshot / DEFAULT_HF_CONFIG / split
-        if split_root.exists():
-            actual_paths.update(
-                path.relative_to(snapshot).as_posix()
-                for path in split_root.rglob("*.parquet")
-            )
+    for config, splits in (
+        (DEFAULT_HF_CONFIG, DEFAULT_HF_SPLITS),
+        (DEFAULT_HF_MT_CONFIG, DEFAULT_HF_MT_SPLITS),
+    ):
+        for split in splits:
+            split_root = snapshot / config / split
+            if split_root.exists():
+                actual_paths.update(
+                    path.relative_to(snapshot).as_posix()
+                    for path in split_root.rglob("*.parquet")
+                )
     expected_paths = set(expected)
     if actual_paths != expected_paths:
         missing = sorted(expected_paths.difference(actual_paths))
@@ -220,8 +251,18 @@ def verify_parquet_snapshot(
                 "delete that file and download again"
             )
     return {
-        split: tuple(snapshot / shard.path for shard in entries if shard.split == split)
-        for split in DEFAULT_HF_SPLITS
+        config: {
+            split: tuple(
+                snapshot / shard.path
+                for shard in entries
+                if shard.config == config and shard.split == split
+            )
+            for split in splits
+        }
+        for config, splits in (
+            (DEFAULT_HF_CONFIG, DEFAULT_HF_SPLITS),
+            (DEFAULT_HF_MT_CONFIG, DEFAULT_HF_MT_SPLITS),
+        )
     }
 
 
@@ -232,7 +273,7 @@ def download_parquet_snapshot(
     source_root: Path | None = None,
     max_workers: int = 4,
 ) -> Path:
-    """Download all original-language Parquet shards at a pinned revision."""
+    """Download all original and English-translation shards at one revision."""
 
     if not isinstance(revision, str) or COMMIT_PATTERN.fullmatch(revision) is None:
         raise ValueError("revision must be a 40-character lowercase commit SHA")
@@ -245,12 +286,16 @@ def download_parquet_snapshot(
     canonical_manifest = _validate_manifest(
         fetch_parquet_manifest(revision) if manifest is None else manifest
     )
-    root = default_corpus_source_root() if source_root is None else source_root
+    if source_root is None:
+        ensure_private_cache_dir(default_project_cache_dir())
+        root = default_corpus_source_root()
+    else:
+        root = source_root
     if not root.is_absolute():
         raise ValueError("source_root must be an absolute path")
+    ensure_private_cache_dir(root)
     destination = root / revision
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    destination.chmod(0o700)
+    ensure_private_cache_dir(destination)
     downloaded = snapshot_download(
         repo_id=DEFAULT_HF_DATASET,
         repo_type="dataset",
@@ -266,7 +311,7 @@ def download_parquet_snapshot(
 def discover_parquet_shards(
     snapshot: Path,
     manifest: Sequence[ParquetShard],
-) -> dict[str, tuple[Path, ...]]:
+) -> dict[str, dict[str, tuple[Path, ...]]]:
     """Return the canonical split-to-file mapping from a downloaded snapshot."""
 
     if not snapshot.is_absolute():
@@ -275,7 +320,7 @@ def discover_parquet_shards(
 
 
 def _metadata_record(index: LocalCorpusIndex) -> dict[str, object]:
-    metadata = index.metadata
+    metadata = index.verify_integrity()
     return {
         "path": str(index.path),
         "schema_version": metadata.schema_version,
@@ -285,8 +330,16 @@ def _metadata_record(index: LocalCorpusIndex) -> dict[str, object]:
         "document_count": metadata.document_count,
         "shard_count": metadata.shard_count,
         "splits": list(metadata.splits),
+        "translation_config": metadata.translation_config,
+        "translation_count": metadata.translation_count,
+        "translation_shard_count": metadata.translation_shard_count,
+        "translation_splits": list(metadata.translation_splits),
         "canonical": metadata.dataset == DEFAULT_HF_DATASET
-        and set(metadata.splits) == set(DEFAULT_HF_SPLITS),
+        and set(metadata.splits) == set(DEFAULT_HF_SPLITS)
+        and metadata.translation_config == DEFAULT_HF_MT_CONFIG
+        and set(metadata.translation_splits) == set(DEFAULT_HF_MT_SPLITS),
+        "english_translations_complete": set(metadata.translation_splits)
+        == set(DEFAULT_HF_MT_SPLITS),
         "built_at": metadata.built_at,
     }
 
@@ -307,6 +360,7 @@ def _build_command(arguments: argparse.Namespace) -> int:
             expected_dataset=DEFAULT_HF_DATASET,
             expected_revision=revision,
             expected_splits=DEFAULT_HF_SPLITS,
+            expected_translation_splits=DEFAULT_HF_MT_SPLITS,
         ) as index:
             print(
                 json.dumps({"reused": True, **_metadata_record(index)}, sort_keys=True)
@@ -341,9 +395,10 @@ def _build_command(arguments: argparse.Namespace) -> int:
 
     try:
         built_path = build_from_parquet(
-            verified_shards,
+            verified_shards[DEFAULT_HF_CONFIG],
             index_path,
             revision=revision,
+            translations=verified_shards[DEFAULT_HF_MT_CONFIG],
             replace=arguments.replace,
         )
     except FileExistsError:
@@ -356,6 +411,7 @@ def _build_command(arguments: argparse.Namespace) -> int:
             expected_dataset=DEFAULT_HF_DATASET,
             expected_revision=revision,
             expected_splits=DEFAULT_HF_SPLITS,
+            expected_translation_splits=DEFAULT_HF_MT_SPLITS,
         ) as index:
             print(
                 json.dumps({"reused": True, **_metadata_record(index)}, sort_keys=True)
@@ -366,6 +422,7 @@ def _build_command(arguments: argparse.Namespace) -> int:
         expected_dataset=DEFAULT_HF_DATASET,
         expected_revision=revision,
         expected_splits=DEFAULT_HF_SPLITS,
+        expected_translation_splits=DEFAULT_HF_MT_SPLITS,
     ) as index:
         print(json.dumps({"reused": False, **_metadata_record(index)}, sort_keys=True))
     return 0
@@ -382,6 +439,7 @@ def _status_command(arguments: argparse.Namespace) -> int:
             path,
             expected_dataset=DEFAULT_HF_DATASET,
             expected_splits=DEFAULT_HF_SPLITS,
+            expected_translation_splits=DEFAULT_HF_MT_SPLITS,
         )
         if arguments.index_path is None
         else LocalCorpusIndex(path)

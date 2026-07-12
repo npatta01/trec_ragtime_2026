@@ -52,7 +52,7 @@ class Document:
 
 @dataclass(frozen=True, slots=True)
 class HuggingFaceDocument:
-    """One original-language RAGTIME2 row loaded from Hugging Face."""
+    """One canonical RAGTIME2 row with an optional English translation."""
 
     dataset: str
     config: str
@@ -64,12 +64,21 @@ class HuggingFaceDocument:
     local_cache_hit: bool | None
     cache_stored_at: float | None
     source: str = "huggingface"
+    english_text: str | None = None
 
     @property
     def language(self) -> str:
         """Return the corpus language encoded by the source split."""
 
         return self.split
+
+    @property
+    def report_text(self) -> str | None:
+        """Return verified English text, or ``None`` when translation is absent."""
+
+        if self.english_text is not None:
+            return self.english_text
+        return self.text if self.split == "eng" else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +96,18 @@ class HydrationResult:
     documents: tuple[HuggingFaceDocument, ...]
     unresolved_ids: tuple[str, ...]
     failures: tuple[HydrationFailure, ...]
+    missing_translation_ids: tuple[str, ...] = ()
 
     def by_id(self) -> dict[str, HuggingFaceDocument]:
         """Index hydrated documents by their opaque corpus ID."""
 
         return {document.document_id: document for document in self.documents}
+
+    @property
+    def translation_unresolved_ids(self) -> tuple[str, ...]:
+        """Compatibility alias for IDs lacking an expected translation."""
+
+        return self.missing_translation_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,10 +123,19 @@ class RetrievedDocument:
     language: str | None
     content_source: str | None
     content_local_cache_hit: bool | None
+    english_text: str | None = None
 
     @property
     def hydrated(self) -> bool:
         return self.text is not None
+
+    @property
+    def report_text(self) -> str | None:
+        """Return verified English text, or ``None`` when translation is absent."""
+
+        if self.english_text is not None:
+            return self.english_text
+        return self.text if self.language == "eng" else None
 
     def as_record(self, *, include_text: bool = True) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -125,6 +150,8 @@ class RetrievedDocument:
         }
         if include_text:
             record["text"] = self.text
+            record["english_text"] = self.english_text
+            record["report_text"] = self.report_text
         return record
 
 
@@ -135,6 +162,7 @@ class RetrievalResult:
     search_result: PipelineResult
     documents: tuple[RetrievedDocument, ...]
     hydration_failures: tuple[HydrationFailure, ...] = ()
+    missing_translation_ids: tuple[str, ...] = ()
 
     @property
     def query(self) -> str:
@@ -151,6 +179,16 @@ class RetrievalResult:
     @property
     def fully_hydrated(self) -> bool:
         return all(document.hydrated for document in self.documents)
+
+    @property
+    def fully_report_ready(self) -> bool:
+        """Return whether every hit has text suitable for English synthesis."""
+
+        return (
+            self.fully_hydrated
+            and not self.missing_translation_ids
+            and all(document.report_text is not None for document in self.documents)
+        )
 
     @property
     def unresolved_ids(self) -> tuple[str, ...]:

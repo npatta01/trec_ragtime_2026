@@ -21,6 +21,7 @@ from trec_ragtime import (
     HydrationResult,
     PipelineResult,
     RagtimeApiError,
+    RagtimeClient,
     RagtimeRetriever,
     SearchHit,
 )
@@ -59,6 +60,18 @@ class RecordingGetSession:
         self.closed = True
 
 
+class RecordingPostSession:
+    def __init__(self, *responses):
+        self.responses = deque(responses)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if not self.responses:
+            raise AssertionError("unexpected RAGTIME request")
+        return self.responses.popleft()
+
+
 def document_row(
     document_id,
     text,
@@ -93,6 +106,7 @@ def hf_document(
     *,
     split="eng",
     local_cache_hit=False,
+    english_text=None,
 ):
     return HuggingFaceDocument(
         dataset="trec-ragtime/ragtime2",
@@ -104,6 +118,7 @@ def hf_document(
         date="2026-01-02",
         local_cache_hit=local_cache_hit,
         cache_stored_at=123.0,
+        english_text=english_text,
     )
 
 
@@ -212,6 +227,7 @@ class HuggingFaceCorpusTests(unittest.TestCase):
         )
         self.assertEqual(result.unresolved_ids, ())
         self.assertEqual(result.failures, ())
+        self.assertEqual(result.missing_translation_ids, ("doc-b", "doc-c"))
         self.assertEqual(len(session.calls), 4)
         expected_filters = (
             "\"id\"='doc-b' OR \"id\"='doc''a'",
@@ -539,7 +555,12 @@ class RagtimeRetrieverTests(unittest.TestCase):
         corpus = FakeCorpus(
             HydrationResult(
                 documents=(
-                    hf_document("doc-mid", "middle", split="spa"),
+                    hf_document(
+                        "doc-mid",
+                        "medio",
+                        split="spa",
+                        english_text="middle",
+                    ),
                     hf_document(
                         "doc-high",
                         "highest",
@@ -571,6 +592,10 @@ class RagtimeRetrieverTests(unittest.TestCase):
         )
         self.assertEqual(
             [document.text for document in result.documents],
+            ["highest", "medio"],
+        )
+        self.assertEqual(
+            [document.report_text for document in result.documents],
             ["highest", "middle"],
         )
         self.assertEqual(
@@ -602,7 +627,7 @@ class RagtimeRetrieverTests(unittest.TestCase):
         )
         self.assertEqual(client.content_calls, [])
 
-    def test_unresolved_documents_do_not_call_private_content_by_default(self):
+    def test_unresolved_documents_use_cached_private_content_by_default(self):
         search = pipeline_result(["doc-1", "doc-2"])
         client = FakeRagtimeClient(
             search,
@@ -621,11 +646,199 @@ class RagtimeRetrieverTests(unittest.TestCase):
 
         result = RagtimeRetriever(client, corpus).retrieve("query")
 
-        self.assertEqual(client.content_calls, [])
-        self.assertEqual(result.unresolved_ids, ("doc-1", "doc-2"))
-        self.assertFalse(result.fully_hydrated)
+        self.assertEqual(
+            client.content_calls,
+            [
+                {"document_id": "doc-1", "refresh": False},
+                {"document_id": "doc-2", "refresh": False},
+            ],
+        )
+        self.assertEqual(result.unresolved_ids, ())
+        self.assertTrue(result.fully_hydrated)
+        self.assertEqual(result.missing_translation_ids, ("doc-1", "doc-2"))
+        self.assertFalse(result.fully_report_ready)
         self.assertTrue(
-            all(document.content_source is None for document in result.documents)
+            all(
+                document.content_source == "ragtime_api"
+                for document in result.documents
+            )
+        )
+
+    def test_automatic_content_fallback_can_be_disabled(self):
+        search = pipeline_result(["doc-1"])
+        client = FakeRagtimeClient(
+            search,
+            contents={"doc-1": private_document("doc-1", "one")},
+        )
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(),
+                unresolved_ids=("doc-1",),
+                failures=(),
+            )
+        )
+
+        result = RagtimeRetriever(client, corpus).retrieve(
+            "query",
+            max_content_fallbacks=0,
+        )
+
+        self.assertEqual(client.content_calls, [])
+        self.assertEqual(result.unresolved_ids, ("doc-1",))
+
+    def test_automatic_content_fallback_has_a_five_document_circuit_bound(self):
+        document_ids = [f"doc-{number}" for number in range(7)]
+        client = FakeRagtimeClient(
+            pipeline_result(document_ids),
+            contents={
+                document_id: private_document(document_id, document_id)
+                for document_id in document_ids
+            },
+        )
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(),
+                unresolved_ids=tuple(document_ids),
+                failures=(),
+            )
+        )
+
+        result = RagtimeRetriever(client, corpus).retrieve("query")
+
+        self.assertEqual(len(client.content_calls), 5)
+        self.assertEqual(result.unresolved_ids, ("doc-5", "doc-6"))
+
+    def test_true_miss_fallback_stops_after_first_content_error(self):
+        document_ids = ["doc-1", "doc-2", "doc-3"]
+        client = FakeRagtimeClient(
+            pipeline_result(document_ids),
+            contents={
+                "doc-1": private_document("doc-1", "one"),
+                "doc-2": RagtimeApiError("RAGTIME /content failed: HTTP 503"),
+                "doc-3": private_document("doc-3", "three"),
+            },
+        )
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(),
+                unresolved_ids=tuple(document_ids),
+                failures=(),
+            )
+        )
+
+        result = RagtimeRetriever(client, corpus).retrieve(
+            "query",
+            max_content_fallbacks=3,
+        )
+
+        self.assertEqual(
+            [call["document_id"] for call in client.content_calls],
+            ["doc-1", "doc-2"],
+        )
+        self.assertEqual(result.unresolved_ids, ("doc-2", "doc-3"))
+
+    def test_unlimited_true_miss_fallback_hydrates_every_result(self):
+        document_ids = [f"doc-{number}" for number in range(7)]
+        client = FakeRagtimeClient(
+            pipeline_result(document_ids),
+            contents={
+                document_id: private_document(document_id, document_id)
+                for document_id in document_ids
+            },
+        )
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(),
+                unresolved_ids=tuple(document_ids),
+                failures=(),
+            )
+        )
+
+        result = RagtimeRetriever(client, corpus).retrieve(
+            "query",
+            max_content_fallbacks=None,
+        )
+
+        self.assertEqual(len(client.content_calls), len(document_ids))
+        self.assertEqual(result.unresolved_ids, ())
+
+    def test_automatic_fallback_reuses_the_shared_content_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "cache" / "api.sqlite3"
+            pipeline_payload = {
+                "pipeline": "ragtime2%20",
+                "processed": True,
+                "query": "query",
+                "scores": {"doc-1": 1.0},
+                "timestamp": 123.0,
+            }
+            content_payload = {
+                "cached": False,
+                "collection": "ragtime2",
+                "id": "doc-1",
+                "text": "endpoint text",
+            }
+            first_session = RecordingPostSession(
+                FakeResponse(pipeline_payload),
+                FakeResponse(content_payload),
+            )
+            missing = HydrationResult(
+                documents=(),
+                unresolved_ids=("doc-1",),
+                failures=(),
+            )
+            with RagtimeRetriever(
+                RagtimeClient(
+                    "https://api.example",
+                    "secret",
+                    cache_path=cache_path,
+                    session=first_session,
+                ),
+                FakeCorpus(missing),
+            ) as first:
+                first_result = first.retrieve("query")
+
+            second_session = RecordingPostSession()
+            with RagtimeRetriever(
+                RagtimeClient(
+                    "https://api.example",
+                    "different-secret",
+                    cache_path=cache_path,
+                    session=second_session,
+                ),
+                FakeCorpus(missing),
+            ) as second:
+                second_result = second.retrieve("query")
+
+            self.assertEqual(len(first_session.calls), 2)
+            self.assertEqual(second_session.calls, [])
+            self.assertFalse(first_result.documents[0].content_local_cache_hit)
+            self.assertTrue(second_result.documents[0].content_local_cache_hit)
+
+    def test_missing_report_text_ids_preserve_search_rank_across_sources(self):
+        client = FakeRagtimeClient(
+            pipeline_result(["doc-api", "doc-hf"]),
+            contents={"doc-api": private_document("doc-api", "unknown language")},
+        )
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(hf_document("doc-hf", "texto", split="spa"),),
+                unresolved_ids=("doc-api",),
+                failures=(),
+                missing_translation_ids=("doc-hf",),
+            )
+        )
+
+        result = RagtimeRetriever(client, corpus).retrieve("query")
+
+        self.assertEqual(
+            result.missing_translation_ids,
+            ("doc-api", "doc-hf"),
+        )
+        self.assertTrue(result.fully_hydrated)
+        self.assertFalse(result.fully_report_ready)
+        self.assertTrue(
+            all(document.report_text is None for document in result.documents)
         )
 
     def test_content_fallback_is_explicit_bounded_and_rank_ordered(self):
@@ -745,7 +958,7 @@ class RagtimeRetrieverTests(unittest.TestCase):
 
         result = RagtimeRetriever(client, corpus).retrieve(
             "query",
-            max_content_fallbacks=2,
+            max_content_fallbacks=3,
             fallback_on_hf_error=True,
         )
 
@@ -780,6 +993,21 @@ class RagtimeRetrieverTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be a boolean"):
                     RagtimeRetriever(client, corpus).retrieve("query", **options)
                 self.assertEqual(client.search_calls, [])
+
+    def test_unlimited_fallback_is_rejected_for_hydration_errors(self):
+        client = FakeRagtimeClient(pipeline_result(["doc-1"]))
+        corpus = FakeCorpus(
+            HydrationResult(documents=(), unresolved_ids=(), failures=())
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires a finite"):
+            RagtimeRetriever(client, corpus).retrieve(
+                "query",
+                max_content_fallbacks=None,
+                fallback_on_hf_error=True,
+            )
+
+        self.assertEqual(client.search_calls, [])
 
 
 if __name__ == "__main__":

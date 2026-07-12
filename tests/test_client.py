@@ -435,7 +435,12 @@ class RagtimeClientTests(unittest.TestCase):
             with (
                 patch.dict(
                     os.environ,
-                    {"XDG_CACHE_HOME": str(root / "cache")},
+                    {
+                        "RAGTIME_PROJECT_CACHE_DIR": str(
+                            root / "cache" / "trec-ragtime-2026"
+                        ),
+                        "XDG_CACHE_HOME": "",
+                    },
                     clear=False,
                 ),
                 patch.dict(
@@ -460,7 +465,11 @@ class RagtimeClientTests(unittest.TestCase):
     def test_relative_cache_paths_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "absolute path"):
             SQLiteResponseCache("relative.sqlite3")
-        for variable in ("RAGTIME_CACHE_PATH", "RAGTIME_CACHE_DIR", "XDG_CACHE_HOME"):
+        for variable in (
+            "RAGTIME_CACHE_PATH",
+            "RAGTIME_CACHE_DIR",
+            "RAGTIME_PROJECT_CACHE_DIR",
+        ):
             with (
                 self.subTest(variable=variable),
                 patch.dict(
@@ -468,6 +477,7 @@ class RagtimeClientTests(unittest.TestCase):
                     {
                         "RAGTIME_CACHE_PATH": "",
                         "RAGTIME_CACHE_DIR": "",
+                        "RAGTIME_PROJECT_CACHE_DIR": "",
                         "XDG_CACHE_HOME": "",
                         variable: "relative-cache",
                     },

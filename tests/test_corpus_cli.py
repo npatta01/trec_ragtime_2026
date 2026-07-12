@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -19,12 +20,44 @@ from trec_ragtime.corpus_cli import (
     resolve_parquet_revision,
     verify_parquet_snapshot,
 )
+from trec_ragtime.cache import SQLiteResponseCache
 from trec_ragtime.local_corpus import (
     LocalCorpusValidationError,
     build_from_parquet,
     default_local_corpus_path,
 )
 from tests.test_local_corpus import write_parquet
+
+CONFIG_SPLITS = {
+    "default": ("eng", "spa", "rus", "zho"),
+    "mt_docs": ("spa.mt.eng", "rus.mt.eng", "zho.mt.eng"),
+}
+
+
+def write_manifest_snapshot(
+    snapshot: Path,
+    *,
+    wrong_hash_path: str | None = None,
+) -> list[ParquetShard]:
+    manifest = []
+    for config, splits in CONFIG_SPLITS.items():
+        for split in splits:
+            relative_path = f"{config}/{split}/0000.parquet"
+            path = snapshot / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = f"content-{config}-{split}".encode()
+            path.write_bytes(content)
+            expected = b"wrong" if relative_path == wrong_hash_path else content
+            manifest.append(
+                ParquetShard(
+                    path=relative_path,
+                    config=config,
+                    split=split,
+                    size=len(content),
+                    sha256=hashlib.sha256(expected).hexdigest(),
+                )
+            )
+    return manifest
 
 
 class CorpusCliTests(unittest.TestCase):
@@ -55,17 +88,18 @@ class CorpusCliTests(unittest.TestCase):
     def test_manifest_requires_exact_lfs_metadata_for_all_splits(self) -> None:
         revision = "0123456789abcdef0123456789abcdef01234567"
         siblings = []
-        for split in ("eng", "spa", "rus", "zho"):
-            siblings.append(
-                SimpleNamespace(
-                    rfilename=f"default/{split}/0000.parquet",
-                    size=10,
-                    lfs=SimpleNamespace(size=10, sha256="a" * 64),
+        for config, splits in CONFIG_SPLITS.items():
+            for split in splits:
+                siblings.append(
+                    SimpleNamespace(
+                        rfilename=f"{config}/{split}/0000.parquet",
+                        size=10,
+                        lfs=SimpleNamespace(size=10, sha256="a" * 64),
+                    )
                 )
-            )
         siblings.append(
             SimpleNamespace(
-                rfilename="mt_docs/eng/0000.parquet",
+                rfilename="unrelated/eng/0000.parquet",
                 size=10,
                 lfs=SimpleNamespace(size=10, sha256="b" * 64),
             )
@@ -78,11 +112,15 @@ class CorpusCliTests(unittest.TestCase):
 
             manifest = fetch_parquet_manifest(revision)
 
-        self.assertEqual(len(manifest), 4)
+        self.assertEqual(len(manifest), 7)
         self.assertEqual(
-            {shard.split for shard in manifest}, {"eng", "spa", "rus", "zho"}
+            {(shard.config, shard.split) for shard in manifest},
+            {
+                (config, split)
+                for config, splits in CONFIG_SPLITS.items()
+                for split in splits
+            },
         )
-        self.assertTrue(all(shard.path.startswith("default/") for shard in manifest))
         api_type.return_value.dataset_info.assert_called_once_with(
             "trec-ragtime/ragtime2",
             revision=revision,
@@ -90,26 +128,12 @@ class CorpusCliTests(unittest.TestCase):
             token=False,
         )
 
-    def test_download_selects_only_four_original_language_splits(self) -> None:
+    def test_download_selects_original_and_english_translation_splits(self) -> None:
         revision = "0123456789abcdef0123456789abcdef01234567"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             snapshot = root / revision
-            manifest = []
-            for split in ("eng", "spa", "rus", "zho"):
-                relative_path = f"default/{split}/0000.parquet"
-                path = snapshot / relative_path
-                path.parent.mkdir(parents=True, exist_ok=True)
-                content = f"content-{split}".encode()
-                path.write_bytes(content)
-                manifest.append(
-                    ParquetShard(
-                        path=relative_path,
-                        split=split,
-                        size=len(content),
-                        sha256=hashlib.sha256(content).hexdigest(),
-                    )
-                )
+            manifest = write_manifest_snapshot(snapshot)
             with patch(
                 "trec_ragtime.corpus_cli.snapshot_download",
                 return_value=str(snapshot),
@@ -132,30 +156,62 @@ class CorpusCliTests(unittest.TestCase):
                 "default/rus/0000.parquet",
                 "default/spa/0000.parquet",
                 "default/zho/0000.parquet",
+                "mt_docs/rus.mt.eng/0000.parquet",
+                "mt_docs/spa.mt.eng/0000.parquet",
+                "mt_docs/zho.mt.eng/0000.parquet",
             ],
         )
 
     def test_snapshot_verification_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory)
-            manifest = []
-            for split in ("eng", "spa", "rus", "zho"):
-                relative_path = f"default/{split}/0000.parquet"
-                path = snapshot / relative_path
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"tampered")
-                expected = b"original" if split == "eng" else b"tampered"
-                manifest.append(
-                    ParquetShard(
-                        path=relative_path,
-                        split=split,
-                        size=len(b"tampered"),
-                        sha256=hashlib.sha256(expected).hexdigest(),
-                    )
-                )
+            manifest = write_manifest_snapshot(
+                snapshot,
+                wrong_hash_path="default/eng/0000.parquet",
+            )
 
             with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
                 verify_parquet_snapshot(snapshot, manifest)
+
+    def test_corpus_first_initializes_a_private_project_cache(self) -> None:
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        with tempfile.TemporaryDirectory() as directory:
+            project_cache = Path(directory) / "new-project-cache"
+            manifest = [
+                ParquetShard(
+                    path=f"{config}/{split}/0000.parquet",
+                    config=config,
+                    split=split,
+                    size=1,
+                    sha256="a" * 64,
+                )
+                for config, splits in CONFIG_SPLITS.items()
+                for split in splits
+            ]
+            destination = project_cache / "corpus-source" / revision
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "RAGTIME_PROJECT_CACHE_DIR": str(project_cache),
+                        "XDG_CACHE_HOME": "",
+                    },
+                    clear=False,
+                ),
+                patch(
+                    "trec_ragtime.corpus_cli.snapshot_download",
+                    return_value=str(destination),
+                ),
+            ):
+                download_parquet_snapshot(revision, manifest=manifest)
+                SQLiteResponseCache(project_cache / "api-v1.sqlite3")
+
+            self.assertEqual(stat.S_IMODE(project_cache.stat().st_mode), 0o700)
+            self.assertEqual(
+                stat.S_IMODE((project_cache / "corpus-source").stat().st_mode),
+                0o700,
+            )
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o700)
 
     def test_status_prints_machine_readable_index_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -183,7 +239,10 @@ class CorpusCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             environment = {
                 "RAGTIME_LOCAL_CORPUS_PATH": "",
-                "XDG_CACHE_HOME": str(Path(directory) / "cache"),
+                "RAGTIME_PROJECT_CACHE_DIR": str(
+                    Path(directory) / "cache" / "trec-ragtime-2026"
+                ),
+                "XDG_CACHE_HOME": "",
             }
             with patch.dict(os.environ, environment, clear=False):
                 root = Path(directory)

@@ -53,29 +53,34 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   it and `viewer` explicitly selects the remote fallback. Do not silently fall
   back from a missing or corrupt configured local index.
 - The canonical corpus is Hugging Face `default/{eng,spa,rus,zho}`. Never mix in
-  `mt_docs`, whose rows reuse source IDs but contain different translated text.
-- Eight measured documents, two per original-language split, matched the
-  private `/content` text byte-for-byte. Preserve the original-language
-  `default` configuration as the canonical hydration source unless a separate,
-  explicit translation feature is being implemented and tested.
+  `mt_docs` as additional retrieval documents. Its rows reuse Spanish, Russian,
+  and Chinese source IDs; join them as optional English representations.
+- Preserve `document.text` as canonical source content. Use
+  `document.report_text` at the English report-synthesis boundary and inspect
+  `missing_translation_ids` separately from unknown base `unresolved_ids`.
+- All 11 cached private `/content` samples matched the Hugging Face source text
+  byte-for-byte, including two per original-language split. Preserve the
+  original-language `default` configuration as canonical hydration evidence;
+  keep `mt_docs` explicitly separate as an English synthesis representation.
 - Request counts above 20 by changing the RoutIR suffix, such as
   `ragtime2%100`; `top_k=None` enriches everything the endpoint returned, while
   `top_k=N` only truncates that existing result set.
-- `RagtimeRetriever.retrieve()` makes no `/content` fallback calls by default
-  because `max_content_fallbacks=0`. Keep fallback explicit and bounded. A
-  Dataset Viewer split failure that leaves IDs unresolved must raise unless
-  `fallback_on_hf_error=True` is explicitly supplied; that option must still
-  respect `max_content_fallbacks`.
+- `RagtimeRetriever.retrieve()` automatically makes at most five forever-cached
+  `/content` calls for true missing base IDs, stopping after the first error.
+  `max_content_fallbacks=0` disables this and `None` explicitly allows all true
+  misses. A Dataset Viewer split failure that leaves IDs unresolved must raise
+  unless `fallback_on_hf_error=True` is explicitly supplied; that option must
+  still use a finite `max_content_fallbacks`.
 - Keep `ragtime2%20` as literal RoutIR DSL. It is not a URL-encoded space.
 - Use `ragtime/2/all` only for topic records. Use `ragtime2` for the pipeline
   alias and for `/content` collection requests.
 - Never trust JSON object order for search ranking. The reusable client sorts
   scores by descending score and then document ID.
-- The default SQLite cache is outside the repository at
-  `${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`, so it is
-  shared across worktrees. Do not replace it with a worktree-relative cache.
+- The project cache is `<git-common-dir>/ragtime-cache`, so the API cache,
+  source snapshot, and DuckDB index are inherently shared by every Git
+  worktree and cannot be committed. Do not use a worktree-relative cache.
 - The complete local corpus defaults to
-  `${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/ragtime2-default-v1.duckdb`.
+  `<git-common-dir>/ragtime-cache/ragtime2-corpus-v2.duckdb`.
   It is revision-pinned, read-only at runtime, and shared across worktrees.
   Build or inspect it only after decrypting `.env`:
 
@@ -86,9 +91,12 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
 
 - A local corpus lookup must not call Dataset Viewer or write per-document
   response-cache entries; the materialized indexed corpus is already the
-  durable source. Keep source Parquet outside the repository for rebuilds. The
-  builder must verify the exact pinned Hub manifest and every source shard's
-  size and LFS SHA-256 before indexing.
+  durable source. Keep source Parquet outside every tracked worktree for
+  rebuilds. The builder must verify the exact pinned Hub manifest and every
+  source shard's size and LFS SHA-256 before indexing. It must also prove
+  `mt_docs` unique-ID, source-split, English-language, and bidirectional
+  coverage invariants. `ragtime-corpus status` must deep-check those indexed
+  invariants before reporting English translations as complete.
 - Treat the participant API as immutable. `/pipeline` and `/content` cache
   entries do not expire by default; retain explicit refresh and namespace
   rotation only as manual invalidation controls.
