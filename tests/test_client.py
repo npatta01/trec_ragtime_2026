@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -7,9 +8,10 @@ import unittest
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
+from requests_ratelimiter import LimiterMixin
 
 from trec_ragtime import (
     RagtimeApiError,
@@ -67,6 +69,52 @@ def pipeline_payload(scores=None, *, query="query", pipeline="ragtime2%20"):
 
 
 class RagtimeClientTests(unittest.TestCase):
+    def test_default_session_proactively_rate_limits_private_requests(self):
+        client = RagtimeClient(
+            "https://api.example",
+            "secret",
+            use_cache=False,
+        )
+        try:
+            self.assertIsInstance(client._session, LimiterMixin)
+            self.assertEqual(client.requests_per_second, 1.0)
+        finally:
+            client.close()
+
+    def test_each_retry_acquires_a_rate_limit_token(self):
+        class SequenceAdapter(requests.adapters.BaseAdapter):
+            def __init__(self):
+                self.statuses = deque((429, 200))
+
+            def send(self, request, **kwargs):
+                response = requests.Response()
+                response.status_code = self.statuses.popleft()
+                response.request = request
+                response.headers["Content-Type"] = "application/json"
+                response._content = json.dumps(pipeline_payload()).encode()
+                return response
+
+            def close(self):
+                pass
+
+        client = RagtimeClient(
+            "https://api.example",
+            "secret",
+            use_cache=False,
+            retries=1,
+        )
+        adapter = SequenceAdapter()
+        client._session.mount("https://", adapter)
+        acquire = client._session.limiter.try_acquire
+        client._session.limiter.try_acquire = Mock(wraps=acquire)
+        try:
+            with patch("trec_ragtime.client.time.sleep"):
+                result = client.search("query")
+            self.assertEqual(result.hits[0].document_id, "doc-a")
+            self.assertEqual(client._session.limiter.try_acquire.call_count, 2)
+        finally:
+            client.close()
+
     def test_search_posts_exact_request_and_canonical_bearer_header(self):
         for token in ("secret", " Bearer secret ", "bearer secret", "BEARER secret"):
             with self.subTest(token=token):
@@ -514,6 +562,19 @@ class RagtimeClientTests(unittest.TestCase):
             search_cache_ttl_seconds=0,
             content_cache_ttl_seconds=None,
         )
+
+    def test_constructor_rejects_invalid_request_rates(self):
+        for value in (0, -1, float("nan"), float("inf"), True):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(RagtimeConfigurationError, "requests_per_second"),
+            ):
+                RagtimeClient(
+                    "https://api.example",
+                    "secret",
+                    use_cache=False,
+                    requests_per_second=value,
+                )
 
     def test_cache_control_flags_require_booleans(self):
         with self.assertRaisesRegex(RagtimeConfigurationError, "use_cache"):

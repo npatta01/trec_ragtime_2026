@@ -201,6 +201,11 @@ class FakeCorpus:
 
 
 class HuggingFaceCorpusTests(unittest.TestCase):
+    def test_backend_is_deprecated(self):
+        with self.assertWarnsRegex(DeprecationWarning, "LocalCorpusIndex"):
+            corpus = HuggingFaceCorpus(use_cache=False)
+        corpus.close()
+
     def test_batches_or_filters_escapes_ids_and_preserves_requested_order(self):
         session = RecordingGetSession(
             FakeResponse(filter_payload(document_row("doc'a", "A"))),

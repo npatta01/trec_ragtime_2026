@@ -200,9 +200,10 @@ comes from `RAGTIME_LOCAL_CORPUS_PATH`, or defaults beneath the configured
 project cache. A missing, corrupt, or incomplete index raises a clear startup
 error; run `uv run ragtime-corpus build` before retrieval. There is no silent
 Dataset Viewer fallback. Local lookups are read-only, require no Hugging Face
-response cache, and never call Dataset Viewer. Use `HuggingFaceCorpus` directly
-only when explicitly opting into Dataset Viewer hydration without the complete
-local index.
+response cache, and never call Dataset Viewer. `HuggingFaceCorpus`, the former
+opt-in Dataset Viewer backend, is deprecated; build the local corpus instead.
+Its HTTP 429 handling remains temporarily for compatibility and is not part of
+normal local-corpus retrieval.
 
 For direct enrichment without running a search, pass any number of exact IDs:
 
@@ -285,6 +286,14 @@ documents live for 30 days by default; override that TTL with
 independently bypass and replace the corresponding entries through
 `RagtimeRetriever.retrieve()`. Set `use_cache=False` only when intentionally
 running without a cache.
+
+Live participant-API cache misses are proactively limited to one request per
+second per host with `requests-ratelimiter`, before the existing retry/backoff
+policy is applied. Override the positive rate with
+`RAGTIME_REQUESTS_PER_SECOND`. Local cache hits and local DuckDB hydration make
+no HTTP request and consume no rate-limit capacity. Supplying a custom
+`session=` is an explicit transport override and bypasses the built-in limiter
+and retry policy.
 
 Live Dataset Viewer fallback fetches use the dataset's current default
 revision, and their sparse cache remains subject to the configured TTL. The
