@@ -51,6 +51,9 @@ credentials to the notebook, repository, or saved cell outputs.
 
 ## Repository Map
 
+- [`topics/topics.all.2026.v0625.jsonl`](topics/topics.all.2026.v0625.jsonl):
+  [official June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625.jsonl),
+  normalized to one JSON object per line.
 - [`index.html`](index.html): compact GitHub Pages landing page for the project.
 - [`reports/2026-quick-reference-and-2025-reproduction-playbook/index.html`](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html):
   static 2026 quick reference and 2025 reproduction playbook.
