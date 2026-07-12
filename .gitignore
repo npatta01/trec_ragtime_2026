@@ -1,4 +1,9 @@
 .venv/
 .uv-cache/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/

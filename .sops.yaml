@@ -1,0 +1,3 @@
+creation_rules:
+  - path_regex: ^config/secrets\.sops\.env$
+    gcp_kms: projects/np-public-training/locations/global/keyRings/sops/cryptoKeys/sops-key
