@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
+import time
 import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -14,6 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
+from requests_ratelimiter import LimiterMixin
 from urllib3.util.retry import Retry
 
 from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, SQLiteResponseCache
@@ -24,6 +26,7 @@ DEFAULT_CONTENT_COLLECTION = "ragtime2"
 DEFAULT_SEARCH_CACHE_TTL_SECONDS: float | None = None
 DEFAULT_CONTENT_CACHE_TTL_SECONDS: float | None = None
 DEFAULT_TIMEOUT = (5.0, 60.0)
+DEFAULT_REQUESTS_PER_SECOND = 1.0
 RETRIABLE_STATUS_CODES = (429, 500, 502, 503, 504)
 T = TypeVar("T")
 
@@ -80,6 +83,21 @@ def _ttl_from_env(name: str, default: float | None) -> float | None:
     return value
 
 
+def _positive_float_from_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RagtimeConfigurationError(
+            f"{name} must be a finite positive number"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RagtimeConfigurationError(f"{name} must be a finite positive number")
+    return value
+
+
 def _validate_ttl(name: str, value: float | None) -> None:
     if value is None:
         return
@@ -89,20 +107,15 @@ def _validate_ttl(name: str, value: float | None) -> None:
         raise RagtimeConfigurationError(f"{name} must be finite and non-negative")
 
 
-def _retrying_session(retries: int) -> requests.Session:
-    retry = Retry(
-        total=retries,
-        connect=retries,
-        read=retries,
-        status=retries,
-        allowed_methods=frozenset({"POST"}),
-        status_forcelist=RETRIABLE_STATUS_CODES,
-        backoff_factor=0.5,
-        respect_retry_after_header=True,
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
+class _RateLimitedSession(LimiterMixin, requests.Session):
+    """Requests session with proactive, per-host leaky-bucket limiting."""
+
+
+def _rate_limited_session(requests_per_second: float) -> requests.Session:
+    # Retries are deliberately performed in RagtimeClient._post so every wire
+    # attempt passes through LimiterMixin.send() and acquires its own token.
+    adapter = HTTPAdapter(max_retries=0)
+    session = _RateLimitedSession(per_second=requests_per_second)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -124,6 +137,7 @@ class RagtimeClient:
         content_cache_ttl_seconds: float | None = DEFAULT_CONTENT_CACHE_TTL_SECONDS,
         timeout: float | tuple[float, float] = DEFAULT_TIMEOUT,
         retries: int = 3,
+        requests_per_second: float = DEFAULT_REQUESTS_PER_SECOND,
         session: requests.Session | None = None,
         allow_insecure_http: bool = False,
     ) -> None:
@@ -148,6 +162,15 @@ class RagtimeClient:
             raise RagtimeConfigurationError("base URL must use HTTPS")
         if retries < 0:
             raise RagtimeConfigurationError("retries must be non-negative")
+        if (
+            isinstance(requests_per_second, bool)
+            or not isinstance(requests_per_second, (int, float))
+            or not math.isfinite(float(requests_per_second))
+            or requests_per_second <= 0
+        ):
+            raise RagtimeConfigurationError(
+                "requests_per_second must be a finite positive number"
+            )
         _validate_ttl("search cache TTL", search_cache_ttl_seconds)
         _validate_ttl("content cache TTL", content_cache_ttl_seconds)
 
@@ -156,7 +179,16 @@ class RagtimeClient:
         self.timeout = timeout
         self.search_cache_ttl_seconds = search_cache_ttl_seconds
         self.content_cache_ttl_seconds = content_cache_ttl_seconds
-        self._session = session if session is not None else _retrying_session(retries)
+        self.requests_per_second = float(requests_per_second)
+        self.retries = retries
+        # An injected session is an explicit transport override. Preserve its
+        # behavior instead of layering this client's limiter or retries on it.
+        self._request_retries = retries if session is None else 0
+        self._session = (
+            session
+            if session is not None
+            else _rate_limited_session(self.requests_per_second)
+        )
         self._owns_session = session is None
 
         if cache is not None and cache_path is not None:
@@ -200,6 +232,9 @@ class RagtimeClient:
             "content_cache_ttl_seconds": _ttl_from_env(
                 "RAGTIME_CONTENT_CACHE_TTL_SECONDS",
                 DEFAULT_CONTENT_CACHE_TTL_SECONDS,
+            ),
+            "requests_per_second": _positive_float_from_env(
+                "RAGTIME_REQUESTS_PER_SECOND", DEFAULT_REQUESTS_PER_SECOND
             ),
         }
         cache_path = os.getenv("RAGTIME_CACHE_PATH", "").strip()
@@ -293,27 +328,55 @@ class RagtimeClient:
             )
 
     def _post(self, endpoint: str, request: Mapping[str, Any]) -> dict[str, Any]:
-        try:
-            response = self._session.post(
-                f"{self.base_url}{endpoint}",
-                headers={
-                    "Authorization": self._authorization,
-                    "Content-Type": "application/json",
-                },
-                json=dict(request),
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        response: requests.Response | Any | None = None
+        error: requests.RequestException | None = None
+        for attempt in range(self._request_retries + 1):
+            try:
+                response = self._session.post(
+                    f"{self.base_url}{endpoint}",
+                    headers={
+                        "Authorization": self._authorization,
+                        "Content-Type": "application/json",
+                    },
+                    json=dict(request),
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                error = None
+                break
+            except requests.RequestException as exc:
+                error = exc
+                status_code = getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                retriable = status_code in RETRIABLE_STATUS_CODES or status_code is None
+                if attempt >= self._request_retries or not retriable:
+                    break
+
+                retry = Retry(
+                    backoff_factor=0.5,
+                    respect_retry_after_header=True,
+                )
+                retry_after = None
+                if response is not None and hasattr(response, "headers"):
+                    retry_after = retry.get_retry_after(response)
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else 0.5 * (2**attempt)
+                )
+                time.sleep(delay)
+
+        if error is not None:
+            status_code = getattr(getattr(error, "response", None), "status_code", None)
             suffix = (
                 f" HTTP {status_code}"
                 if status_code is not None
-                else f" {exc.__class__.__name__}"
+                else f" {error.__class__.__name__}"
             )
-            raise RagtimeApiError(
-                f"RAGTIME {endpoint} request failed:{suffix}"
-            ) from None
+            raise RagtimeApiError(f"RAGTIME {endpoint} request failed:{suffix}") from None
+
+        assert response is not None
 
         try:
             payload = response.json()

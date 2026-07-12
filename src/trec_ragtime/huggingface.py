@@ -142,10 +142,11 @@ def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
 
 
 class HuggingFaceCorpus:
-    """Hydrate opaque RAGTIME2 IDs with batched Dataset Viewer filters.
+    """Deprecated Dataset Viewer hydration backend.
 
     Documents are cached individually in the same SQLite store used by the
     private search client. The private bearer token is neither needed nor sent.
+    Use :class:`LocalCorpusIndex` through :class:`RagtimeRetriever` instead.
     """
 
     backend_name = "viewer"
@@ -167,6 +168,12 @@ class HuggingFaceCorpus:
         retries: int = 2,
         session: requests.Session | None = None,
     ) -> None:
+        warnings.warn(
+            "HuggingFaceCorpus is deprecated; build and use LocalCorpusIndex "
+            "through RagtimeRetriever.from_env() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if not isinstance(use_cache, bool):
             raise HuggingFaceConfigurationError("use_cache must be a boolean")
         normalized_base_url = base_url.strip().rstrip("/")
