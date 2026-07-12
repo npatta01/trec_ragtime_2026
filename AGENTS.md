@@ -37,3 +37,23 @@ After decrypting `.env`, run notebooks without a SOPS wrapper:
 uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
 uv run jupyter lab notebooks/ragtime_single_query.ipynb
 ```
+
+## Reusable Client And Cache
+
+- Use `trec_ragtime.RagtimeClient` instead of duplicating HTTP or bearer-token
+  handling in notebooks and scripts.
+- Keep `ragtime2%20` as literal RoutIR DSL. It is not a URL-encoded space.
+- Use `ragtime/2/all` only for topic records. Use `ragtime2` for the pipeline
+  alias and for `/content` collection requests.
+- Never trust JSON object order for search ranking. The reusable client sorts
+  scores by descending score and then document ID.
+- The default SQLite cache is outside the repository at
+  `${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`, so it is
+  shared across worktrees. Do not replace it with a worktree-relative cache.
+- Cache keys must include the endpoint, operation, namespace, and exact request,
+  but never the bearer token. Cache only validated successful responses.
+- Decrypt `.env` first, then run the offline tests normally:
+
+  ```bash
+  uv run python -m unittest discover -s tests -v
+  ```
