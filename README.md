@@ -38,35 +38,33 @@ and no Hugging Face token for the public samples.
 ## Private Search API
 
 Registered TREC participants receive the base URL and bearer token separately.
-Set them in your shell before starting Jupyter:
+The notebook loads the ignored root `.env` file automatically and skips private
+retrieval when either value is absent. Do not add credentials to the notebook,
+repository, or saved cell outputs.
 
-```bash
-export RAGTIME_BASE_URL="https://participant-api.example"
-export RAGTIME_BEARER_TOKEN="your-token"
-uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
-```
-
-The notebook skips private retrieval when either variable is absent. Do not add
-credentials to the notebook, repository, or saved cell outputs.
-
-For local development, copy `.env.example` to the ignored `.env` file, add the
-token there, and load it into the shell with `set -a; source .env; set +a`
-before starting Jupyter. A shared encrypted copy is committed as
+The shared encrypted configuration is committed as
 `config/secrets.sops.env` using SOPS and the GCP KMS key configured in
 `.sops.yaml`. GCP Application Default Credentials must have decrypt access to
-that key. Edit the encrypted values with `sops config/secrets.sops.env`, or
-decrypt them without printing the secret to the terminal:
+that key.
+
+Decrypt the configuration before starting the notebook, then run Jupyter
+normally:
 
 ```bash
 sops decrypt --output .env config/secrets.sops.env
+uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
 ```
 
-Alternatively, run a command directly with the decrypted values in its
-environment and without creating a plaintext file:
+To change the encrypted values, edit them through SOPS and decrypt the updated
+file again:
 
 ```bash
-sops exec-env config/secrets.sops.env 'uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb'
+sops config/secrets.sops.env
+sops decrypt --output .env config/secrets.sops.env
 ```
+
+For an unshared local configuration, copy `.env.example` to `.env` and fill in
+the token. The plaintext `.env` file is ignored by Git.
 
 ## Repository Map
 
