@@ -218,13 +218,16 @@ queries and repository worktrees. Set `RAGTIME_CACHE_DIR` or
 paths inside a user-only directory. The client refuses a cache directory
 accessible to other users.
 
-Search entries live for 24 hours. Private `/content` entries and Hugging Face
-documents live for 30 days by default. Override the Hugging Face document TTL
-in seconds with `RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`; set it to `none`,
-`off`, or `disabled` for no expiry. `refresh_search=True` and
-`refresh_documents=True` independently bypass and replace the corresponding
-entries through `RagtimeRetriever.retrieve()`. Set `use_cache=False` only when
-intentionally running without a cache.
+Private `/pipeline` and `/content` entries do not expire by default because the
+participant endpoint is treated as immutable. Numeric
+`RAGTIME_SEARCH_CACHE_TTL_SECONDS` and `RAGTIME_CONTENT_CACHE_TTL_SECONDS`
+values can still impose an expiry if needed. Hugging Face documents live for 30
+days by default; override that TTL with
+`RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`, or set it to `none`, `off`, or
+`disabled` for no expiry. `refresh_search=True` and `refresh_documents=True`
+independently bypass and replace the corresponding entries through
+`RagtimeRetriever.retrieve()`. Set `use_cache=False` only when intentionally
+running without a cache.
 
 Live Hugging Face fetches use the dataset's current default revision, but cache
 entries are not keyed by Hub commit and remain at the revision originally
@@ -235,10 +238,21 @@ runs; for a large sweep of mostly new queries, download a corpus snapshot once
 and build a local ID index instead of issuing thousands of remote filter
 operations.
 
-The private retrieval endpoint does not expose an immutable index version. Use
-`RAGTIME_CACHE_NAMESPACE` to separate experiment/index generations, or call
-`client.cache.clear()` to clear the active namespace. Cache keys include the
-base URL, operation, namespace, and exact JSON request, but never the bearer
+For this topic set, the Hugging Face document cache is also the economical
+local index: there are only 103 topics and at most 2,060 top-20 IDs, whereas a
+complete original-language snapshot currently contains 4,000,380 documents in
+25 Parquet shards totaling about 6.93 GB before a database index is built. A
+full revision-pinned DuckDB primary-key index makes sense for a large sweep of
+mostly novel queries, but it should be an explicit build because the snapshot
+and database require corpus-scale disk and memory. FAISS is unnecessary for
+hydration because the hosted endpoint has already done semantic retrieval; the
+remaining operation is an exact lookup by document ID.
+
+Although the private endpoint does not publish an immutable version identifier,
+this project follows the participant guarantee that its results will not
+change. Use `refresh=True`, rotate `RAGTIME_CACHE_NAMESPACE`, or call
+`client.cache.clear()` only for explicit manual invalidation. Cache keys include
+the base URL, operation, namespace, and exact JSON request, but never the bearer
 token.
 
 ### RAGTIME Contract Details

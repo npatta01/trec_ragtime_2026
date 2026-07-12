@@ -129,6 +129,49 @@ class RagtimeClientTests(unittest.TestCase):
             self.assertEqual(second_result.hits, first_result.hits)
             self.assertEqual(second_session.calls, [])
 
+    def test_default_api_cache_entries_never_expire(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.0]
+            cache = SQLiteResponseCache(
+                Path(directory) / "responses.sqlite3",
+                clock=lambda: now[0],
+            )
+            content_payload = {
+                "cached": False,
+                "collection": "ragtime2",
+                "id": "doc-1",
+                "text": "document text",
+            }
+            first_session = RecordingSession(
+                FakeResponse(pipeline_payload({"doc-1": 1.0})),
+                FakeResponse(content_payload),
+            )
+            first = RagtimeClient(
+                "https://api.example",
+                "first-token",
+                cache=cache,
+                session=first_session,
+            )
+            first.search("query")
+            first.get_content("doc-1")
+
+            now[0] += 100 * 365 * 24 * 60 * 60
+            second_session = RecordingSession()
+            second = RagtimeClient(
+                "https://api.example",
+                "second-token",
+                cache=cache,
+                session=second_session,
+            )
+            cached_search = second.search("query")
+            cached_document = second.get_content("doc-1")
+
+            self.assertIsNone(second.search_cache_ttl_seconds)
+            self.assertIsNone(second.content_cache_ttl_seconds)
+            self.assertTrue(cached_search.local_cache_hit)
+            self.assertTrue(cached_document.local_cache_hit)
+            self.assertEqual(second_session.calls, [])
+
     def test_refresh_replaces_a_cached_response(self):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "responses.sqlite3"

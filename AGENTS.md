@@ -70,6 +70,9 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
 - The default SQLite cache is outside the repository at
   `${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`, so it is
   shared across worktrees. Do not replace it with a worktree-relative cache.
+- Treat the participant API as immutable. `/pipeline` and `/content` cache
+  entries do not expire by default; retain explicit refresh and namespace
+  rotation only as manual invalidation controls.
 - `HuggingFaceCorpus` stores validated documents individually in that same
   SQLite database. Its default TTL is 30 days and can be overridden with
   `RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`; `none`, `off`, or `disabled` means no
@@ -78,6 +81,11 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   revision. Refresh documents or rotate `RAGTIME_CACHE_NAMESPACE` after a known
   corpus update. Prefer a downloaded snapshot plus local ID index for large
   sweeps of mostly uncached queries.
+- For the 103 test topics, prefer this sparse exact-ID document cache over a
+  full corpus index. A complete original-language snapshot is about 6.93 GB
+  across 4,000,380 documents before building an index. If a large novel-query
+  sweep justifies a full local index, use a revision-pinned exact primary-key
+  store such as DuckDB; do not build another FAISS/vector index for hydration.
 - Cache keys must include the endpoint, operation, namespace, and exact request,
   but never the bearer token. Cache only validated successful responses.
 - The public Hugging Face dataset does not require the private RAGTIME token.
