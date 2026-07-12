@@ -119,34 +119,123 @@ instructions, or index snapshots. If local cost or latency matters, smaller
 Qwen3 embedding variants are available, but their quality should be measured
 on the RAGTIME topics rather than inferred from generic benchmarks.
 
-## Reusable API Client And Shared Cache
+## Reusable Retrieval And Hydration
 
-Use the `trec_ragtime` package from notebooks, scripts, or other Python code:
+Use `RagtimeRetriever` for the normal end-to-end path. It searches the private
+RAGTIME endpoint, then hydrates the ranked document IDs with original-language
+text, URL, date, and language from the public
+[Hugging Face corpus](https://huggingface.co/datasets/trec-ragtime/ragtime2):
+
+```python
+from trec_ragtime import RagtimeRetriever
+
+with RagtimeRetriever.from_env() as retriever:
+    result = retriever.retrieve("health benefits of Nordic walking")
+
+for document in result.documents:
+    print(
+        document.rank,
+        document.document_id,
+        document.score,
+        document.language,
+        document.url,
+        document.text,
+    )
+```
+
+`RagtimeRetriever` uses the existing cached `RagtimeClient.search()` method for
+retrieval. On a cold document cache, hydrating the default top 20 takes at most
+four sequential Hugging Face Dataset Viewer
+[`/filter`](https://huggingface.co/docs/dataset-viewer/filter) operations: one
+each against the `default` configuration's `eng`, `spa`, `rus`, and `zho`
+splits. IDs found in an earlier split are removed from later requests. This
+avoids making up to 20 private `/content` requests, and repeat or overlapping
+queries reuse the per-document cache. Transient failures are retried with
+backoff, so wire-level GET attempts can exceed four.
+
+The hydrator intentionally uses the original-language `default` configuration,
+not `mt_docs`. In a measured sample of eight retrieved documents—two from each
+of English, Spanish, Russian, and Chinese—the Hugging Face `default` text was
+byte-for-byte identical to the private API's `/content` text in all eight
+cases. The machine-translated rows reuse the same IDs but contain different
+text, so they are a separate representation and are not silently substituted.
+
+For direct batch hydration without running a search, use `HuggingFaceCorpus`:
+
+```python
+from trec_ragtime import HuggingFaceCorpus
+
+with HuggingFaceCorpus() as corpus:
+    hydration = corpus.get_many(["document-id-1", "document-id-2"])
+
+for document in hydration.documents:
+    print(document.document_id, document.text, document.url, document.date)
+```
+
+Dataset Viewer failures are reported by `HuggingFaceCorpus.get_many()`.
+`RagtimeRetriever.retrieve()` raises `HuggingFaceHydrationError` when a split
+request fails and leaves IDs unresolved, rather than turning an upstream
+Hugging Face problem into a burst of private requests. Private `/content`
+fallback is disabled by default:
+
+```python
+result = retriever.retrieve(
+    "health benefits of Nordic walking",
+    max_content_fallbacks=2,
+)
+```
+
+`max_content_fallbacks` opts into at most that many cached `/content` requests
+for IDs still unresolved after successful Hugging Face lookups. Set
+`fallback_on_hf_error=True` only when the same bounded fallback is also desired
+after a Hugging Face split failure. Any document hydrated through `/content`
+has text but no URL, date, or language metadata. Remaining unresolved documents
+stay in rank order with `text=None`; inspect `result.fully_hydrated`,
+`result.unresolved_ids`, and `result.hydration_failures` before generation.
+
+Use the lower-level `RagtimeClient` when only document IDs and scores, or an
+explicit single `/content` lookup, are needed:
 
 ```python
 from trec_ragtime import RagtimeClient
 
-client = RagtimeClient.from_env()
-result = client.search("health benefits of Nordic walking")
+with RagtimeClient.from_env() as client:
+    result = client.search("health benefits of Nordic walking")
 
-for hit in result.hits:
-    print(hit.rank, hit.document_id, hit.score)
+    for hit in result.hits:
+        print(hit.rank, hit.document_id, hit.score)
 
-document = client.get_content(result.hits[0].document_id)
-print(document.text)
+    document = client.get_content(result.hits[0].document_id)
+    print(document.text)
 ```
 
-Search and content responses are cached in a permission-restricted SQLite
-database at `${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`.
-Because this path is outside the repository, all worktrees for the same user
-share it automatically. Set `RAGTIME_CACHE_DIR` or `RAGTIME_CACHE_PATH` to
-override the location; overrides must be absolute paths inside a user-only
-directory. The client refuses a cache directory accessible to other users. Set
-`use_cache=False` only when intentionally running without a cache. Search
-entries live for 24 hours and content entries for 30 days by default; use
-`refresh=True` on either client method to bypass and replace a cached response.
+Private search responses, private content responses, and normalized Hugging
+Face documents share the same permission-restricted SQLite database at
+`${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`. Hugging Face
+documents are stored individually, so the cache is reusable across different
+queries and repository worktrees. Set `RAGTIME_CACHE_DIR` or
+`RAGTIME_CACHE_PATH` to override the shared location; overrides must be absolute
+paths inside a user-only directory. The client refuses a cache directory
+accessible to other users.
 
-The endpoint does not expose an immutable index version. Use
+Search entries live for 24 hours. Private `/content` entries and Hugging Face
+documents live for 30 days by default. Override the Hugging Face document TTL
+in seconds with `RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`; set it to `none`,
+`off`, or `disabled` for no expiry. `refresh_search=True` and
+`refresh_documents=True` independently bypass and replace the corresponding
+entries through `RagtimeRetriever.retrieve()`. Set `use_cache=False` only when
+intentionally running without a cache.
+
+Live Hugging Face fetches use the dataset's current default revision, but cache
+entries are not keyed by Hub commit and remain at the revision originally
+fetched until expiry or replacement. Use the finite TTL,
+`refresh_documents=True`, or a new `RAGTIME_CACHE_NAMESPACE` when the corpus
+changes. Dataset Viewer hydration is intended for interactive and moderate
+runs; for a large sweep of mostly new queries, download a corpus snapshot once
+and build a local ID index instead of issuing thousands of remote filter
+operations.
+
+The private retrieval endpoint does not expose an immutable index version. Use
 `RAGTIME_CACHE_NAMESPACE` to separate experiment/index generations, or call
 `client.cache.clear()` to clear the active namespace. Cache keys include the
 base URL, operation, namespace, and exact JSON request, but never the bearer
@@ -169,16 +258,17 @@ token.
   client sorts it by descending score and then document ID for stable ties.
 - The client canonicalizes authentication to `Authorization: Bearer <token>`
   and distinguishes a local SQLite hit from the service's own `cached` field.
-- Cached queries and document text may be participant-only data. The cache
-  directory and database are created with user-only permissions and must not be
-  committed.
+- Cached private queries and responses must be treated as participant data. The
+  cache directory and database are created with user-only permissions and must
+  not be committed.
 
 ## Repository Map
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the
   required decrypt-first secret workflow.
-- [`src/trec_ragtime`](src/trec_ragtime): reusable API client, typed responses,
-  and cross-worktree SQLite cache.
+- [`src/trec_ragtime`](src/trec_ragtime): reusable private API client, batched
+  Hugging Face corpus hydrator, high-level retriever, typed responses, and
+  cross-worktree SQLite cache.
 - [`topics/topics.all.2026.v0625.jsonl`](topics/topics.all.2026.v0625.jsonl):
   [official June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625.jsonl),
   normalized to one JSON object per line.
@@ -188,7 +278,7 @@ token.
 - [`notebooks/ragtime2_mini_viewer.ipynb`](notebooks/ragtime2_mini_viewer.ipynb):
   bounded dataset preview and optional retrieval API example.
 - [`notebooks/ragtime_single_query.ipynb`](notebooks/ragtime_single_query.ipynb):
-  minimal one-query search against the private RAGTIME endpoint.
+  one-query cached search with batched Hugging Face document hydration.
 - [`pyproject.toml`](pyproject.toml) and [`uv.lock`](uv.lock): reproducible Python
   environment managed by uv.
 - [`tests`](tests): offline unit tests for HTTP validation and cache behavior.

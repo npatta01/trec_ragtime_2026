@@ -462,6 +462,25 @@ class RagtimeClientTests(unittest.TestCase):
             content_cache_ttl_seconds=None,
         )
 
+    def test_cache_control_flags_require_booleans(self):
+        with self.assertRaisesRegex(RagtimeConfigurationError, "use_cache"):
+            RagtimeClient(
+                "https://api.example",
+                "secret",
+                use_cache="false",
+            )
+
+        client = RagtimeClient(
+            "https://api.example",
+            "secret",
+            use_cache=False,
+            session=RecordingSession(),
+        )
+        with self.assertRaisesRegex(ValueError, "refresh"):
+            client.search("query", refresh="false")
+        with self.assertRaisesRegex(ValueError, "refresh"):
+            client.get_content("doc-1", refresh="false")
+
     def test_configuration_rejects_insecure_or_malformed_credentials(self):
         with self.assertRaises(RagtimeConfigurationError):
             RagtimeClient("http://api.example", "secret", use_cache=False)
