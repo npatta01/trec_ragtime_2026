@@ -44,22 +44,26 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   Use `trec_ragtime.RagtimeClient` only when raw search results or an explicit
   single `/content` lookup is required. Do not duplicate HTTP or bearer-token
   handling in notebooks and scripts.
-- Use `trec_ragtime.HuggingFaceCorpus.get_many()` for direct batch hydration.
-  It reads original-language rows from the Hugging Face `default` configuration
-  across `eng`, `spa`, `rus`, and `zho`; do not silently substitute `mt_docs`,
-  whose rows reuse the source IDs but contain different translated text.
+- Use `LocalCorpusIndex.enrich_documents(ids)` for direct local hydration, or
+  `RagtimeRetriever.enrich_documents(ids)` when the search client is already
+  open. Both must preserve first-seen order, deduplicate lookup work, and return
+  unresolved IDs explicitly. Never impose a 20-document hydration cap.
+- `RAGTIME_DOCUMENT_BACKEND=auto` must prefer the shared local DuckDB index when
+  present. An explicit local path also requires that artifact. `local` requires
+  it and `viewer` explicitly selects the remote fallback. Do not silently fall
+  back from a missing or corrupt configured local index.
+- The canonical corpus is Hugging Face `default/{eng,spa,rus,zho}`. Never mix in
+  `mt_docs`, whose rows reuse source IDs but contain different translated text.
 - Eight measured documents, two per original-language split, matched the
   private `/content` text byte-for-byte. Preserve the original-language
   `default` configuration as the canonical hydration source unless a separate,
   explicit translation feature is being implemented and tested.
-- For the default top 20, a cold hydration requires at most four sequential
-  Hugging Face `/filter` operations rather than up to 20 private `/content`
-  calls. Retry/backoff can make more than four wire-level GET attempts.
-  Preserve batching, remove IDs found in earlier splits, and never depend on
-  Dataset Viewer row order for retrieval rank.
+- Request counts above 20 by changing the RoutIR suffix, such as
+  `ragtime2%100`; `top_k=None` enriches everything the endpoint returned, while
+  `top_k=N` only truncates that existing result set.
 - `RagtimeRetriever.retrieve()` makes no `/content` fallback calls by default
   because `max_content_fallbacks=0`. Keep fallback explicit and bounded. A
-  Hugging Face split failure that leaves IDs unresolved must raise unless
+  Dataset Viewer split failure that leaves IDs unresolved must raise unless
   `fallback_on_hf_error=True` is explicitly supplied; that option must still
   respect `max_content_fallbacks`.
 - Keep `ragtime2%20` as literal RoutIR DSL. It is not a URL-encoded space.
@@ -70,6 +74,21 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
 - The default SQLite cache is outside the repository at
   `${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`, so it is
   shared across worktrees. Do not replace it with a worktree-relative cache.
+- The complete local corpus defaults to
+  `${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/ragtime2-default-v1.duckdb`.
+  It is revision-pinned, read-only at runtime, and shared across worktrees.
+  Build or inspect it only after decrypting `.env`:
+
+  ```bash
+  uv run ragtime-corpus build
+  uv run ragtime-corpus status
+  ```
+
+- A local corpus lookup must not call Dataset Viewer or write per-document
+  response-cache entries; the materialized indexed corpus is already the
+  durable source. Keep source Parquet outside the repository for rebuilds. The
+  builder must verify the exact pinned Hub manifest and every source shard's
+  size and LFS SHA-256 before indexing.
 - Treat the participant API as immutable. `/pipeline` and `/content` cache
   entries do not expire by default; retain explicit refresh and namespace
   rotation only as manual invalidation controls.
@@ -77,15 +96,10 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   SQLite database. Its default TTL is 30 days and can be overridden with
   `RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`; `none`, `off`, or `disabled` means no
   expiry. Keep search and document refresh controls independent.
-- The Hugging Face cache is TTL/namespace based and does not pin a Hub
-  revision. Refresh documents or rotate `RAGTIME_CACHE_NAMESPACE` after a known
-  corpus update. Prefer a downloaded snapshot plus local ID index for large
-  sweeps of mostly uncached queries.
-- For the 103 test topics, prefer this sparse exact-ID document cache over a
-  full corpus index. A complete original-language snapshot is about 6.93 GB
-  across 4,000,380 documents before building an index. If a large novel-query
-  sweep justifies a full local index, use a revision-pinned exact primary-key
-  store such as DuckDB; do not build another FAISS/vector index for hydration.
+- The Dataset Viewer fallback cache is TTL/namespace based and does not pin a
+  Hub revision. Keep it only for environments without the complete local
+  index. Do not build another FAISS/vector index for hydration; document IDs
+  are exact lookup keys after hosted retrieval.
 - Cache keys must include the endpoint, operation, namespace, and exact request,
   but never the bearer token. Cache only validated successful responses.
 - The public Hugging Face dataset does not require the private RAGTIME token.

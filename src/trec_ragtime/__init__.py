@@ -23,6 +23,17 @@ from .huggingface import (
     HuggingFaceHydrationError,
     HuggingFaceProtocolError,
 )
+from .local_corpus import (
+    LocalCorpusBuildError,
+    LocalCorpusConfigurationError,
+    LocalCorpusError,
+    LocalCorpusIndex,
+    LocalCorpusMetadata,
+    LocalCorpusReadError,
+    LocalCorpusValidationError,
+    build_from_parquet,
+    default_local_corpus_path,
+)
 from .models import (
     Document,
     HuggingFaceDocument,
@@ -33,7 +44,7 @@ from .models import (
     RetrievedDocument,
     SearchHit,
 )
-from .retriever import RagtimeRetriever
+from .retriever import DocumentCorpus, RagtimeRetriever
 
 __all__ = [
     "DEFAULT_CONTENT_COLLECTION",
@@ -44,6 +55,7 @@ __all__ = [
     "DEFAULT_HF_SPLITS",
     "DEFAULT_PIPELINE",
     "Document",
+    "DocumentCorpus",
     "HuggingFaceApiError",
     "HuggingFaceConfigurationError",
     "HuggingFaceCorpus",
@@ -53,6 +65,13 @@ __all__ = [
     "HuggingFaceProtocolError",
     "HydrationFailure",
     "HydrationResult",
+    "LocalCorpusBuildError",
+    "LocalCorpusConfigurationError",
+    "LocalCorpusError",
+    "LocalCorpusIndex",
+    "LocalCorpusMetadata",
+    "LocalCorpusReadError",
+    "LocalCorpusValidationError",
     "PipelineResult",
     "RagtimeApiError",
     "RagtimeClient",
@@ -64,5 +83,7 @@ __all__ = [
     "RetrievedDocument",
     "SQLiteResponseCache",
     "SearchHit",
+    "build_from_parquet",
     "default_cache_path",
+    "default_local_corpus_path",
 ]

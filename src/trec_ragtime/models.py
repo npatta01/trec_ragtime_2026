@@ -61,8 +61,9 @@ class HuggingFaceDocument:
     text: str
     url: str | None
     date: str | None
-    local_cache_hit: bool
+    local_cache_hit: bool | None
     cache_stored_at: float | None
+    source: str = "huggingface"
 
     @property
     def language(self) -> str:

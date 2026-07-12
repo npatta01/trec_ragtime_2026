@@ -57,9 +57,10 @@ uv run jupyter lab notebooks/ragtime2_mini_viewer.ipynb
 ```
 
 For a minimal one-query API check, open the single-query notebook and edit its
-`QUERY` value:
+`QUERY` value. Build the complete local corpus once before opening it:
 
 ```bash
+uv run ragtime-corpus build
 uv run jupyter lab notebooks/ragtime_single_query.ipynb
 ```
 
@@ -130,7 +131,11 @@ text, URL, date, and language from the public
 from trec_ragtime import RagtimeRetriever
 
 with RagtimeRetriever.from_env() as retriever:
-    result = retriever.retrieve("health benefits of Nordic walking")
+    result = retriever.retrieve(
+        "health benefits of Nordic walking",
+        pipeline="ragtime2%100",
+        top_k=None,
+    )
 
 for document in result.documents:
     print(
@@ -143,15 +148,12 @@ for document in result.documents:
     )
 ```
 
-`RagtimeRetriever` uses the existing cached `RagtimeClient.search()` method for
-retrieval. On a cold document cache, hydrating the default top 20 takes at most
-four sequential Hugging Face Dataset Viewer
-[`/filter`](https://huggingface.co/docs/dataset-viewer/filter) operations: one
-each against the `default` configuration's `eng`, `spa`, `rus`, and `zho`
-splits. IDs found in an earlier split are removed from later requests. This
-avoids making up to 20 private `/content` requests, and repeat or overlapping
-queries reuse the per-document cache. Transient failures are retried with
-backoff, so wire-level GET attempts can exceed four.
+`RagtimeRetriever` uses the cached `RagtimeClient.search()` method for retrieval
+and automatically selects the local corpus index when it exists. `top_k=None`
+enriches every result returned by the endpoint; it does not impose a 20-result
+limit. To request more than 20 from RoutIR, change the literal pipeline suffix,
+for example `ragtime2%100`. A `top_k` value can only truncate results that the
+endpoint already returned.
 
 The hydrator intentionally uses the original-language `default` configuration,
 not `mt_docs`. In a measured sample of eight retrieved documents—two from each
@@ -160,23 +162,54 @@ byte-for-byte identical to the private API's `/content` text in all eight
 cases. The machine-translated rows reuse the same IDs but contain different
 text, so they are a separate representation and are not silently substituted.
 
-For direct batch hydration without running a search, use `HuggingFaceCorpus`:
+### Build The Complete Local Corpus
+
+The corpus command resolves the generated Parquet branch to an immutable Hub
+commit, downloads all 25 `default/{eng,spa,rus,zho}` shards, materializes their
+4,000,380 documents into DuckDB, and creates a unique exact-ID index. Before
+indexing, it verifies the exact Hub manifest plus every shard's byte size and
+LFS SHA-256 digest:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env
+uv run ragtime-corpus build
+uv run ragtime-corpus status
+```
+
+The current source snapshot is about 6.93 GB and the materialized indexed
+database is about 15 GB. Both live outside the repository under
+`${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/`, so every worktree shares them.
+The source Parquet remains available for reproducible rebuilds. Override the
+database with an absolute `RAGTIME_LOCAL_CORPUS_PATH`.
+
+`RAGTIME_DOCUMENT_BACKEND=auto` is the default: it uses the default local index
+when present and otherwise falls back to the cached Dataset Viewer hydrator. An
+explicit `RAGTIME_LOCAL_CORPUS_PATH` or `local_index_path` requires that local
+artifact and never silently falls back. Use `local` to require the index or
+`viewer` to force remote hydration. Local lookups are read-only, require no
+Hugging Face response cache, and never call Dataset Viewer or private
+`/content`.
+
+For direct enrichment without running a search, pass any number of exact IDs:
 
 ```python
-from trec_ragtime import HuggingFaceCorpus
+from trec_ragtime import LocalCorpusIndex
 
-with HuggingFaceCorpus() as corpus:
-    hydration = corpus.get_many(["document-id-1", "document-id-2"])
+with LocalCorpusIndex() as corpus:
+    hydration = corpus.enrich_documents(document_ids)
 
 for document in hydration.documents:
     print(document.document_id, document.text, document.url, document.date)
 ```
 
-Dataset Viewer failures are reported by `HuggingFaceCorpus.get_many()`.
-`RagtimeRetriever.retrieve()` raises `HuggingFaceHydrationError` when a split
-request fails and leaves IDs unresolved, rather than turning an upstream
-Hugging Face problem into a burst of private requests. Private `/content`
-fallback is disabled by default:
+The method deduplicates IDs for lookup, preserves first-seen order, chunks
+arbitrarily large batches, and reports absent IDs in
+`hydration.unresolved_ids`. The local index is revision-pinned, so
+`refresh=True` does not contact the network. The high-level retriever exposes
+the same operation as `retriever.enrich_documents(ids)` when a search client is
+already open.
+
+Private `/content` fallback remains disabled by default:
 
 ```python
 result = retriever.retrieve(
@@ -186,12 +219,16 @@ result = retriever.retrieve(
 ```
 
 `max_content_fallbacks` opts into at most that many cached `/content` requests
-for IDs still unresolved after successful Hugging Face lookups. Set
-`fallback_on_hf_error=True` only when the same bounded fallback is also desired
-after a Hugging Face split failure. Any document hydrated through `/content`
-has text but no URL, date, or language metadata. Remaining unresolved documents
-stay in rank order with `text=None`; inspect `result.fully_hydrated`,
-`result.unresolved_ids`, and `result.hydration_failures` before generation.
+for IDs absent from the configured corpus. Any fallback document has text but
+no URL, date, or language metadata. Remaining unresolved documents stay in
+rank order with `text=None`; inspect `result.fully_hydrated` and
+`result.unresolved_ids` before generation.
+
+Dataset Viewer failures that leave IDs unresolved raise
+`HuggingFaceHydrationError` rather than causing a burst of private requests.
+Set `fallback_on_hf_error=True` only when the same bounded private fallback is
+desired after a remote hydration failure; inspect `result.hydration_failures`
+for any recorded failures.
 
 Use the lower-level `RagtimeClient` when only document IDs and scores, or an
 explicit single `/content` lookup, are needed:
@@ -209,44 +246,31 @@ with RagtimeClient.from_env() as client:
     print(document.text)
 ```
 
-Private search responses, private content responses, and normalized Hugging
-Face documents share the same permission-restricted SQLite database at
-`${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`. Hugging Face
-documents are stored individually, so the cache is reusable across different
-queries and repository worktrees. Set `RAGTIME_CACHE_DIR` or
-`RAGTIME_CACHE_PATH` to override the shared location; overrides must be absolute
-paths inside a user-only directory. The client refuses a cache directory
-accessible to other users.
+Private responses and Dataset Viewer fallback documents share the
+permission-restricted SQLite database at
+`${XDG_CACHE_HOME:-~/.cache}/trec-ragtime-2026/api-v1.sqlite3`. The complete
+local corpus is a separate revision-pinned DuckDB database and does not use
+per-document response caching. Both locations are outside the repository and
+shared across worktrees. Cache overrides must be absolute paths inside a
+user-only directory.
 
 Private `/pipeline` and `/content` entries do not expire by default because the
 participant endpoint is treated as immutable. Numeric
 `RAGTIME_SEARCH_CACHE_TTL_SECONDS` and `RAGTIME_CONTENT_CACHE_TTL_SECONDS`
-values can still impose an expiry if needed. Hugging Face documents live for 30
-days by default; override that TTL with
+values can still impose an expiry if needed. Remotely hydrated Dataset Viewer
+documents live for 30 days by default; override that TTL with
 `RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`, or set it to `none`, `off`, or
 `disabled` for no expiry. `refresh_search=True` and `refresh_documents=True`
 independently bypass and replace the corresponding entries through
 `RagtimeRetriever.retrieve()`. Set `use_cache=False` only when intentionally
 running without a cache.
 
-Live Hugging Face fetches use the dataset's current default revision, but cache
-entries are not keyed by Hub commit and remain at the revision originally
-fetched until expiry or replacement. Use the finite TTL,
-`refresh_documents=True`, or a new `RAGTIME_CACHE_NAMESPACE` when the corpus
-changes. Dataset Viewer hydration is intended for interactive and moderate
-runs; for a large sweep of mostly new queries, download a corpus snapshot once
-and build a local ID index instead of issuing thousands of remote filter
-operations.
-
-For this topic set, the Hugging Face document cache is also the economical
-local index: there are only 103 topics and at most 2,060 top-20 IDs, whereas a
-complete original-language snapshot currently contains 4,000,380 documents in
-25 Parquet shards totaling about 6.93 GB before a database index is built. A
-full revision-pinned DuckDB primary-key index makes sense for a large sweep of
-mostly novel queries, but it should be an explicit build because the snapshot
-and database require corpus-scale disk and memory. FAISS is unnecessary for
-hydration because the hosted endpoint has already done semantic retrieval; the
-remaining operation is an exact lookup by document ID.
+Live Dataset Viewer fallback fetches use the dataset's current default
+revision, and their sparse cache remains subject to the configured TTL. The
+complete local index instead records the immutable Parquet conversion commit
+and is replaced only by an explicit `ragtime-corpus build --replace`. FAISS is
+unnecessary for hydration because the hosted endpoint has already done
+semantic retrieval; the remaining operation is an exact lookup by document ID.
 
 Although the private endpoint does not publish an immutable version identifier,
 this project follows the participant guarantee that its results will not
@@ -280,9 +304,9 @@ token.
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the
   required decrypt-first secret workflow.
-- [`src/trec_ragtime`](src/trec_ragtime): reusable private API client, batched
-  Hugging Face corpus hydrator, high-level retriever, typed responses, and
-  cross-worktree SQLite cache.
+- [`src/trec_ragtime`](src/trec_ragtime): reusable private API client, local
+  DuckDB corpus index and builder, Dataset Viewer fallback, high-level
+  retriever, typed responses, and cross-worktree caches.
 - [`topics/topics.all.2026.v0625.jsonl`](topics/topics.all.2026.v0625.jsonl):
   [official June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625.jsonl),
   normalized to one JSON object per line.
@@ -292,12 +316,13 @@ token.
 - [`notebooks/ragtime2_mini_viewer.ipynb`](notebooks/ragtime2_mini_viewer.ipynb):
   bounded dataset preview and optional retrieval API example.
 - [`notebooks/ragtime_single_query.ipynb`](notebooks/ragtime_single_query.ipynb):
-  one-query cached search with batched Hugging Face document hydration.
+  one-query cached search with complete local-corpus document enrichment.
 - [`pyproject.toml`](pyproject.toml) and [`uv.lock`](uv.lock): reproducible Python
   environment managed by uv.
-- [`tests`](tests): offline unit tests for HTTP validation and cache behavior.
+- [`tests`](tests): offline unit tests for HTTP, cache, corpus build, and local
+  enrichment behavior.
 
-The RAGTIME2 corpus is accessed remotely and is not vendored in this repository.
-Track details can change, so use the official sources linked from the
-[reference report](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html)
+The RAGTIME2 snapshot and generated DuckDB index live in the user cache and are
+not vendored in this repository. Track details can change, so use the official
+sources linked from the [reference report](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html)
 when making submission decisions.

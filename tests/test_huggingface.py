@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from collections import deque
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -166,6 +167,8 @@ class FakeRagtimeClient:
 
 
 class FakeCorpus:
+    backend_name = "fake"
+
     def __init__(self, result):
         self.result = result
         self.calls = []
@@ -174,6 +177,9 @@ class FakeCorpus:
     def get_many(self, document_ids, *, refresh):
         self.calls.append({"document_ids": tuple(document_ids), "refresh": refresh})
         return self.result
+
+    def enrich_documents(self, document_ids, *, refresh):
+        return self.get_many(document_ids, refresh=refresh)
 
     def close(self):
         self.closed = True
@@ -268,7 +274,7 @@ class HuggingFaceCorpusTests(unittest.TestCase):
                 [document.document_id for document in second_result.documents],
                 ["doc-1", "doc-2"],
             )
-            with sqlite3.connect(cache_path) as connection:
+            with closing(sqlite3.connect(cache_path)) as connection:
                 count = connection.execute(
                     "SELECT COUNT(*) FROM responses "
                     "WHERE operation = 'huggingface_document'"
@@ -360,7 +366,7 @@ class HuggingFaceCorpusTests(unittest.TestCase):
                 self.assertEqual(invalid_result.documents, ())
                 self.assertEqual(invalid_result.unresolved_ids, ("doc-1",))
                 self.assertEqual(len(invalid_result.failures), 1)
-                with sqlite3.connect(cache_path) as connection:
+                with closing(sqlite3.connect(cache_path)) as connection:
                     count = connection.execute(
                         "SELECT COUNT(*) FROM responses"
                     ).fetchone()[0]
@@ -469,6 +475,64 @@ class HuggingFaceCorpusTests(unittest.TestCase):
 
 
 class RagtimeRetrieverTests(unittest.TestCase):
+    def test_enriches_every_api_result_without_a_twenty_document_cap(self):
+        document_ids = [f"doc-{index:03d}" for index in range(137)]
+        search = pipeline_result(document_ids, pipeline="ragtime2%137")
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=tuple(
+                    hf_document(document_id, f"text {document_id}")
+                    for document_id in document_ids
+                ),
+                unresolved_ids=(),
+                failures=(),
+            )
+        )
+
+        result = RagtimeRetriever(FakeRagtimeClient(search), corpus).retrieve(
+            "query",
+            pipeline="ragtime2%137",
+            top_k=None,
+        )
+
+        self.assertEqual(len(result.documents), 137)
+        self.assertEqual(
+            [document.document_id for document in result.documents],
+            document_ids,
+        )
+        self.assertEqual(corpus.calls[0]["document_ids"], tuple(document_ids))
+
+    def test_public_enrich_documents_delegates_arbitrary_ids(self):
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(hf_document("doc-2", "two"),),
+                unresolved_ids=("missing",),
+                failures=(),
+            )
+        )
+        retriever = RagtimeRetriever(
+            FakeRagtimeClient(pipeline_result([])),
+            corpus,
+        )
+
+        result = retriever.enrich_documents(
+            ["doc-2", "missing", "doc-2"],
+            refresh_documents=True,
+        )
+
+        self.assertEqual(result.documents[0].document_id, "doc-2")
+        self.assertEqual(result.unresolved_ids, ("missing",))
+        self.assertEqual(retriever.document_backend, "fake")
+        self.assertEqual(
+            corpus.calls,
+            [
+                {
+                    "document_ids": ("doc-2", "missing", "doc-2"),
+                    "refresh": True,
+                }
+            ],
+        )
+
     def test_rank_and_score_are_preserved_when_hydration_order_differs(self):
         search = pipeline_result(["doc-high", "doc-mid", "doc-low"])
         client = FakeRagtimeClient(search)

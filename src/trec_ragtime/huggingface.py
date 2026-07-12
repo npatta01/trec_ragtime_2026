@@ -146,6 +146,8 @@ class HuggingFaceCorpus:
     private search client. The private bearer token is neither needed nor sent.
     """
 
+    backend_name = "viewer"
+
     def __init__(
         self,
         *,
@@ -579,6 +581,16 @@ class HuggingFaceCorpus:
             ),
             failures=tuple(failures),
         )
+
+    def enrich_documents(
+        self,
+        document_ids: Iterable[str],
+        *,
+        refresh: bool = False,
+    ) -> HydrationResult:
+        """Enrich any number of exact document IDs from Viewer plus cache."""
+
+        return self.get_many(document_ids, refresh=refresh)
 
 
 __all__ = [
