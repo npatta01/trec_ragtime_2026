@@ -48,10 +48,12 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   `RagtimeRetriever.enrich_documents(ids)` when the search client is already
   open. Both must preserve first-seen order, deduplicate lookup work, and return
   unresolved IDs explicitly. Never impose a 20-document hydration cap.
-- `RAGTIME_DOCUMENT_BACKEND=auto` must prefer the shared local DuckDB index when
-  present. An explicit local path also requires that artifact. `local` requires
-  it and `viewer` explicitly selects the remote fallback. Do not silently fall
-  back from a missing or corrupt configured local index.
+- `RagtimeRetriever.from_env()` must require the shared canonical local DuckDB
+  index and fail clearly when it is missing, corrupt, or incomplete. Configure
+  its location with `RAGTIME_PROJECT_CACHE_DIR` or
+  `RAGTIME_LOCAL_CORPUS_PATH`; do not silently fall back to Dataset Viewer.
+- Use `HuggingFaceCorpus` directly only when an explicit Dataset Viewer client
+  is required in an environment without the complete local index.
 - The canonical corpus is Hugging Face `default/{eng,spa,rus,zho}`. Never mix in
   `mt_docs` as additional retrieval documents. Its rows reuse Spanish, Russian,
   and Chinese source IDs; join them as optional English representations.

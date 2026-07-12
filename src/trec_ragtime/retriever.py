@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -12,9 +12,7 @@ from .huggingface import (
     DEFAULT_HF_DATASET,
     DEFAULT_HF_MT_SPLITS,
     DEFAULT_HF_SPLITS,
-    HuggingFaceCorpus,
     HuggingFaceHydrationError,
-    hf_cache_ttl_from_env,
 )
 from .local_corpus import (
     LocalCorpusConfigurationError,
@@ -70,29 +68,12 @@ class RagtimeRetriever:
     def from_env(
         cls,
         *,
-        document_backend: str | None = None,
         local_index_path: str | os.PathLike[str] | None = None,
-        local_corpus_options: Mapping[str, Any] | None = None,
-        corpus_options: Mapping[str, Any] | None = None,
         **client_overrides: Any,
     ) -> "RagtimeRetriever":
-        """Build both clients after the root ``.env`` has been decrypted."""
+        """Build a cached search client and the required local corpus index."""
 
         client = RagtimeClient.from_env(**client_overrides)
-        configured_backend = os.getenv("RAGTIME_DOCUMENT_BACKEND", "auto")
-        backend = configured_backend if document_backend is None else document_backend
-        if not isinstance(backend, str) or backend.strip().lower() not in {
-            "auto",
-            "local",
-            "viewer",
-        }:
-            client.close()
-            raise ValueError("document_backend must be 'auto', 'local', or 'viewer'")
-        backend = backend.strip().lower()
-        configured_local_path = os.getenv("RAGTIME_LOCAL_CORPUS_PATH", "").strip()
-        local_path_is_explicit = local_index_path is not None or bool(
-            configured_local_path
-        )
         try:
             index_path = (
                 default_local_corpus_path()
@@ -105,75 +86,19 @@ class RagtimeRetriever:
         if not index_path.is_absolute():
             client.close()
             raise ValueError("local_index_path must be absolute")
-        if backend == "auto":
-            if corpus_options and local_corpus_options:
-                client.close()
-                raise ValueError(
-                    "corpus_options and local_corpus_options cannot both be supplied"
-                )
-            if local_corpus_options or local_path_is_explicit:
-                backend = "local"
-            elif corpus_options:
-                # Preserve the pre-local-index API: Dataset Viewer options imply
-                # that the caller deliberately selected that implementation.
-                backend = "viewer"
-            elif index_path.exists() or index_path.is_symlink():
-                backend = "local"
-            else:
-                backend = "viewer"
 
         try:
-            if backend == "local":
-                if not index_path.exists() and not index_path.is_symlink():
-                    raise LocalCorpusConfigurationError(
-                        f"local corpus index does not exist: {index_path}; "
-                        "run `uv run ragtime-corpus build` first"
-                    )
-                if corpus_options:
-                    raise ValueError(
-                        "corpus_options apply only to the Dataset Viewer backend"
-                    )
-                local_options = dict(local_corpus_options or {})
-                if "path" in local_options or "local_index_path" in local_options:
-                    raise ValueError(
-                        "pass local_index_path directly, not in local_corpus_options"
-                    )
-                reserved_identity_options = {
-                    "expected_dataset",
-                    "expected_splits",
-                    "expected_translation_splits",
-                }.intersection(local_options)
-                if reserved_identity_options:
-                    raise ValueError(
-                        "canonical local corpus identity is managed by RagtimeRetriever"
-                    )
-                local_options["expected_dataset"] = DEFAULT_HF_DATASET
-                local_options["expected_splits"] = DEFAULT_HF_SPLITS
-                local_options["expected_translation_splits"] = DEFAULT_HF_MT_SPLITS
-                corpus: DocumentCorpus = LocalCorpusIndex(
-                    index_path,
-                    **local_options,
+            if not index_path.exists() and not index_path.is_symlink():
+                raise LocalCorpusConfigurationError(
+                    f"local corpus index does not exist: {index_path}; "
+                    "run `uv run ragtime-corpus build` first"
                 )
-            else:
-                if local_corpus_options:
-                    raise ValueError(
-                        "local_corpus_options apply only to the local backend"
-                    )
-                options = dict(corpus_options or {})
-                shared_cache_options = {
-                    "cache",
-                    "cache_path",
-                    "cache_namespace",
-                    "use_cache",
-                }
-                if shared_cache_options.intersection(options):
-                    raise ValueError(
-                        "RagtimeRetriever always shares the search client's cache"
-                    )
-                options.setdefault("cache_ttl_seconds", hf_cache_ttl_from_env())
-                options["cache"] = client.cache
-                options["use_cache"] = client.cache is not None
-                corpus = HuggingFaceCorpus(**options)
+            corpus: DocumentCorpus = LocalCorpusIndex(
+                index_path,
+                expected_dataset=DEFAULT_HF_DATASET,
+                expected_splits=DEFAULT_HF_SPLITS,
+                expected_translation_splits=DEFAULT_HF_MT_SPLITS,
+            )
         except Exception:
             client.close()
             raise

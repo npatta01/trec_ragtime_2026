@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import duckdb
 
-from trec_ragtime import HuggingFaceCorpus, RagtimeRetriever
+from trec_ragtime import RagtimeRetriever
 from trec_ragtime.local_corpus import (
     DOCUMENT_ID_INDEX_NAME,
     LOCAL_CORPUS_PATH_ENV,
@@ -711,7 +711,7 @@ class LocalCorpusIndexTests(unittest.TestCase):
                 ):
                     default_local_corpus_path()
 
-    def test_retriever_auto_prefers_existing_local_index(self) -> None:
+    def test_retriever_from_env_uses_configured_local_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shards = {}
@@ -741,7 +741,6 @@ class LocalCorpusIndexTests(unittest.TestCase):
                 "RAGTIME_BASE_URL": "https://api.example",
                 "RAGTIME_BEARER_TOKEN": "secret",
                 LOCAL_CORPUS_PATH_ENV: str(destination),
-                "RAGTIME_DOCUMENT_BACKEND": "auto",
             }
             with patch.dict(os.environ, environment, clear=False):
                 with RagtimeRetriever.from_env(use_cache=False) as retriever:
@@ -749,22 +748,11 @@ class LocalCorpusIndexTests(unittest.TestCase):
                     self.assertEqual(retriever.document_backend, "local")
                     self.assertEqual(retriever.corpus_path, destination)
 
-                with RagtimeRetriever.from_env(
-                    document_backend="viewer",
-                    use_cache=False,
-                ) as retriever:
-                    self.assertIsInstance(retriever.corpus, HuggingFaceCorpus)
-                    self.assertEqual(retriever.document_backend, "viewer")
-                    self.assertIsNone(retriever.corpus_path)
-
-    def test_retriever_auto_uses_viewer_only_when_default_index_is_absent(
-        self,
-    ) -> None:
+    def test_retriever_from_env_requires_default_local_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = {
                 "RAGTIME_BASE_URL": "https://api.example",
                 "RAGTIME_BEARER_TOKEN": "secret",
-                "RAGTIME_DOCUMENT_BACKEND": "auto",
                 "RAGTIME_LOCAL_CORPUS_PATH": "",
                 "RAGTIME_PROJECT_CACHE_DIR": str(
                     Path(directory) / "empty-cache" / "trec-ragtime-2026"
@@ -772,14 +760,11 @@ class LocalCorpusIndexTests(unittest.TestCase):
                 "XDG_CACHE_HOME": "",
             }
             with patch.dict(os.environ, environment, clear=False):
-                with RagtimeRetriever.from_env(use_cache=False) as retriever:
-                    self.assertIsInstance(retriever.corpus, HuggingFaceCorpus)
-                    self.assertEqual(retriever.document_backend, "viewer")
-                with RagtimeRetriever.from_env(
-                    corpus_options={"splits": ("eng",)},
-                    use_cache=False,
-                ) as retriever:
-                    self.assertIsInstance(retriever.corpus, HuggingFaceCorpus)
+                with self.assertRaisesRegex(
+                    LocalCorpusConfigurationError,
+                    "ragtime-corpus build",
+                ):
+                    RagtimeRetriever.from_env(use_cache=False)
 
     def test_local_backend_missing_or_corrupt_index_fails_without_viewer_fallback(
         self,
@@ -797,33 +782,12 @@ class LocalCorpusIndexTests(unittest.TestCase):
                     LocalCorpusConfigurationError,
                     "ragtime-corpus build",
                 ):
-                    RagtimeRetriever.from_env(
-                        document_backend="local",
-                        use_cache=False,
-                    )
-                with self.assertRaisesRegex(
-                    LocalCorpusConfigurationError,
-                    "ragtime-corpus build",
-                ):
-                    RagtimeRetriever.from_env(
-                        document_backend="auto",
-                        corpus_options={"splits": ("eng",)},
-                        use_cache=False,
-                    )
-                with self.assertRaisesRegex(
-                    LocalCorpusConfigurationError,
-                    "ragtime-corpus build",
-                ):
-                    RagtimeRetriever.from_env(
-                        document_backend="auto",
-                        use_cache=False,
-                    )
+                    RagtimeRetriever.from_env(use_cache=False)
 
                 corrupt = root / "corrupt.duckdb"
                 corrupt.write_text("not a DuckDB database")
                 with self.assertRaises(LocalCorpusReadError):
                     RagtimeRetriever.from_env(
-                        document_backend="auto",
                         local_index_path=corrupt,
                         use_cache=False,
                     )
@@ -840,7 +804,6 @@ class LocalCorpusIndexTests(unittest.TestCase):
                     "expected_splits",
                 ):
                     RagtimeRetriever.from_env(
-                        document_backend="auto",
                         local_index_path=partial,
                         use_cache=False,
                     )

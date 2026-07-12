@@ -195,13 +195,14 @@ this Git checkout fall back to
 an absolute `RAGTIME_PROJECT_CACHE_DIR` or the database alone with
 `RAGTIME_LOCAL_CORPUS_PATH`.
 
-`RAGTIME_DOCUMENT_BACKEND=auto` is the default: it uses the default local index
-when present and otherwise falls back to the cached Dataset Viewer hydrator. An
-explicit `RAGTIME_LOCAL_CORPUS_PATH` or `local_index_path` requires that local
-artifact and never silently falls back. Use `local` to require the index or
-`viewer` to force remote hydration. Local lookups are read-only, require no
-Hugging Face response cache, and never call Dataset Viewer or private
-`/content`.
+`RagtimeRetriever.from_env()` always opens the canonical local index. Its path
+comes from `RAGTIME_LOCAL_CORPUS_PATH`, or defaults beneath the configured
+project cache. A missing, corrupt, or incomplete index raises a clear startup
+error; run `uv run ragtime-corpus build` before retrieval. There is no silent
+Dataset Viewer fallback. Local lookups are read-only, require no Hugging Face
+response cache, and never call Dataset Viewer. Use `HuggingFaceCorpus` directly
+only when explicitly opting into Dataset Viewer hydration without the complete
+local index.
 
 For direct enrichment without running a search, pass any number of exact IDs:
 
