@@ -178,7 +178,8 @@
           <ul>
             <li><code>ragtime2</code> aliases a fused multilingual search over <code>zho</code>, <code>spa</code>, <code>rus</code>, and <code>eng</code>.</li>
             <li>Single-language retrieval can be requested by using a single language pipeline in the <code>pipeline</code> field.</li>
-            <li>The 2026 service uses Qwen3-8B embeddings, a FAISS index, and RoutIR.</li>
+            <li>The 2026 service uses <a href="https://huggingface.co/Qwen/Qwen3-Embedding-8B"><code>Qwen/Qwen3-Embedding-8B</code></a>, a FAISS index, and RoutIR.</li>
+            <li>The hosted model performs retrieval, not report generation. The deployed embedding dimension, query instruction, truncation, FAISS configuration, and immutable index version are not publicly specified.</li>
           </ul>
         </div>
         <div class="quick-box">

@@ -77,6 +77,48 @@ sops decrypt --output .env config/secrets.sops.env
 For an unshared local configuration, copy `.env.example` to `.env` and fill in
 the token. The plaintext `.env` file is ignored by Git.
 
+## Hosted Retrieval Model
+
+The official participant endpoint currently uses
+[`Qwen/Qwen3-Embedding-8B`](https://huggingface.co/Qwen/Qwen3-Embedding-8B)
+for dense retrieval, a FAISS index for vector similarity search, and
+[RoutIR](https://github.com/hltcoe/routir) for serving and pipeline composition.
+The `ragtime2` alias searches Chinese, Spanish, Russian, and English branches
+and fuses their scores.
+
+The model is an 8-billion-parameter, instruction-aware text embedding model.
+Its model card reports support for more than 100 languages, a context window up
+to 32K tokens, and embeddings up to 4,096 dimensions. Those are model
+capabilities, not confirmed endpoint settings: the organizers have not
+published the deployed embedding dimension, query instruction, truncation,
+FAISS quantization/index parameters, or an immutable index version.
+
+This endpoint is retrieval-only. It returns ranked document IDs and scores,
+and `/content` returns document text. The default `ragtime2` pipeline does not
+write the final report, extract nuggets, apply a cross-encoder reranker, or
+verify citations. A separate generation model is therefore required for
+report-generation runs.
+
+### When To Consider Another Retrieval Model
+
+Use the hosted Qwen3 retriever as the first baseline. It is already a strong
+multilingual model and avoids maintaining a four-language index. Before
+replacing it, measure retrieval failures on judged development topics and try:
+
+1. Decomposing each report request into focused queries and fusing the result
+   lists.
+2. Fetching candidate text and applying a multilingual reranker, such as a
+   Qwen3-Reranker model, to improve ordering and citation precision.
+3. Adding a lexical BM25/SPLADE signal for exact names, dates, law numbers, and
+   other facts that dense retrieval may miss.
+
+Build a separate embedding index only when evaluation shows that the hosted
+candidate pool is missing relevant documents, or when you need full control
+over candidate depth, offline reproducibility, metadata filters, custom query
+instructions, or index snapshots. If local cost or latency matters, smaller
+Qwen3 embedding variants are available, but their quality should be measured
+on the RAGTIME topics rather than inferred from generic benchmarks.
+
 ## Reusable API Client And Shared Cache
 
 Use the `trec_ragtime` package from notebooks, scripts, or other Python code:

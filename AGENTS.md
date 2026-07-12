@@ -52,6 +52,12 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   shared across worktrees. Do not replace it with a worktree-relative cache.
 - Cache keys must include the endpoint, operation, namespace, and exact request,
   but never the bearer token. Cache only validated successful responses.
+- The hosted endpoint uses `Qwen/Qwen3-Embedding-8B`, FAISS, and RoutIR. It is a
+  retriever, not a report-generation model. Do not describe unreported serving
+  details such as the deployed vector dimension, instruction, quantization, or
+  immutable index version as known facts.
+- Prefer measured query decomposition, result fusion, or multilingual
+  reranking before introducing a separately maintained embedding index.
 - Decrypt `.env` first, then run the offline tests normally:
 
   ```bash
