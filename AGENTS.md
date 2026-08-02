@@ -1,5 +1,9 @@
 # Agent Instructions
 
+## TREC RAGTIME 2026 Competition Rules
+
+- Treat the [TREC 2026 RAGTIME Track Guidelines](https://docs.google.com/document/d/1XqypNTHxIdazxfnUebrp-EsUuGNhodhQGrJIDnYGaB4/edit) as the source of truth for competition rules, submission formats, scoring, deadlines, and other track requirements. Consult the document whenever the repository instructions or task context leave a competition rule unclear.
+
 ## Secrets And Environment
 
 - Use a decrypt-first workflow. Before running notebooks, scripts, tests, or
