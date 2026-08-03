@@ -8,8 +8,10 @@ Create a small, reproducible organizer-retrieval control for all RAGTIME 2026 to
 
 `trec_ragtime.RagtimeRetriever.retrieve()` already provides the required end-to-end primitive:
 
-- `pipeline="ragtime2%100"` requests the organizer's 100-result RoutIR variant.
-- `top_k=None` preserves every result returned by that endpoint.
+- `pipeline="ragtime2"` requests the current organizer pipeline, which the
+  verified endpoint returns with 100 candidates for the Control-A probe.
+- `top_k=100` preserves the full response; smaller values apply client-side
+  truncation through the existing retriever.
 - `RagtimeRetriever.from_env()` requires the canonical shared local DuckDB corpus.
 - `max_content_fallbacks=0` prevents private `/content` fallback from masking local corpus problems.
 - `RetrievalResult` preserves organizer rank/score, canonical `text`, optional `report_text`, language, URLs, dates, hydration failures, unresolved IDs, and missing translation IDs.
@@ -34,25 +36,23 @@ Background: {background}
 
 The `limit` field remains topic metadata and is not inserted into the retrieval query.
 
-The Control-A runner exposes the requested candidate depth as `top_k=100`.
-The organizer protocol encodes that server-side depth in the pipeline string,
-so the runner translates it internally to `ragtime2%100` and calls:
+The Control-A runner exposes the requested candidate depth as `top_k=100` and
+uses the current organizer pipeline name directly:
 
 ```python
 retriever.retrieve(
     query,
-    pipeline="ragtime2%100",
-    top_k=None,
+    pipeline="ragtime2",
+    top_k=100,
     max_content_fallbacks=0,
 )
 ```
 
-Here `pipeline="ragtime2%100"` is a transport detail: it asks the endpoint to
-return up to 100 candidates. The retriever's `top_k` argument is a separate
-client-side truncation applied after the endpoint response; setting it to
-`100` cannot increase the default endpoint response from 20. Control-A uses
-`top_k=None` internally so it retains the full server response, while its
-manifest records the user-facing requested depth as `top_k=100`.
+The endpoint was sanity-tested through both the Slack-shared RoutIR client and
+the repository's raw `RagtimeClient`: `pipeline="ragtime2"` returned 100
+scores for `test query`, while the suffixed `ragtime2%100` form timed out.
+Control-A therefore keeps the pipeline name fixed and uses the existing
+retriever's `top_k` argument as the public depth control.
 
 The runner will not decompose, rerank, fuse, or add a local retrieval index.
 
@@ -101,7 +101,7 @@ Use fake retrievers and temporary directories for unit tests. Cover:
 
 - topic parsing and source-order preservation;
 - deterministic query construction and query hashes;
-- exact retrieval arguments, including `%100`, `top_k=None`, and zero fallback;
+- exact retrieval arguments, including `pipeline="ragtime2"`, `top_k=100`, and zero fallback;
 - rank/document alignment and explicit unresolved/translation status;
 - manifest contents without secret values;
 - atomic artifact output and refusal to overwrite an existing run;

@@ -144,11 +144,21 @@ def build_topic_query(topic: Topic) -> str:
 
 
 def pipeline_for_top_k(top_k: int) -> str:
-    """Translate the public candidate depth to the organizer pipeline syntax."""
+    """Validate depth and return the current organizer pipeline name.
 
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
-        raise ValueError("top_k must be a positive integer")
-    return f"ragtime2%{top_k}"
+    The current endpoint returns up to 100 candidates for ``ragtime2``. The
+    requested depth is therefore applied by ``RagtimeRetriever.top_k`` after
+    the response, rather than encoded in a RoutIR suffix.
+    """
+
+    if (
+        isinstance(top_k, bool)
+        or not isinstance(top_k, int)
+        or top_k < 1
+        or top_k > 100
+    ):
+        raise ValueError("top_k must be an integer from 1 through 100")
+    return "ragtime2"
 
 
 def query_hash(query: str) -> str:
@@ -321,7 +331,7 @@ def run_control_a(
         result = retriever.retrieve(
             query,
             pipeline=pipeline,
-            top_k=None,
+            top_k=top_k,
             max_content_fallbacks=0,
             fallback_on_hf_error=False,
         )
@@ -359,7 +369,7 @@ def run_control_a(
         "requested_top_k": top_k,
         "pipeline": pipeline,
         "retrieval": {
-            "top_k": None,
+            "top_k": top_k,
             "max_content_fallbacks": 0,
             "fallback_on_hf_error": False,
         },

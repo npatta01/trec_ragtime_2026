@@ -68,10 +68,13 @@ class TopicHelpersTests(unittest.TestCase):
         )
 
     def test_pipeline_for_top_k_translates_depth_to_organizer_protocol(self) -> None:
-        self.assertEqual(pipeline_for_top_k(100), "ragtime2%100")
+        self.assertEqual(pipeline_for_top_k(100), "ragtime2")
+        self.assertEqual(pipeline_for_top_k(24), "ragtime2")
 
         with self.assertRaises(ValueError):
             pipeline_for_top_k(0)
+        with self.assertRaises(ValueError):
+            pipeline_for_top_k(101)
 
     def test_query_hash_is_sha256_of_exact_query(self) -> None:
         query = "Problem: café"
@@ -226,7 +229,7 @@ def make_retrieval_result(
     return RetrievalResult(
         search_result=PipelineResult(
             query=query,
-            pipeline="ragtime2%100",
+            pipeline="ragtime2",
             hits=tuple(
                 SearchHit(
                     rank=document.rank,
@@ -326,9 +329,9 @@ class ControlARunnerTests(unittest.TestCase):
         self.assertEqual(run_dir, self.output_root / "control-a-test")
         self.assertEqual(
             [call["pipeline"] for call in retriever.calls],
-            ["ragtime2%100", "ragtime2%100"],
+            ["ragtime2", "ragtime2"],
         )
-        self.assertEqual([call["top_k"] for call in retriever.calls], [None, None])
+        self.assertEqual([call["top_k"] for call in retriever.calls], [100, 100])
         self.assertEqual(
             [call["max_content_fallbacks"] for call in retriever.calls], [0, 0]
         )
@@ -341,7 +344,8 @@ class ControlARunnerTests(unittest.TestCase):
             (run_dir / "manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["requested_top_k"], 100)
-        self.assertEqual(manifest["pipeline"], "ragtime2%100")
+        self.assertEqual(manifest["pipeline"], "ragtime2")
+        self.assertEqual(manifest["retrieval"]["top_k"], 100)
         self.assertEqual(manifest["git_revision"], "git-revision-1")
         self.assertEqual(manifest["corpus"]["revision"], "corpus-revision-1")
         self.assertEqual(manifest["counts"]["topics"], 2)

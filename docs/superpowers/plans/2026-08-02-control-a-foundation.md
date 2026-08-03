@@ -4,7 +4,7 @@
 
 **Goal:** Build a tested batch runner that retrieves every checked-in RAGTIME topic from the organizer at a user-facing `top_k=100` depth and writes a durable, self-contained Control-A artifact.
 
-**Architecture:** Add one focused `topic_candidates` module containing topic parsing, deterministic query construction, organizer-depth translation, artifact serialization, and the batch runner. The module will call the existing `RagtimeRetriever` without modifying its API; `top_k=100` becomes the transport detail `ragtime2%100`, while the retriever call keeps `top_k=None` to retain the complete response. The CLI will default to the shared project cache and require a unique run ID, while unit tests inject a fake retriever and use temporary directories.
+**Architecture:** Add one focused `topic_candidates` module containing topic parsing, deterministic query construction, artifact serialization, and the batch runner. The module will call the existing `RagtimeRetriever` without modifying its API; the current organizer pipeline name is fixed as `ragtime2`, while the public `top_k` is passed to the retriever for client-side truncation of its 100-result response. The CLI will default to the shared project cache and require a unique run ID, while unit tests inject a fake retriever and use temporary directories.
 
 **Tech Stack:** Python 3.11+, standard-library `dataclasses`, `argparse`, `hashlib`, `json`, `pathlib`, `tempfile`, `subprocess`, `datetime`; existing `RagtimeRetriever`, `RetrievalResult`, and `default_project_cache_dir()`; `unittest`.
 
@@ -12,8 +12,8 @@
 
 - Decrypt credentials before running tests or application code: `sops decrypt --output .env config/secrets.sops.env`.
 - Use `RagtimeRetriever.from_env()` and the complete shared local DuckDB corpus for live runs.
-- Use the literal organizer pipeline suffix `ragtime2%100`; do not describe it as a URL-encoded space.
-- Use `top_k=None` inside the retriever call so the server response is not truncated client-side.
+- Use the verified organizer pipeline name `ragtime2`; do not add a `%100` suffix.
+- Pass the public `top_k` into the retriever call; Control-A defaults to `top_k=100`.
 - Set `max_content_fallbacks=0`; unresolved IDs must remain explicit in the artifact.
 - Preserve canonical `document.text`; use `document.report_text` only as the English report representation.
 - Do not send or save bearer tokens; do not create a second corpus or vector index.
@@ -48,7 +48,7 @@ def test_build_topic_query_labels_problem_and_background(self):
     )
 
 def test_pipeline_for_top_k_translates_depth_to_organizer_protocol(self):
-    self.assertEqual(pipeline_for_top_k(100), "ragtime2%100")
+    self.assertEqual(pipeline_for_top_k(100), "ragtime2")
     with self.assertRaises(ValueError):
         pipeline_for_top_k(0)
 ```
@@ -181,13 +181,13 @@ Create a fake retriever that records calls and returns real `RetrievalResult` ob
 
 ```python
 {
-    "pipeline": "ragtime2%100",
-    "top_k": None,
+    "pipeline": "ragtime2",
+    "top_k": 100,
     "max_content_fallbacks": 0,
 }
 ```
 
-Assert that the resulting JSONL is ordered by topic source order and organizer rank, includes query hashes and full text, and explicitly records one unresolved document and one missing translation. Assert that the manifest records `requested_top_k=100`, `pipeline="ragtime2%100"`, topic count, candidate count, source hash, supplied Git revision, and corpus metadata without any token-like field.
+Assert that the resulting JSONL is ordered by topic source order and organizer rank, includes query hashes and full text, and explicitly records one unresolved document and one missing translation. Assert that the manifest records `requested_top_k=100`, `pipeline="ragtime2"`, topic count, candidate count, source hash, supplied Git revision, and corpus metadata without any token-like field.
 
 - [x] **Step 2: Run the runner tests and verify they fail**
 
@@ -201,7 +201,7 @@ Expected: failure because `run_control_a` is not implemented.
 
 - [x] **Step 3: Implement the minimal batch runner**
 
-For every loaded topic, call `retriever.retrieve()` once with the generated pipeline, `top_k=None`, `max_content_fallbacks=0`, and no fallback-on-Hugging-Face errors. Convert each `RetrievedDocument` with `as_record(include_text=True)`, add topic ID, collection ID, query, query hash, topic limit, `hydrated`, `report_ready`, and `missing_translation` fields, and preserve the result order. Build a manifest with schema version, run ID, UTC creation time, topic source path/hash, Git revision, query-construction version, requested depth, transport pipeline, retrieval options, API cache path, corpus path/revision, counts, and per-topic unresolved/translation IDs.
+For every loaded topic, call `retriever.retrieve()` once with `pipeline="ragtime2"`, the requested `top_k`, `max_content_fallbacks=0`, and no fallback-on-Hugging-Face errors. Convert each `RetrievedDocument` with `as_record(include_text=True)`, add topic ID, collection ID, query, query hash, topic limit, `hydrated`, `report_ready`, and `missing_translation` fields, and preserve the result order. Build a manifest with schema version, run ID, UTC creation time, topic source path/hash, Git revision, query-construction version, requested depth, pipeline, retrieval options, API cache path, corpus path/revision, counts, and per-topic unresolved/translation IDs.
 
 Use the supplied `created_at` and `git_revision` in tests; when omitted, use UTC now and `git rev-parse HEAD` from the topic repository. Do not include exception strings that could contain credentials.
 
