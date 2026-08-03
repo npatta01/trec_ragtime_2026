@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from .models import RetrievalResult, RetrievedDocument
 from .paths import default_project_cache_dir
@@ -378,11 +379,88 @@ def run_control_a(
     return run_dir
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the explicit Control-A command-line parser."""
+
+    parser = argparse.ArgumentParser(
+        description="Run the Control-A organizer retrieval batch.",
+    )
+    parser.add_argument(
+        "--topics",
+        type=Path,
+        default=Path("topics/topics.all.2026.v0625.jsonl"),
+        help="topic JSONL source (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=_positive_int,
+        default=100,
+        help="requested organizer candidate depth (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--run-id",
+        required=True,
+        help="unique output directory name for this immutable run",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=default_project_cache_dir() / "experiments" / "control-a",
+        help="shared artifact root (default: %(default)s)",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the live Control-A batch after the operator decrypts `.env`."""
+
+    try:
+        arguments = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        if exc.code == 0:
+            return 0
+        raise
+
+    from .retriever import RagtimeRetriever
+
+    with RagtimeRetriever.from_env() as retriever:
+        run_dir = run_control_a(
+            arguments.topics,
+            retriever=retriever,
+            output_root=arguments.output_root,
+            run_id=arguments.run_id,
+            top_k=arguments.top_k,
+        )
+    manifest = json.loads(
+        (run_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    counts = manifest["counts"]
+    print(f"Control-A artifact: {run_dir}")
+    print(f"Topics: {counts['topics']}; candidates: {counts['candidates']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = [
     "RetrieverLike",
     "Topic",
+    "build_parser",
     "build_topic_query",
     "load_topics",
+    "main",
     "pipeline_for_top_k",
     "query_hash",
     "run_control_a",

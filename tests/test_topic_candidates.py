@@ -4,6 +4,8 @@ import hashlib
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +13,9 @@ from trec_ragtime import PipelineResult, RetrievalResult, RetrievedDocument, Sea
 from trec_ragtime.topic_candidates import (
     Topic,
     build_topic_query,
+    build_parser,
     load_topics,
+    main,
     pipeline_for_top_k,
     query_hash,
     run_control_a,
@@ -381,6 +385,66 @@ class ControlARunnerTests(unittest.TestCase):
                 output_root=self.output_root,
                 run_id="existing",
             )
+
+
+class ControlACommandLineTests(unittest.TestCase):
+    def test_help_is_available_without_constructing_a_retriever(self) -> None:
+        stdout = StringIO()
+
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            build_parser().parse_args(["--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--top-k", stdout.getvalue())
+        self.assertIn("--run-id", stdout.getvalue())
+
+    def test_run_id_is_required(self) -> None:
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                build_parser().parse_args([])
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_parser_defaults_to_user_facing_top_k_100(self) -> None:
+        arguments = build_parser().parse_args(["--run-id", "run-1"])
+
+        self.assertEqual(arguments.top_k, 100)
+        self.assertEqual(
+            arguments.topics, Path("topics/topics.all.2026.v0625.jsonl")
+        )
+
+    def test_parser_accepts_custom_paths_and_depth(self) -> None:
+        arguments = build_parser().parse_args(
+            [
+                "--run-id",
+                "run-1",
+                "--top-k",
+                "24",
+                "--topics",
+                "custom/topics.jsonl",
+                "--output-root",
+                "/tmp/control-a",
+            ]
+        )
+
+        self.assertEqual(arguments.top_k, 24)
+        self.assertEqual(arguments.topics, Path("custom/topics.jsonl"))
+        self.assertEqual(arguments.output_root, Path("/tmp/control-a"))
+
+    def test_parser_rejects_non_positive_top_k(self) -> None:
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                build_parser().parse_args(["--run-id", "run-1", "--top-k", "0"])
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_main_help_does_not_construct_a_retriever(self) -> None:
+        stdout = StringIO()
+
+        with redirect_stdout(stdout):
+            self.assertEqual(main(["--help"]), 0)
+
+        self.assertIn("Control-A", stdout.getvalue())
 
 
 if __name__ == "__main__":

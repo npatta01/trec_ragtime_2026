@@ -229,19 +229,19 @@ git commit -m "feat: add Control-A batch runner"
 **Interfaces:**
 - Adds `main(argv: Sequence[str] | None = None) -> int`, runnable with `uv run python -m trec_ragtime.topic_candidates`.
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Test `--help`, required/validated `--run-id`, default `--top-k 100`, custom `--topics`, and custom `--output-root` argument parsing without constructing a live retriever. Test that `--top-k 0` fails through argparse.
 
-- [ ] **Step 2: Run the CLI tests and verify they fail**
+- [x] **Step 2: Run the CLI tests and verify they fail**
 
 Run the focused CLI test. Expected: failure because `main` and module execution are not implemented.
 
-- [ ] **Step 3: Implement the CLI**
+- [x] **Step 3: Implement the CLI**
 
 Add arguments for `--topics` (default `topics/topics.all.2026.v0625.jsonl`), `--top-k` (default `100`), `--run-id` (required), and `--output-root` (default `default_project_cache_dir() / "experiments" / "control-a"`). Require the operator to run the repository's decrypt-first command before invoking the CLI, then construct `RagtimeRetriever.from_env()`. Run the batch in a context manager, print only the artifact path and non-secret counts, and return zero on success.
 
-- [ ] **Step 4: Run focused, full, and smoke verification**
+- [x] **Step 4: Run focused, full, and smoke verification**
 
 First run:
 
@@ -253,7 +253,7 @@ uv run python -m unittest discover -s tests -v
 
 Then run a no-network smoke test through the fake retriever already covered by the suite. Do not execute the full live batch unless separately requested; the CLI itself is the explicit live operation.
 
-- [ ] **Step 5: Commit the CLI and verification changes**
+- [x] **Step 5: Commit the CLI and verification changes**
 
 ```bash
 git add src/trec_ragtime/topic_candidates.py tests/test_topic_candidates.py
