@@ -134,7 +134,7 @@ def private_document(document_id, text, *, local_cache_hit=False):
     )
 
 
-def pipeline_result(document_ids, *, query="query", pipeline="ragtime2%20"):
+def pipeline_result(document_ids, *, query="query", pipeline="ragtime2"):
     hits = tuple(
         SearchHit(
             rank=index,
@@ -616,7 +616,7 @@ class RagtimeRetrieverTests(unittest.TestCase):
             [
                 {
                     "query": "query",
-                    "pipeline": "ragtime2%20",
+                    "pipeline": "ragtime2",
                     "refresh": True,
                 }
             ],
@@ -771,7 +771,7 @@ class RagtimeRetrieverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "cache" / "api.sqlite3"
             pipeline_payload = {
-                "pipeline": "ragtime2%20",
+                "pipeline": "ragtime2",
                 "processed": True,
                 "query": "query",
                 "scores": {"doc-1": 1.0},
