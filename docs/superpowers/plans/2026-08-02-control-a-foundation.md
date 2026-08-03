@@ -175,7 +175,7 @@ fallback_on_hf_error)` method returning `RetrievalResult`, so the fake test
 retriever and the production `RagtimeRetriever` share the same checked
 boundary.
 
-- [ ] **Step 1: Write the failing runner tests**
+- [x] **Step 1: Write the failing runner tests**
 
 Create a fake retriever that records calls and returns real `RetrievalResult` objects assembled from `PipelineResult` and `RetrievedDocument`. Assert that two topics produce two calls with:
 
@@ -189,7 +189,7 @@ Create a fake retriever that records calls and returns real `RetrievalResult` ob
 
 Assert that the resulting JSONL is ordered by topic source order and organizer rank, includes query hashes and full text, and explicitly records one unresolved document and one missing translation. Assert that the manifest records `requested_top_k=100`, `pipeline="ragtime2%100"`, topic count, candidate count, source hash, supplied Git revision, and corpus metadata without any token-like field.
 
-- [ ] **Step 2: Run the runner tests and verify they fail**
+- [x] **Step 2: Run the runner tests and verify they fail**
 
 Run:
 
@@ -199,13 +199,13 @@ uv run python -m unittest tests.test_topic_candidates.ControlARunnerTests -v
 
 Expected: failure because `run_control_a` is not implemented.
 
-- [ ] **Step 3: Implement the minimal batch runner**
+- [x] **Step 3: Implement the minimal batch runner**
 
 For every loaded topic, call `retriever.retrieve()` once with the generated pipeline, `top_k=None`, `max_content_fallbacks=0`, and no fallback-on-Hugging-Face errors. Convert each `RetrievedDocument` with `as_record(include_text=True)`, add topic ID, collection ID, query, query hash, topic limit, `hydrated`, `report_ready`, and `missing_translation` fields, and preserve the result order. Build a manifest with schema version, run ID, UTC creation time, topic source path/hash, Git revision, query-construction version, requested depth, transport pipeline, retrieval options, API cache path, corpus path/revision, counts, and per-topic unresolved/translation IDs.
 
 Use the supplied `created_at` and `git_revision` in tests; when omitted, use UTC now and `git rev-parse HEAD` from the topic repository. Do not include exception strings that could contain credentials.
 
-- [ ] **Step 4: Run the runner tests and verify they pass**
+- [x] **Step 4: Run the runner tests and verify they pass**
 
 Run the focused runner tests, then all module tests:
 
@@ -213,7 +213,7 @@ Run the focused runner tests, then all module tests:
 uv run python -m unittest tests.test_topic_candidates -v
 ```
 
-- [ ] **Step 5: Commit the batch runner**
+- [x] **Step 5: Commit the batch runner**
 
 ```bash
 git add src/trec_ragtime/topic_candidates.py tests/test_topic_candidates.py

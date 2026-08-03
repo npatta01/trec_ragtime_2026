@@ -5,11 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+from .models import RetrievalResult, RetrievedDocument
+from .paths import default_project_cache_dir
 
 
 _TOPIC_FIELDS = frozenset(
@@ -26,6 +31,24 @@ class Topic:
     problem_statement: str
     background: str
     limit: int
+
+
+class RetrieverLike(Protocol):
+    """Minimal retrieval boundary used by the batch runner and its tests."""
+
+    cache_path: Path | None
+    corpus_path: Path | None
+    corpus: object
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+    ) -> RetrievalResult: ...
 
 
 def _non_blank_string(value: Any, *, field: str, line_number: int) -> str:
@@ -203,11 +226,165 @@ def write_control_a_artifact(
         raise
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_revision(path: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=path.parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    revision = completed.stdout.strip()
+    return revision or None
+
+
+def _run_id_path(output_root: Path, run_id: str) -> Path:
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_id must be a non-blank string")
+    if run_id in {".", ".."} or Path(run_id).name != run_id:
+        raise ValueError("run_id must be a single directory name")
+    return output_root / run_id
+
+
+def _candidate_record(
+    topic: Topic,
+    query: str,
+    document: RetrievedDocument,
+    *,
+    missing_translation_ids: set[str],
+) -> dict[str, object]:
+    record = document.as_record(include_text=True)
+    record.update(
+        {
+            "collection_id": topic.collection_id,
+            "limit": topic.limit,
+            "query": query,
+            "query_hash": query_hash(query),
+            "topic_id": topic.topic_id,
+            "hydrated": document.hydrated,
+            "report_ready": document.report_text is not None,
+            "missing_translation": document.document_id in missing_translation_ids,
+        }
+    )
+    return record
+
+
+def _corpus_manifest(retriever: RetrieverLike) -> dict[str, object]:
+    metadata = getattr(getattr(retriever, "corpus", None), "metadata", None)
+    return {
+        "path": (
+            str(retriever.corpus_path)
+            if retriever.corpus_path is not None
+            else None
+        ),
+        "revision": getattr(metadata, "revision", None),
+    }
+
+
+def run_control_a(
+    topics_path: Path,
+    *,
+    retriever: RetrieverLike,
+    output_root: Path,
+    run_id: str,
+    top_k: int = 100,
+    git_revision: str | None = None,
+    created_at: str | None = None,
+) -> Path:
+    """Retrieve all topics once and publish one immutable Control-A artifact."""
+
+    topic_path = Path(topics_path)
+    topics = load_topics(topic_path)
+    pipeline = pipeline_for_top_k(top_k)
+    run_dir = _run_id_path(Path(output_root), run_id)
+    if run_dir.exists():
+        raise FileExistsError(f"Control-A run already exists: {run_dir}")
+
+    records: list[dict[str, object]] = []
+    topic_status: list[dict[str, object]] = []
+    unresolved_count = 0
+    missing_translation_count = 0
+    for topic in topics:
+        query = build_topic_query(topic)
+        result = retriever.retrieve(
+            query,
+            pipeline=pipeline,
+            top_k=None,
+            max_content_fallbacks=0,
+            fallback_on_hf_error=False,
+        )
+        missing_translation_ids = set(result.missing_translation_ids)
+        unresolved_ids = list(result.unresolved_ids)
+        unresolved_count += len(unresolved_ids)
+        missing_translation_count += len(missing_translation_ids)
+        topic_status.append(
+            {
+                "missing_translation_ids": sorted(missing_translation_ids),
+                "topic_id": topic.topic_id,
+                "unresolved_ids": unresolved_ids,
+            }
+        )
+        records.extend(
+            _candidate_record(
+                topic,
+                query,
+                document,
+                missing_translation_ids=missing_translation_ids,
+            )
+            for document in result.documents
+        )
+
+    manifest: dict[str, object] = {
+        "schema_version": "control_a_v1",
+        "run_id": run_id,
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+        "git_revision": git_revision if git_revision is not None else _git_revision(topic_path),
+        "topic_source": {
+            "path": str(topic_path.resolve()),
+            "sha256": _sha256_file(topic_path),
+        },
+        "query_construction": "problem_background_v1",
+        "requested_top_k": top_k,
+        "pipeline": pipeline,
+        "retrieval": {
+            "top_k": None,
+            "max_content_fallbacks": 0,
+            "fallback_on_hf_error": False,
+        },
+        "api_cache_path": (
+            str(retriever.cache_path) if retriever.cache_path is not None else None
+        ),
+        "corpus": _corpus_manifest(retriever),
+        "counts": {
+            "topics": len(topics),
+            "candidates": len(records),
+            "unresolved_documents": unresolved_count,
+            "missing_translation_documents": missing_translation_count,
+        },
+        "topic_status": topic_status,
+    }
+    write_control_a_artifact(run_dir, manifest=manifest, records=records)
+    return run_dir
+
+
 __all__ = [
+    "RetrieverLike",
     "Topic",
     "build_topic_query",
     "load_topics",
     "pipeline_for_top_k",
     "query_hash",
+    "run_control_a",
     "write_control_a_artifact",
 ]

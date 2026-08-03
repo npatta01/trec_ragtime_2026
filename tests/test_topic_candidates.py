@@ -5,13 +5,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+from trec_ragtime import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
 from trec_ragtime.topic_candidates import (
     Topic,
     build_topic_query,
     load_topics,
     pipeline_for_top_k,
     query_hash,
+    run_control_a,
     write_control_a_artifact,
 )
 
@@ -177,6 +180,211 @@ class ControlAArtifactTests(unittest.TestCase):
             write_control_a_artifact(run_dir, manifest={}, records=[])
 
         self.assertEqual(list(run_dir.iterdir()), [])
+
+
+class FakeRetriever:
+    def __init__(self, results: list[RetrievalResult]) -> None:
+        self.results = iter(results)
+        self.calls: list[dict[str, object]] = []
+        self.cache_path = Path("/shared/ragtime-cache/api-v1.sqlite3")
+        self.corpus_path = Path("/shared/ragtime-cache/ragtime2-corpus-v2.duckdb")
+        self.corpus = SimpleNamespace(
+            metadata=SimpleNamespace(revision="corpus-revision-1")
+        )
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+    ) -> RetrievalResult:
+        self.calls.append(
+            {
+                "query": query,
+                "pipeline": pipeline,
+                "top_k": top_k,
+                "max_content_fallbacks": max_content_fallbacks,
+                "fallback_on_hf_error": fallback_on_hf_error,
+            }
+        )
+        return next(self.results)
+
+
+def make_retrieval_result(
+    query: str,
+    documents: tuple[RetrievedDocument, ...],
+    *,
+    missing_translation_ids: tuple[str, ...] = (),
+) -> RetrievalResult:
+    return RetrievalResult(
+        search_result=PipelineResult(
+            query=query,
+            pipeline="ragtime2%100",
+            hits=tuple(
+                SearchHit(
+                    rank=document.rank,
+                    document_id=document.document_id,
+                    score=document.score,
+                )
+                for document in documents
+            ),
+            processed=True,
+            local_cache_hit=True,
+            remote_cached=True,
+            server_timestamp=123.0,
+            cache_stored_at=123.0,
+        ),
+        documents=documents,
+        missing_translation_ids=missing_translation_ids,
+    )
+
+
+class ControlARunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        root = Path(self.temporary_directory.name)
+        self.topic_file = root / "topics.jsonl"
+        self.topic_file.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {
+                        "topic_id": "1",
+                        "collection_id": "ragtime/2/all",
+                        "problem_statement": "first problem",
+                        "background": "first background",
+                        "limit": 5000,
+                    },
+                    {
+                        "topic_id": "2",
+                        "collection_id": "ragtime/2/all",
+                        "problem_statement": "second problem",
+                        "background": "second background",
+                        "limit": 5000,
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.output_root = root / "artifacts"
+
+    def test_runner_calls_organizer_and_writes_auditable_candidates(self) -> None:
+        unresolved = RetrievedDocument(
+            rank=2,
+            document_id="doc-unresolved",
+            score=0.2,
+            text=None,
+            url=None,
+            date=None,
+            language=None,
+            content_source=None,
+            content_local_cache_hit=None,
+        )
+        translated = RetrievedDocument(
+            rank=1,
+            document_id="doc-translation",
+            score=0.9,
+            text="texto fuente",
+            url="https://example.test/doc",
+            date="2025-01-01",
+            language="spa",
+            content_source="huggingface",
+            content_local_cache_hit=True,
+        )
+        first_query = "Problem: first problem\n\nBackground: first background"
+        second_query = "Problem: second problem\n\nBackground: second background"
+        retriever = FakeRetriever(
+            [
+                make_retrieval_result(first_query, (unresolved,)),
+                make_retrieval_result(
+                    second_query,
+                    (translated,),
+                    missing_translation_ids=("doc-translation",),
+                ),
+            ]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="control-a-test",
+            top_k=100,
+            git_revision="git-revision-1",
+            created_at="2026-08-02T00:00:00+00:00",
+        )
+
+        self.assertEqual(run_dir, self.output_root / "control-a-test")
+        self.assertEqual(
+            [call["pipeline"] for call in retriever.calls],
+            ["ragtime2%100", "ragtime2%100"],
+        )
+        self.assertEqual([call["top_k"] for call in retriever.calls], [None, None])
+        self.assertEqual(
+            [call["max_content_fallbacks"] for call in retriever.calls], [0, 0]
+        )
+        self.assertEqual(
+            [call["fallback_on_hf_error"] for call in retriever.calls],
+            [False, False],
+        )
+
+        manifest = json.loads(
+            (run_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["requested_top_k"], 100)
+        self.assertEqual(manifest["pipeline"], "ragtime2%100")
+        self.assertEqual(manifest["git_revision"], "git-revision-1")
+        self.assertEqual(manifest["corpus"]["revision"], "corpus-revision-1")
+        self.assertEqual(manifest["counts"]["topics"], 2)
+        self.assertEqual(manifest["counts"]["candidates"], 2)
+        self.assertEqual(
+            manifest["topic_status"],
+            [
+                {"missing_translation_ids": [], "topic_id": "1", "unresolved_ids": ["doc-unresolved"]},
+                {"missing_translation_ids": ["doc-translation"], "topic_id": "2", "unresolved_ids": []},
+            ],
+        )
+
+        candidate_lines = (run_dir / "candidates.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        candidates = [json.loads(line) for line in candidate_lines]
+        self.assertEqual([candidate["topic_id"] for candidate in candidates], ["1", "2"])
+        self.assertEqual(candidates[0]["document_id"], "doc-unresolved")
+        self.assertFalse(candidates[0]["hydrated"])
+        self.assertFalse(candidates[0]["report_ready"])
+        self.assertTrue(candidates[1]["missing_translation"])
+        self.assertEqual(candidates[1]["text"], "texto fuente")
+        self.assertIsNone(candidates[1]["report_text"])
+        self.assertEqual(candidates[0]["query_hash"], query_hash(first_query))
+        self.assertEqual(candidates[1]["query_hash"], query_hash(second_query))
+        self.assertEqual(
+            manifest["topic_source"]["sha256"],
+            hashlib.sha256(self.topic_file.read_bytes()).hexdigest(),
+        )
+        self.assertNotIn("bearer_token", json.dumps(manifest).lower())
+
+    def test_runner_refuses_to_overwrite_existing_run(self) -> None:
+        run_dir = self.output_root / "existing"
+        run_dir.mkdir(parents=True)
+        retriever = FakeRetriever([])
+
+        with self.assertRaises(FileExistsError):
+            run_control_a(
+                self.topic_file,
+                retriever=retriever,
+                output_root=self.output_root,
+                run_id="existing",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":
