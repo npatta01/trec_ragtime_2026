@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
+from .client import RagtimeError
+from .huggingface import HuggingFaceError
 from .models import RetrievalResult, RetrievedDocument
 from .paths import default_project_cache_dir
 
@@ -136,11 +138,11 @@ def load_topics(path: Path) -> tuple[Topic, ...]:
 
 
 def build_topic_query(topic: Topic) -> str:
-    """Build the stable Control-A query from the topic's two text fields."""
+    """Build the stable problem-only Control-A retrieval query."""
 
     if not isinstance(topic, Topic):
         raise TypeError("topic must be a Topic")
-    return f"Problem: {topic.problem_statement}\n\nBackground: {topic.background}"
+    return topic.problem_statement
 
 
 def pipeline_for_top_k(top_k: int) -> str:
@@ -326,15 +328,28 @@ def run_control_a(
     topic_status: list[dict[str, object]] = []
     unresolved_count = 0
     missing_translation_count = 0
+    failed_topic_count = 0
     for topic in topics:
         query = build_topic_query(topic)
-        result = retriever.retrieve(
-            query,
-            pipeline=pipeline,
-            top_k=top_k,
-            max_content_fallbacks=0,
-            fallback_on_hf_error=False,
-        )
+        try:
+            result = retriever.retrieve(
+                query,
+                pipeline=pipeline,
+                top_k=top_k,
+                max_content_fallbacks=0,
+                fallback_on_hf_error=False,
+            )
+        except (RagtimeError, HuggingFaceError) as exc:
+            failed_topic_count += 1
+            topic_status.append(
+                {
+                    "error": {"type": type(exc).__name__},
+                    "missing_translation_ids": [],
+                    "topic_id": topic.topic_id,
+                    "unresolved_ids": [],
+                }
+            )
+            continue
         missing_translation_ids = set(result.missing_translation_ids)
         unresolved_ids = list(result.unresolved_ids)
         unresolved_count += len(unresolved_ids)
@@ -365,7 +380,7 @@ def run_control_a(
             "path": str(topic_path.resolve()),
             "sha256": _sha256_file(topic_path),
         },
-        "query_construction": "problem_background_v1",
+        "query_construction": "problem_only_v1",
         "requested_top_k": top_k,
         "pipeline": pipeline,
         "retrieval": {
@@ -380,6 +395,7 @@ def run_control_a(
         "counts": {
             "topics": len(topics),
             "candidates": len(records),
+            "failed_topics": failed_topic_count,
             "unresolved_documents": unresolved_count,
             "missing_translation_documents": missing_translation_count,
         },

@@ -41,11 +41,9 @@ def test_load_topics_preserves_source_order_and_validates_fields(self):
     self.assertEqual([topic.topic_id for topic in topics], ["2000", "2001"])
     self.assertEqual(topics[0].limit, 5000)
 
-def test_build_topic_query_labels_problem_and_background(self):
+def test_build_topic_query_uses_problem_statement_only(self):
     topic = Topic("1", "ragtime/2/all", "problem", "background", 5000)
-    self.assertEqual(
-        build_topic_query(topic), "Problem: problem\n\nBackground: background"
-    )
+    self.assertEqual(build_topic_query(topic), "problem")
 
 def test_pipeline_for_top_k_translates_depth_to_organizer_protocol(self):
     self.assertEqual(pipeline_for_top_k(100), "ragtime2")
@@ -201,7 +199,17 @@ Expected: failure because `run_control_a` is not implemented.
 
 - [x] **Step 3: Implement the minimal batch runner**
 
-For every loaded topic, call `retriever.retrieve()` once with `pipeline="ragtime2"`, the requested `top_k`, `max_content_fallbacks=0`, and no fallback-on-Hugging-Face errors. Convert each `RetrievedDocument` with `as_record(include_text=True)`, add topic ID, collection ID, query, query hash, topic limit, `hydrated`, `report_ready`, and `missing_translation` fields, and preserve the result order. Build a manifest with schema version, run ID, UTC creation time, topic source path/hash, Git revision, query-construction version, requested depth, pipeline, retrieval options, API cache path, corpus path/revision, counts, and per-topic unresolved/translation IDs.
+For every loaded topic, call `retriever.retrieve()` once with the problem-only
+query, `pipeline="ragtime2"`, the requested `top_k`, `max_content_fallbacks=0`,
+and no fallback-on-Hugging-Face errors. Convert each `RetrievedDocument` with
+`as_record(include_text=True)`, add topic ID, collection ID, query, query hash,
+topic limit, `hydrated`, `report_ready`, and `missing_translation` fields, and
+preserve the result order. Build a manifest with schema version, run ID, UTC
+creation time, topic source path/hash, Git revision, query-construction
+version, requested depth, pipeline, retrieval options, API cache path, corpus
+path/revision, counts, and per-topic unresolved/translation IDs. The topic
+background remains available to the later `P+F(B)` decomposition arm and is not
+included verbatim in Control-A.
 
 Use the supplied `created_at` and `git_revision` in tests; when omitted, use UTC now and `git rev-parse HEAD` from the topic repository. Do not include exception strings that could contain credentials.
 

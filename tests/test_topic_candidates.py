@@ -9,7 +9,13 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
-from trec_ragtime import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
+from trec_ragtime import (
+    PipelineResult,
+    RagtimeApiError,
+    RetrievalResult,
+    RetrievedDocument,
+    SearchHit,
+)
 from trec_ragtime.topic_candidates import (
     Topic,
     build_topic_query,
@@ -60,12 +66,10 @@ class TopicHelpersTests(unittest.TestCase):
         self.assertEqual([topic.topic_id for topic in topics], ["2000", "2001"])
         self.assertEqual(topics[0].limit, 5000)
 
-    def test_build_topic_query_labels_problem_and_background(self) -> None:
+    def test_build_topic_query_uses_problem_statement_only(self) -> None:
         topic = Topic("1", "ragtime/2/all", "problem", "background", 5000)
 
-        self.assertEqual(
-            build_topic_query(topic), "Problem: problem\n\nBackground: background"
-        )
+        self.assertEqual(build_topic_query(topic), "problem")
 
     def test_pipeline_for_top_k_translates_depth_to_organizer_protocol(self) -> None:
         self.assertEqual(pipeline_for_top_k(100), "ragtime2")
@@ -190,7 +194,7 @@ class ControlAArtifactTests(unittest.TestCase):
 
 
 class FakeRetriever:
-    def __init__(self, results: list[RetrievalResult]) -> None:
+    def __init__(self, results: list[object]) -> None:
         self.results = iter(results)
         self.calls: list[dict[str, object]] = []
         self.cache_path = Path("/shared/ragtime-cache/api-v1.sqlite3")
@@ -217,7 +221,10 @@ class FakeRetriever:
                 "fallback_on_hf_error": fallback_on_hf_error,
             }
         )
-        return next(self.results)
+        result = next(self.results)
+        if isinstance(result, BaseException):
+            raise result
+        return result  # type: ignore[return-value]
 
 
 def make_retrieval_result(
@@ -303,8 +310,8 @@ class ControlARunnerTests(unittest.TestCase):
             content_source="huggingface",
             content_local_cache_hit=True,
         )
-        first_query = "Problem: first problem\n\nBackground: first background"
-        second_query = "Problem: second problem\n\nBackground: second background"
+        first_query = "first problem"
+        second_query = "second problem"
         retriever = FakeRetriever(
             [
                 make_retrieval_result(first_query, (unresolved,)),
@@ -345,6 +352,7 @@ class ControlARunnerTests(unittest.TestCase):
         )
         self.assertEqual(manifest["requested_top_k"], 100)
         self.assertEqual(manifest["pipeline"], "ragtime2")
+        self.assertEqual(manifest["query_construction"], "problem_only_v1")
         self.assertEqual(manifest["retrieval"]["top_k"], 100)
         self.assertEqual(manifest["git_revision"], "git-revision-1")
         self.assertEqual(manifest["corpus"]["revision"], "corpus-revision-1")
@@ -389,6 +397,56 @@ class ControlARunnerTests(unittest.TestCase):
                 output_root=self.output_root,
                 run_id="existing",
             )
+
+    def test_runner_records_retrieval_failure_and_continues(self) -> None:
+        translated = RetrievedDocument(
+            rank=1,
+            document_id="doc-success",
+            score=0.9,
+            text="source text",
+            url=None,
+            date=None,
+            language="eng",
+            content_source="huggingface",
+            content_local_cache_hit=True,
+        )
+        retriever = FakeRetriever(
+            [
+                RagtimeApiError("HTTP 504"),
+                make_retrieval_result("second problem", (translated,)),
+            ]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="control-a-with-failure",
+            top_k=100,
+        )
+
+        manifest = json.loads(
+            (run_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["counts"]["topics"], 2)
+        self.assertEqual(manifest["counts"]["candidates"], 1)
+        self.assertEqual(manifest["counts"]["failed_topics"], 1)
+        self.assertEqual(
+            manifest["topic_status"],
+            [
+                {
+                    "error": {"type": "RagtimeApiError"},
+                    "missing_translation_ids": [],
+                    "topic_id": "1",
+                    "unresolved_ids": [],
+                },
+                {
+                    "missing_translation_ids": [],
+                    "topic_id": "2",
+                    "unresolved_ids": [],
+                },
+            ],
+        )
 
 
 class ControlACommandLineTests(unittest.TestCase):

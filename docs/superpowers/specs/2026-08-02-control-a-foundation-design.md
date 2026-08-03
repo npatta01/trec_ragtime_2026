@@ -26,15 +26,15 @@ Add a topic-batch runner and pure serialization helpers, with tests:
 - `tests/test_topic_candidates.py`
 - a small command or experiment entry point for running the batch against the checked-in topic JSONL
 
-The runner will read `topics/topics.all.2026.v0625.jsonl`, preserving source order and validating each record's `topic_id`, `collection_id`, `problem_statement`, `background`, and `limit`. The baseline query is deterministic and labeled:
+The runner will read `topics/topics.all.2026.v0625.jsonl`, preserving source order and validating each record's `topic_id`, `collection_id`, `problem_statement`, `background`, and `limit`. The baseline query is the problem statement alone and is recorded as `query_construction="problem_only_v1"`:
 
 ```text
-Problem: {problem_statement}
-
-Background: {background}
+{problem_statement}
 ```
 
-The `limit` field remains topic metadata and is not inserted into the retrieval query.
+The background remains topic metadata for the separate `P+F(B)` facet arm; it
+is not sent verbatim as part of Control-A. The `limit` field remains topic
+metadata and is not inserted into the retrieval query.
 
 The Control-A runner exposes the requested candidate depth as `top_k=100` and
 uses the current organizer pipeline name directly:
@@ -55,6 +55,8 @@ Control-A therefore keeps the pipeline name fixed and uses the existing
 retriever's `top_k` argument as the public depth control.
 
 The runner will not decompose, rerank, fuse, or add a local retrieval index.
+The later `P+F(B)` arm will consume the same topic records and shared cache,
+using background only to generate facet queries.
 
 ## Artifact contract
 
