@@ -31,7 +31,7 @@
 **Interfaces:**
 - Produces `Topic`, `load_topics(path)`, `build_topic_query(topic)`, `pipeline_for_top_k(top_k)`, and `query_hash(query)` for the later runner tasks.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add `unittest` cases covering:
 
@@ -55,7 +55,7 @@ def test_pipeline_for_top_k_translates_depth_to_organizer_protocol(self):
 
 Also test that malformed JSON, missing required fields, duplicate topic IDs, non-positive limits, and blank text fail with `ValueError` naming the source line or field.
 
-- [ ] **Step 2: Run the focused tests and verify the expected failure**
+- [x] **Step 2: Run the focused tests and verify the expected failure**
 
 Run:
 
@@ -65,7 +65,7 @@ uv run python -m unittest tests.test_topic_candidates -v
 
 Expected: import failure because `trec_ragtime.topic_candidates` does not yet exist.
 
-- [ ] **Step 3: Implement the minimal pure helpers**
+- [x] **Step 3: Implement the minimal pure helpers**
 
 Define:
 
@@ -86,11 +86,11 @@ def query_hash(query: str) -> str: ...
 
 Read UTF-8 JSONL line-by-line, reject blank lines and unexpected/missing fields, preserve file order, and hash the exact UTF-8 query with SHA-256. Keep `limit` as metadata and exclude it from the query.
 
-- [ ] **Step 4: Run the focused tests and verify they pass**
+- [x] **Step 4: Run the focused tests and verify they pass**
 
 Run the same focused command. Expected: all parsing and query-construction tests pass.
 
-- [ ] **Step 5: Commit the pure topic layer**
+- [x] **Step 5: Commit the pure topic layer**
 
 ```bash
 git add src/trec_ragtime/topic_candidates.py tests/test_topic_candidates.py
@@ -106,11 +106,11 @@ git commit -m "feat: add Control-A topic query helpers"
 **Interfaces:**
 - Produces `write_control_a_artifact(run_dir, manifest, records)` and a JSON-safe candidate-record helper used by the batch runner.
 
-- [ ] **Step 1: Write the failing serialization tests**
+- [x] **Step 1: Write the failing serialization tests**
 
 Test that the writer creates `manifest.json` and `candidates.jsonl`, emits UTF-8 JSON with stable key ordering, preserves canonical text and `report_text`, records unresolved/translation status, and refuses to write into an existing run directory. Test that a temporary file is not left as the completed artifact after a successful write.
 
-- [ ] **Step 2: Run the serialization tests and verify they fail**
+- [x] **Step 2: Run the serialization tests and verify they fail**
 
 Run:
 
@@ -120,7 +120,7 @@ uv run python -m unittest tests.test_topic_candidates.ControlAArtifactTests -v
 
 Expected: failure because the writer helpers do not exist.
 
-- [ ] **Step 3: Implement atomic, no-overwrite serialization**
+- [x] **Step 3: Implement atomic, no-overwrite serialization**
 
 Implement:
 
@@ -135,11 +135,11 @@ def write_control_a_artifact(
 
 Create the run directory exactly once, write each file through a same-directory temporary file, flush and `os.fsync()` it, then publish with `os.replace()`. Reject an existing `run_dir` before writing. Serialize each candidate on one JSONL line with `ensure_ascii=False`, sorted keys, and newline termination.
 
-- [ ] **Step 4: Run the serialization tests and verify they pass**
+- [x] **Step 4: Run the serialization tests and verify they pass**
 
 Run the focused serialization command, then rerun `uv run python -m unittest tests.test_topic_candidates -v`.
 
-- [ ] **Step 5: Commit the artifact layer**
+- [x] **Step 5: Commit the artifact layer**
 
 ```bash
 git add src/trec_ragtime/topic_candidates.py tests/test_topic_candidates.py
