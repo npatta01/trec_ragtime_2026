@@ -56,7 +56,7 @@ class RecordingSession:
         self.closed = True
 
 
-def pipeline_payload(scores=None, *, query="query", pipeline="ragtime2%20"):
+def pipeline_payload(scores=None, *, query="query", pipeline="ragtime2"):
     return {
         "pipeline": pipeline,
         "processed": True,
@@ -130,7 +130,7 @@ class RagtimeClientTests(unittest.TestCase):
                 self.assertEqual(session.calls[0][0], "https://api.example/pipeline")
                 self.assertEqual(
                     session.calls[0][1]["json"],
-                    {"pipeline": "ragtime2%20", "query": "query"},
+                    {"pipeline": "ragtime2", "query": "query"},
                 )
                 self.assertEqual(
                     session.calls[0][1]["headers"]["Authorization"],
@@ -339,7 +339,7 @@ class RagtimeClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "responses.sqlite3"
             cache = SQLiteResponseCache(cache_path)
-            request = {"pipeline": "ragtime2%20", "query": "query"}
+            request = {"pipeline": "ragtime2", "query": "query"}
             cache.put(
                 base_url="https://api.example",
                 operation="pipeline",
@@ -411,7 +411,7 @@ class RagtimeClientTests(unittest.TestCase):
                 Path(directory) / "responses.sqlite3",
                 clock=lambda: now[0],
             )
-            request = {"pipeline": "ragtime2%20", "query": "query"}
+            request = {"pipeline": "ragtime2", "query": "query"}
             response = pipeline_payload()
             cache.put(
                 base_url="https://api.example",
@@ -457,7 +457,7 @@ class RagtimeClientTests(unittest.TestCase):
                 cache.put(
                     base_url="https://api.example",
                     operation="pipeline",
-                    request={"pipeline": "ragtime2%20", "query": f"query-{index}"},
+                    request={"pipeline": "ragtime2", "query": f"query-{index}"},
                     response=pipeline_payload(query=f"query-{index}"),
                 )
 

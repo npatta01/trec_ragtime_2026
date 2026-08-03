@@ -21,7 +21,7 @@ from urllib3.util.retry import Retry
 from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, SQLiteResponseCache
 from .models import Document, PipelineResult, SearchHit
 
-DEFAULT_PIPELINE = "ragtime2%20"
+DEFAULT_PIPELINE = "ragtime2"
 DEFAULT_CONTENT_COLLECTION = "ragtime2"
 DEFAULT_SEARCH_CACHE_TTL_SECONDS: float | None = None
 DEFAULT_CONTENT_CACHE_TTL_SECONDS: float | None = None
