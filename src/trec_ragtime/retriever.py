@@ -116,6 +116,31 @@ class RagtimeRetriever:
     def corpus_path(self) -> Path | None:
         return self.corpus.path if isinstance(self.corpus, LocalCorpusIndex) else None
 
+    @property
+    def corpus_identity(self) -> dict[str, Any]:
+        """Return immutable provenance for artifacts hydrated by the local corpus."""
+
+        if not isinstance(self.corpus, LocalCorpusIndex):
+            raise LocalCorpusConfigurationError(
+                "query baseline artifacts require a revision-pinned local corpus"
+            )
+        metadata = self.corpus.metadata
+        return {
+            "backend": self.corpus.backend_name,
+            "path": str(self.corpus.path.resolve(strict=True)),
+            "schema_version": metadata.schema_version,
+            "dataset": metadata.dataset,
+            "config": metadata.config,
+            "revision": metadata.revision,
+            "document_count": metadata.document_count,
+            "shard_count": metadata.shard_count,
+            "splits": list(metadata.splits),
+            "translation_config": metadata.translation_config,
+            "translation_count": metadata.translation_count,
+            "translation_shard_count": metadata.translation_shard_count,
+            "translation_splits": list(metadata.translation_splits),
+        }
+
     def close(self) -> None:
         try:
             self.corpus.close()

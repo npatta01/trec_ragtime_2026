@@ -8,7 +8,8 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,10 @@ from .paths import default_project_cache_dir
 PIPELINE = "ragtime2"
 DEFAULT_TOP_K = 100
 DEFAULT_RRF_K = 60
+EXPECTED_TOPIC_IDS = tuple(str(topic_id) for topic_id in range(2000, 2103))
+EXPECTED_QUERY_PLAN_SHA256 = (
+    "83dacea6961986bcbd9aeb1423e8da321d80f0d185d39a875ef148f8f22185d7"
+)
 _BASELINE_NAMES = {"b": "baseline-b-single-query", "c": "baseline-c-facet-rrf"}
 
 
@@ -51,6 +56,9 @@ class RetrieverLike(Protocol):
     ) -> RetrievalResult: ...
 
     def enrich_documents(self, document_ids: Iterable[str]) -> HydrationResult: ...
+
+    @property
+    def corpus_identity(self) -> Mapping[str, Any]: ...
 
 
 def _now() -> str:
@@ -266,8 +274,10 @@ def _query_record_from_result(
     started_at: str,
     duration_seconds: float,
     attempt: int,
+    top_k: int,
 ) -> dict[str, Any]:
     search = result.search_result
+    hits = search.hits[:top_k]
     return {
         "topic_id": topic_id,
         "query_index": query_index,
@@ -280,8 +290,8 @@ def _query_record_from_result(
         "attempt": attempt,
         "local_cache_hit": search.local_cache_hit,
         "remote_cached": search.remote_cached,
-        "hit_count": len(search.hits),
-        "hits": search.as_records(),
+        "hit_count": len(hits),
+        "hits": [hit.as_record() for hit in hits],
     }
 
 
@@ -402,6 +412,85 @@ def _manifest_counts(
     }
 
 
+def _corpus_identity(retriever: RetrieverLike) -> dict[str, Any]:
+    try:
+        identity = dict(retriever.corpus_identity)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "retriever must expose a valid immutable corpus_identity mapping"
+        ) from exc
+    required = {"backend", "path", "schema_version", "dataset", "revision"}
+    missing = sorted(required.difference(identity))
+    if missing:
+        raise ValueError(
+            "corpus_identity is missing required fields: " + ", ".join(missing)
+        )
+    try:
+        json.dumps(identity, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("corpus_identity must be JSON serializable") from exc
+    return identity
+
+
+@contextmanager
+def _baseline_root_lock(output_root: Path) -> Iterator[None]:
+    """Permit only one baseline process to use organizer capacity at a time."""
+
+    lock_path = output_root / ".query-baselines.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - supported production host is POSIX.
+            yield
+        else:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(
+                    f"another query baseline is already running under {output_root}"
+                ) from None
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _hydration_error_topic_record(
+    plan: QueryPlan,
+    *,
+    baseline: str,
+    query_records: Sequence[dict[str, Any]],
+    error: Exception,
+) -> dict[str, Any]:
+    return {
+        "topic_id": plan.topic_id,
+        "variant": _BASELINE_NAMES[baseline],
+        "status": "error",
+        "plan_status": plan.plan_status,
+        "queries": list(_queries_for(plan, baseline)),
+        "query_results": [
+            {key: value for key, value in record.items() if key != "topic_id"}
+            for record in query_records
+        ],
+        "candidate_count": 0,
+        "candidates": [],
+        "hydration": {
+            "status": "error",
+            "error_type": type(error).__name__,
+            "error_detail": str(error),
+            "hydrated_count": 0,
+            "unresolved_ids": [],
+            "missing_translation_ids": [],
+            "failure_count": 1,
+        },
+        "created_at": _now(),
+    }
+
+
 def run_query_baseline(
     plans_path: Path,
     *,
@@ -412,23 +501,83 @@ def run_query_baseline(
     top_k: int = DEFAULT_TOP_K,
     rrf_k: int = DEFAULT_RRF_K,
     progress: Callable[[str], None] | None = None,
+    expected_topic_ids: Sequence[str] | None = EXPECTED_TOPIC_IDS,
+    expected_plan_sha256: str | None = EXPECTED_QUERY_PLAN_SHA256,
 ) -> Path:
     """Run or resume one exact query-plan baseline and return its artifact path."""
 
     if baseline not in _BASELINE_NAMES:
         raise ValueError("baseline must be 'b' or 'c'")
-    if not isinstance(run_id, str) or not run_id or Path(run_id).name != run_id:
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or run_id in {".", ".."}
+        or Path(run_id).name != run_id
+    ):
         raise ValueError("run_id must be one non-empty path component")
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
-        raise ValueError("top_k must be a positive integer")
-    if isinstance(rrf_k, bool) or not isinstance(rrf_k, int) or rrf_k < 1:
-        raise ValueError("rrf_k must be a positive integer")
+    if top_k != DEFAULT_TOP_K:
+        raise ValueError(f"official baselines require top_k={DEFAULT_TOP_K}")
+    if rrf_k != DEFAULT_RRF_K:
+        raise ValueError(f"official baselines require rrf_k={DEFAULT_RRF_K}")
 
     plans_path = Path(plans_path)
     plans = load_query_plans(plans_path)
-    output_root = Path(output_root)
+    actual_topic_ids = tuple(plan.topic_id for plan in plans)
+    if expected_topic_ids is not None and actual_topic_ids != tuple(expected_topic_ids):
+        raise ValueError("query plan topic IDs do not match the expected 103-topic set")
+    plan_sha256 = _sha256_file(plans_path)
+    if (
+        expected_plan_sha256 is not None
+        and plan_sha256 != expected_plan_sha256
+    ):
+        raise ValueError(
+            "query plan SHA-256 does not match the pinned baseline query plan"
+        )
+    corpus_identity = _corpus_identity(retriever)
+
+    output_root = Path(output_root).expanduser().absolute()
+    if output_root.is_symlink():
+        raise ValueError("output_root must not be a symbolic link")
     output_root.mkdir(parents=True, exist_ok=True)
-    run_dir = output_root / run_id
+    output_root = output_root.resolve()
+    with _baseline_root_lock(output_root):
+        run_dir = output_root / run_id
+        if run_dir.is_symlink():
+            raise ValueError("run directory must not be a symbolic link")
+        if run_dir.resolve(strict=False).parent != output_root:
+            raise ValueError("run directory must be directly beneath output_root")
+        run_dir.mkdir(mode=0o700, exist_ok=True)
+        return _run_query_baseline_locked(
+            plans_path=plans_path,
+            plans=plans,
+            plan_sha256=plan_sha256,
+            corpus_identity=corpus_identity,
+            baseline=baseline,
+            retriever=retriever,
+            run_dir=run_dir,
+            run_id=run_id,
+            top_k=top_k,
+            rrf_k=rrf_k,
+            progress=progress,
+        )
+
+
+def _run_query_baseline_locked(
+    *,
+    plans_path: Path,
+    plans: Sequence[QueryPlan],
+    plan_sha256: str,
+    corpus_identity: dict[str, Any],
+    baseline: str,
+    retriever: RetrieverLike,
+    run_dir: Path,
+    run_id: str,
+    top_k: int,
+    rrf_k: int,
+    progress: Callable[[str], None] | None,
+) -> Path:
+    """Execute with the shared baseline-root lock already held."""
+
     run_dir.mkdir(mode=0o700, exist_ok=True)
     manifest_path = run_dir / "manifest.json"
     queries_path = run_dir / "queries.jsonl"
@@ -439,7 +588,6 @@ def run_query_baseline(
         if manifest_path.exists()
         else None
     )
-    plan_sha256 = _sha256_file(plans_path)
     if prior_manifest is not None:
         expected = {
             "baseline": baseline,
@@ -447,6 +595,7 @@ def run_query_baseline(
             "top_k": top_k,
             "rrf_k": rrf_k,
             "plan_sha256": plan_sha256,
+            "corpus_identity": corpus_identity,
         }
         actual = {
             "baseline": prior_manifest.get("baseline"),
@@ -454,6 +603,7 @@ def run_query_baseline(
             "top_k": prior_manifest.get("top_k"),
             "rrf_k": prior_manifest.get("rrf_k"),
             "plan_sha256": prior_manifest.get("query_plan", {}).get("sha256"),
+            "corpus_identity": prior_manifest.get("corpus"),
         }
         if actual != expected:
             raise ValueError("existing run configuration does not match this request")
@@ -479,6 +629,7 @@ def run_query_baseline(
                     "path": str(plans_path.resolve()),
                     "sha256": plan_sha256,
                 },
+                "corpus": corpus_identity,
                 "query_construction": (
                     "problem_background_single_query_v1"
                     if baseline == "b"
@@ -542,6 +693,7 @@ def run_query_baseline(
                     started_at=started_at,
                     duration_seconds=time.perf_counter() - started,
                     attempt=attempt,
+                    top_k=top_k,
                 )
             checkpoints[key] = checkpoint
             _write_jsonl(
@@ -551,14 +703,22 @@ def run_query_baseline(
             write_manifest("running")
             query_records.append(checkpoint)
 
-        topic = _topic_record(
-            plan,
-            baseline=baseline,
-            query_records=query_records,
-            retriever=retriever,
-            top_k=top_k,
-            rrf_k=rrf_k,
-        )
+        try:
+            topic = _topic_record(
+                plan,
+                baseline=baseline,
+                query_records=query_records,
+                retriever=retriever,
+                top_k=top_k,
+                rrf_k=rrf_k,
+            )
+        except (RagtimeError, HuggingFaceError, LocalCorpusError) as exc:
+            topic = _hydration_error_topic_record(
+                plan,
+                baseline=baseline,
+                query_records=query_records,
+                error=exc,
+            )
         topics[(plan.topic_id,)] = topic
         _write_jsonl(
             topics_path,
@@ -617,8 +777,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=default_project_cache_dir() / "experiments" / "query-baselines",
     )
-    parser.add_argument("--top-k", type=_positive_int, default=DEFAULT_TOP_K)
-    parser.add_argument("--rrf-k", type=_positive_int, default=DEFAULT_RRF_K)
+    parser.add_argument(
+        "--top-k",
+        type=_positive_int,
+        choices=(DEFAULT_TOP_K,),
+        default=DEFAULT_TOP_K,
+    )
+    parser.add_argument(
+        "--rrf-k",
+        type=_positive_int,
+        choices=(DEFAULT_RRF_K,),
+        default=DEFAULT_RRF_K,
+    )
     return parser
 
 

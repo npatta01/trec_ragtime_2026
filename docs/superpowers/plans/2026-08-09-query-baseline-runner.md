@@ -31,27 +31,27 @@
 - Consumes: `RagtimeRetriever.retrieve(query, pipeline="ragtime2", top_k=100, max_content_fallbacks=0, fallback_on_hf_error=False)`.
 - Produces: `run_query_baseline(...) -> Path`, `build_parser()`, and `main()`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Cover literal plan loading, B organizer ordering, C `sum(1/(60+rank))`
 fusion, success/partial/error states, resume of successful query checkpoints,
 retry of failed checkpoints, atomic latest-record JSONL replacement, and CLI
 defaults (`ragtime2`, `top_k=100`, shared output root).
 
-- [ ] **Step 2: Verify the tests fail for the missing module**
+- [x] **Step 2: Verify the tests fail for the missing module**
 
 Run: `uv run python -m unittest tests.test_query_baselines -v`
 
 Expected: import failure for `trec_ragtime.query_baselines`.
 
-- [ ] **Step 3: Implement the minimal runner**
+- [x] **Step 3: Implement the minimal runner**
 
 Create typed plan/checkpoint helpers, deterministic B/C candidate builders,
 atomic JSON/JSONL writers, resume loading keyed by topic/query index, local
 hydration mapping, manifest counts, and the `b|c` CLI. Keep the module focused;
 reuse existing client, retriever, path, and model classes.
 
-- [ ] **Step 4: Verify targeted and full tests**
+- [x] **Step 4: Verify targeted and full tests**
 
 Run:
 
@@ -63,7 +63,7 @@ git diff --check
 
 Expected: all tests pass and `git diff --check` exits zero.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/superpowers/specs/2026-08-09-query-baseline-runner-design.md \
@@ -82,7 +82,7 @@ git commit -m "feat: add resumable query baseline runner"
 - Consumes: Task 1 CLI.
 - Produces: complete B and C run directories.
 
-- [ ] **Step 1: Decrypt and verify the live endpoint**
+- [x] **Step 1: Decrypt and verify the live endpoint**
 
 Run one short `ragtime2` query with `retries=0`; require 100 hits before the
 batch.

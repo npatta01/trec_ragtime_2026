@@ -8,6 +8,8 @@ corrected 2026 topics without changing the agreed query definitions.
 ## Inputs and invariants
 
 - Read the existing `query_plans.jsonl`; do not generate new queries.
+- Require topic IDs 2000–2102 and the pinned query-plan SHA-256; reject a
+  truncated or modified plan before retrieval.
 - Baseline B uses exactly one `single_query` per topic.
 - Baseline C uses exactly the ordered `facet_queries` per topic.
 - Do not use `title` or `collection_id` in query construction.
@@ -58,11 +60,19 @@ query checkpoints. A failed B query yields an `error` topic. C is `success`
 when every facet succeeds, `partial` when at least one but not all succeeds,
 and `error` when none succeeds. Failures are never silently replaced.
 
+A nonblocking lock at the shared baseline output root permits only one B/C
+process at a time. Run IDs must resolve to direct, non-symlink children of that
+root. Manifests pin the validated local-corpus path, dataset revision, schema,
+counts, and split identity; a resume with different corpus provenance fails
+before retrieval.
+
 ## Error handling and observability
 
 - Use zero transport retries per run; explicit reruns provide retry policy.
 - Catch retrieval/hydration errors per query and preserve only sanitized error
   type/detail.
+- Clip every checkpointed organizer list to `top_k=100`; the official CLI
+  rejects any other retrieval depth or RRF constant.
 - Print one concise progress line per topic.
 - Never print document text, bearer tokens, or raw response bodies.
 
