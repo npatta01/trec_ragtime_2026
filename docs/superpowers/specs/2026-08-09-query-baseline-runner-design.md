@@ -33,20 +33,24 @@ artifact records are not imported into the new baseline.
 
 ## Bounded request concurrency
 
-Within one locked B or C run, use a dynamic scheduler with at most four
+Within one locked B or C run, use bounded waves with at most four
 independent `RagtimeRetriever` instances. Each instance owns its own HTTP
 session and may have only one in-flight query. The main thread is the sole
 artifact writer: as each future completes, it writes that exact query's latest
-checkpoint atomically, then builds a topic artifact as soon as every planned
-query for that topic has a terminal checkpoint. Topic and query JSONL output
-remain in query-plan order regardless of completion order.
+checkpoint atomically. It does not hydrate topic candidates until all scheduled
+query futures have been checkpointed. Then it rebuilds every eligible topic
+artifact from current checkpoints, replacing stale topic records left by an
+interruption. Topic and query JSONL output remain in query-plan order regardless
+of completion order.
 
-Concurrency is execution metadata, not retrieval semantics, so an existing
-run created sequentially can resume with four workers. Before the batch, issue
-four real requests concurrently as a load test. Use four workers only when all
-four return 100 hits without timeout. If timeouts appear or the failure rate
-materially rises during a run, stop and resume with two workers; never exceed
-four. Keep the baseline-root process lock so B and C themselves remain
+Concurrency is execution metadata, not retrieval semantics, so an existing run
+created sequentially can resume with four workers. The CLI defaults to one
+worker. Before explicitly selecting four, issue four real requests concurrently
+as a load test and require all four to return 100 hits without timeout. A
+concurrent wave that records any failed query checkpoints every result in that
+wave, schedules no later wave, marks the manifest `stopped_on_failure`, and
+exits nonzero. Resume with two workers or stop and report the evidence; never
+exceed four. Keep the baseline-root process lock so B and C themselves remain
 sequential.
 
 ## Ranking

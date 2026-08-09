@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -137,6 +139,72 @@ class FakeRetriever:
         )
 
 
+class ConcurrentFakeRetriever(FakeRetriever):
+    def __init__(
+        self,
+        responses: dict[str, RetrievalResult | Exception],
+        *,
+        tracker: dict[str, object],
+        delays: dict[str, float] | None = None,
+        blockers: dict[str, threading.Event] | None = None,
+        completed: dict[str, threading.Event] | None = None,
+        hydration_blocker: threading.Event | None = None,
+    ) -> None:
+        super().__init__(responses)
+        self.tracker = tracker
+        self.delays = delays or {}
+        self.blockers = blockers or {}
+        self.completed = completed or {}
+        self.hydration_blocker = hydration_blocker
+        self.active = 0
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+    ) -> RetrievalResult:
+        lock = self.tracker["lock"]
+        assert isinstance(lock, type(threading.Lock()))
+        with lock:
+            self.active += 1
+            self.tracker["active"] = int(self.tracker["active"]) + 1
+            self.tracker["maximum"] = max(
+                int(self.tracker["maximum"]), int(self.tracker["active"])
+            )
+            if self.active > 1:
+                self.tracker["retriever_overlap"] = True
+        try:
+            blocker = self.blockers.get(query)
+            if blocker is not None:
+                blocker.wait(timeout=5)
+            delay = self.delays.get(query, 0.0)
+            if delay:
+                time.sleep(delay)
+            return super().retrieve(
+                query,
+                pipeline=pipeline,
+                top_k=top_k,
+                max_content_fallbacks=max_content_fallbacks,
+                fallback_on_hf_error=fallback_on_hf_error,
+            )
+        finally:
+            completed = self.completed.get(query)
+            if completed is not None:
+                completed.set()
+            with lock:
+                self.active -= 1
+                self.tracker["active"] = int(self.tracker["active"]) - 1
+
+    def enrich_documents(self, document_ids: list[str]) -> HydrationResult:
+        if self.hydration_blocker is not None:
+            self.hydration_blocker.wait(timeout=5)
+        return super().enrich_documents(document_ids)
+
+
 class QueryBaselineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -177,6 +245,7 @@ class QueryBaselineTests(unittest.TestCase):
 
         self.assertEqual(arguments.top_k, 100)
         self.assertEqual(arguments.rrf_k, 60)
+        self.assertEqual(arguments.concurrency, 1)
         self.assertEqual(arguments.plans, default_query_plan_path())
         self.assertEqual(
             arguments.output_root,
@@ -192,6 +261,10 @@ class QueryBaselineTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             build_parser().parse_args(
                 ["c", "--run-id", "baseline-c", "--rrf-k", "3"]
+            )
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["c", "--run-id", "baseline-c", "--concurrency", "8"]
             )
 
     def test_fuse_ranked_hits_uses_rrf_60_and_deterministic_ties(self) -> None:
@@ -248,10 +321,13 @@ class QueryBaselineTests(unittest.TestCase):
         second_retriever = FakeRetriever(
             {"single one": _retrieval_result("single one", ["doc-c"])}
         )
+        idle_retriever = FakeRetriever({})
         run_query_baseline(
             self.plans_path,
             baseline="b",
             retriever=second_retriever,
+            retrievers=(second_retriever, idle_retriever),
+            concurrency=2,
             output_root=self.root / "runs",
             run_id="baseline-b",
             top_k=100,
@@ -270,6 +346,7 @@ class QueryBaselineTests(unittest.TestCase):
         self.assertEqual(resumed_topics["2001"]["status"], "success")
         manifest = json.loads((run_dir / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(manifest["concurrency"], 2)
         self.assertEqual(manifest["counts"]["successful_topics"], 2)
         self.assertEqual(manifest["counts"]["failed_queries"], 0)
 
@@ -482,6 +559,327 @@ class QueryBaselineTests(unittest.TestCase):
                 _atomic_write(destination, "new\n")
 
         self.assertEqual(destination.read_text(encoding="utf-8"), "old\n")
+
+    def test_four_workers_overlap_without_sharing_a_retriever(self) -> None:
+        plans = [
+            {
+                "topic_id": str(topic_id),
+                "plan_status": "model_generated",
+                "single_query": f"query {topic_id}",
+                "facet_queries": [f"facet {topic_id}"],
+            }
+            for topic_id in range(2000, 2008)
+        ]
+        plans_path = self.root / "eight_plans.jsonl"
+        plans_path.write_text(
+            "".join(json.dumps(plan) + "\n" for plan in plans),
+            encoding="utf-8",
+        )
+        tracker: dict[str, object] = {
+            "lock": threading.Lock(),
+            "active": 0,
+            "maximum": 0,
+            "retriever_overlap": False,
+        }
+        responses = {
+            plan["single_query"]: _retrieval_result(
+                plan["single_query"], [f"doc-{plan['topic_id']}"]
+            )
+            for plan in plans
+        }
+        delays = {
+            plan["single_query"]: 0.08 - index * 0.005
+            for index, plan in enumerate(plans)
+        }
+        retrievers = tuple(
+            ConcurrentFakeRetriever(responses, tracker=tracker, delays=delays)
+            for _ in range(4)
+        )
+
+        run_dir = run_query_baseline(
+            plans_path,
+            baseline="b",
+            retriever=retrievers[0],
+            retrievers=retrievers,
+            concurrency=4,
+            output_root=self.root / "runs",
+            run_id="concurrent-four",
+            expected_topic_ids=tuple(plan["topic_id"] for plan in plans),
+            expected_plan_sha256=None,
+        )
+
+        self.assertEqual(tracker["maximum"], 4)
+        self.assertFalse(tracker["retriever_overlap"])
+        queries = [
+            json.loads(line)
+            for line in (run_dir / "queries.jsonl").read_text().split("\n")
+            if line
+        ]
+        topics = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().split("\n")
+            if line
+        ]
+        expected_order = [plan["topic_id"] for plan in plans]
+        self.assertEqual([row["topic_id"] for row in queries], expected_order)
+        self.assertEqual([row["topic_id"] for row in topics], expected_order)
+
+    def test_completed_query_is_checkpointed_while_peer_is_blocked(self) -> None:
+        tracker: dict[str, object] = {
+            "lock": threading.Lock(),
+            "active": 0,
+            "maximum": 0,
+            "retriever_overlap": False,
+        }
+        release_slow = threading.Event()
+        fast_completed = threading.Event()
+        responses = {
+            "single zero": _retrieval_result("single zero", ["doc-a"]),
+            "single one": _retrieval_result("single one", ["doc-b"]),
+        }
+        retrievers = (
+            ConcurrentFakeRetriever(
+                responses,
+                tracker=tracker,
+                completed={"single zero": fast_completed},
+            ),
+            ConcurrentFakeRetriever(
+                responses,
+                tracker=tracker,
+                blockers={"single one": release_slow},
+            ),
+        )
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                run_query_baseline(
+                    self.plans_path,
+                    baseline="b",
+                    retriever=retrievers[0],
+                    retrievers=retrievers,
+                    concurrency=2,
+                    output_root=self.root / "runs",
+                    run_id="immediate-checkpoint",
+                    expected_topic_ids=self.expected_topic_ids,
+                    expected_plan_sha256=None,
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below.
+                errors.append(exc)
+
+        runner = threading.Thread(target=run)
+        runner.start()
+        self.assertTrue(fast_completed.wait(timeout=2))
+        queries_path = (
+            self.root / "runs" / "immediate-checkpoint" / "queries.jsonl"
+        )
+        deadline = time.monotonic() + 2
+        checkpointed = False
+        while time.monotonic() < deadline:
+            if queries_path.exists():
+                rows = [
+                    json.loads(line)
+                    for line in queries_path.read_text().split("\n")
+                    if line
+                ]
+                if [row["topic_id"] for row in rows] == ["2000"]:
+                    checkpointed = True
+                    break
+            time.sleep(0.01)
+        self.assertTrue(checkpointed)
+        self.assertTrue(runner.is_alive())
+        release_slow.set()
+        runner.join(timeout=5)
+
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_all_completed_queries_checkpoint_before_topic_hydration(self) -> None:
+        tracker: dict[str, object] = {
+            "lock": threading.Lock(),
+            "active": 0,
+            "maximum": 0,
+            "retriever_overlap": False,
+        }
+        release_hydration = threading.Event()
+        zero_completed = threading.Event()
+        one_completed = threading.Event()
+        responses = {
+            "single zero": _retrieval_result("single zero", ["doc-a"]),
+            "single one": _retrieval_result("single one", ["doc-b"]),
+        }
+        retrievers = (
+            ConcurrentFakeRetriever(
+                responses,
+                tracker=tracker,
+                completed={"single zero": zero_completed},
+                hydration_blocker=release_hydration,
+            ),
+            ConcurrentFakeRetriever(
+                responses,
+                tracker=tracker,
+                completed={"single one": one_completed},
+            ),
+        )
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                run_query_baseline(
+                    self.plans_path,
+                    baseline="b",
+                    retriever=retrievers[0],
+                    retrievers=retrievers,
+                    concurrency=2,
+                    output_root=self.root / "runs",
+                    run_id="checkpoint-before-hydration",
+                    expected_topic_ids=self.expected_topic_ids,
+                    expected_plan_sha256=None,
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below.
+                errors.append(exc)
+
+        runner = threading.Thread(target=run)
+        runner.start()
+        try:
+            self.assertTrue(zero_completed.wait(timeout=2))
+            self.assertTrue(one_completed.wait(timeout=2))
+            queries_path = (
+                self.root
+                / "runs"
+                / "checkpoint-before-hydration"
+                / "queries.jsonl"
+            )
+            deadline = time.monotonic() + 2
+            checkpoint_count = 0
+            while time.monotonic() < deadline:
+                if queries_path.exists():
+                    checkpoint_count = len(
+                        [line for line in queries_path.read_text().split("\n") if line]
+                    )
+                    if checkpoint_count == 2:
+                        break
+                time.sleep(0.01)
+        finally:
+            release_hydration.set()
+            runner.join(timeout=5)
+
+        self.assertEqual(checkpoint_count, 2)
+        self.assertEqual(errors, [])
+
+    def test_resume_rebuilds_stale_topic_from_successful_checkpoint(self) -> None:
+        first = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=first,
+            output_root=self.root / "runs",
+            run_id="stale-topic",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        topics = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().split("\n")
+            if line
+        ]
+        topics[0] = {
+            **topics[0],
+            "status": "error",
+            "candidate_count": 0,
+            "candidates": [],
+        }
+        (run_dir / "topics.jsonl").write_text(
+            "".join(json.dumps(topic) + "\n" for topic in topics),
+            encoding="utf-8",
+        )
+        resumed = FakeRetriever({})
+
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=resumed,
+            output_root=self.root / "runs",
+            run_id="stale-topic",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        rebuilt = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().split("\n")
+            if line
+        ]
+        self.assertEqual(rebuilt[0]["status"], "success")
+        self.assertEqual(rebuilt[0]["candidate_count"], 1)
+        self.assertEqual(resumed.calls, [])
+
+    def test_concurrent_failure_stops_scheduling_new_queries(self) -> None:
+        plans = [
+            {
+                "topic_id": str(topic_id),
+                "plan_status": "model_generated",
+                "single_query": f"query {topic_id}",
+                "facet_queries": [f"facet {topic_id}"],
+            }
+            for topic_id in range(2000, 2006)
+        ]
+        plans_path = self.root / "six_plans.jsonl"
+        plans_path.write_text(
+            "".join(json.dumps(plan) + "\n" for plan in plans),
+            encoding="utf-8",
+        )
+        tracker: dict[str, object] = {
+            "lock": threading.Lock(),
+            "active": 0,
+            "maximum": 0,
+            "retriever_overlap": False,
+        }
+        responses: dict[str, RetrievalResult | Exception] = {
+            plan["single_query"]: _retrieval_result(
+                plan["single_query"], [f"doc-{plan['topic_id']}"]
+            )
+            for plan in plans
+        }
+        responses["query 2000"] = RagtimeApiError(
+            "RAGTIME /pipeline request failed: HTTP 504"
+        )
+        delays = {plan["single_query"]: 0.1 for plan in plans[1:]}
+        retrievers = tuple(
+            ConcurrentFakeRetriever(responses, tracker=tracker, delays=delays)
+            for _ in range(4)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "concurrent retrieval stopped"):
+            run_query_baseline(
+                plans_path,
+                baseline="b",
+                retriever=retrievers[0],
+                retrievers=retrievers,
+                concurrency=4,
+                output_root=self.root / "runs",
+                run_id="stop-on-error",
+                expected_topic_ids=tuple(plan["topic_id"] for plan in plans),
+                expected_plan_sha256=None,
+            )
+
+        total_calls = sum(len(worker.calls) for worker in retrievers)
+        self.assertEqual(total_calls, 4)
+        manifest = json.loads(
+            (
+                self.root
+                / "runs"
+                / "stop-on-error"
+                / "manifest.json"
+            ).read_text()
+        )
+        self.assertEqual(manifest["status"], "stopped_on_failure")
+        self.assertEqual(manifest["counts"]["failed_queries"], 1)
 
 
 if __name__ == "__main__":

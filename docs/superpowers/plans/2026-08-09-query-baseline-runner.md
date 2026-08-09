@@ -84,30 +84,33 @@ git commit -m "feat: add resumable query baseline runner"
 **Interfaces:**
 - Consumes: `run_query_baseline(..., retrievers: Sequence[RetrieverLike], concurrency: int)`.
 - Produces: immediate deterministic checkpoints from at most four in-flight
-  organizer requests; CLI option `--concurrency {1,2,4}` with default `4`.
+  organizer requests; CLI option `--concurrency {1,2,4}` with default `1`.
 
-- [ ] **Step 1: Write failing scheduler tests**
+- [x] **Step 1: Write failing scheduler tests**
 
 Cover a measured maximum of four overlapping retrieval calls, one in-flight
 call per retriever instance, deterministic plan-ordered JSONL after
-out-of-order completion, immediate checkpoint writes, exact resume of the
-existing sequential B artifact, and parser rejection above four.
+out-of-order completion, immediate checkpoint writes before topic hydration,
+rebuilding stale topic records, stopping after the first failed concurrent
+wave, exact resume of the existing sequential B artifact, and parser rejection
+above four.
 
-- [ ] **Step 2: Verify the focused tests fail**
+- [x] **Step 2: Verify the focused tests fail**
 
 Run: `uv run python -m unittest tests.test_query_baselines -v`
 
 Expected: failures because `run_query_baseline` and the CLI do not expose
 bounded concurrency.
 
-- [ ] **Step 3: Implement the dynamic scheduler**
+- [x] **Step 3: Implement the bounded wave scheduler**
 
-Use `ThreadPoolExecutor` with one independent retriever per slot. Submit at
-most one query per retriever, process futures in the main thread, atomically
-write each completed query checkpoint, and immediately refill the freed slot.
-Only the main thread may mutate checkpoint/topic mappings or artifact files.
+Use `ThreadPoolExecutor` with one independent retriever per slot. Submit one
+bounded wave at a time, process futures in the main thread, and atomically write
+each completed query checkpoint before topic hydration. Stop before the next
+wave if any query fails. Only the main thread may mutate checkpoint/topic
+mappings or artifact files.
 
-- [ ] **Step 4: Verify focused and complete offline suites**
+- [x] **Step 4: Verify focused and complete offline suites**
 
 Run:
 
@@ -119,7 +122,7 @@ git diff --check
 
 Expected: all tests pass and `git diff --check` exits zero.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/trec_ragtime/query_baselines.py tests/test_query_baselines.py \

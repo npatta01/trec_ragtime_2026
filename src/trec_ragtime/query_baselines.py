@@ -6,12 +6,15 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -32,6 +35,10 @@ EXPECTED_QUERY_PLAN_SHA256 = (
 _BASELINE_NAMES = {"b": "baseline-b-single-query", "c": "baseline-c-facet-rrf"}
 
 
+class ConcurrentRetrievalStopped(RuntimeError):
+    """Raised after a concurrent wave records a failure and stops safely."""
+
+
 @dataclass(frozen=True, slots=True)
 class QueryPlan:
     """Literal pre-generated queries for one topic."""
@@ -40,6 +47,17 @@ class QueryPlan:
     plan_status: str
     single_query: str
     facet_queries: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QueryTask:
+    """One organizer request waiting for a dedicated retriever slot."""
+
+    ordinal: int
+    topic_id: str
+    query_index: int
+    query: str
+    attempt: int
 
 
 class RetrieverLike(Protocol):
@@ -295,6 +313,68 @@ def _query_record_from_result(
     }
 
 
+def _run_query_task(
+    task: QueryTask,
+    *,
+    retriever: RetrieverLike,
+    top_k: int,
+) -> dict[str, Any]:
+    started_at = _now()
+    started = time.perf_counter()
+    try:
+        result = retriever.retrieve(
+            task.query,
+            pipeline=PIPELINE,
+            top_k=top_k,
+            max_content_fallbacks=0,
+            fallback_on_hf_error=False,
+        )
+    except (RagtimeError, HuggingFaceError, LocalCorpusError) as exc:
+        return {
+            "topic_id": task.topic_id,
+            "query_index": task.query_index,
+            "query": task.query,
+            "query_chars": len(task.query),
+            "pipeline": PIPELINE,
+            "started_at": started_at,
+            "status": "error",
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "attempt": task.attempt,
+            "error_type": type(exc).__name__,
+            "error_detail": str(exc),
+            "hits": [],
+        }
+    return _query_record_from_result(
+        topic_id=task.topic_id,
+        query_index=task.query_index,
+        query=task.query,
+        result=result,
+        started_at=started_at,
+        duration_seconds=time.perf_counter() - started,
+        attempt=task.attempt,
+        top_k=top_k,
+    )
+
+
+def _query_records_for_topic(
+    plan: QueryPlan,
+    *,
+    baseline: str,
+    checkpoints: Mapping[tuple[Any, ...], dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    records: list[dict[str, Any]] = []
+    for query_index, query in enumerate(_queries_for(plan, baseline), start=1):
+        record = checkpoints.get((plan.topic_id, query_index))
+        if (
+            record is None
+            or record.get("query") != query
+            or record.get("pipeline") != PIPELINE
+        ):
+            return None
+        records.append(record)
+    return records
+
+
 def _hydrate_candidates(
     candidates: list[dict[str, Any]],
     retriever: RetrieverLike,
@@ -496,6 +576,8 @@ def run_query_baseline(
     *,
     baseline: str,
     retriever: RetrieverLike,
+    retrievers: Sequence[RetrieverLike] | None = None,
+    concurrency: int = 1,
     output_root: Path,
     run_id: str,
     top_k: int = DEFAULT_TOP_K,
@@ -519,6 +601,17 @@ def run_query_baseline(
         raise ValueError(f"official baselines require top_k={DEFAULT_TOP_K}")
     if rrf_k != DEFAULT_RRF_K:
         raise ValueError(f"official baselines require rrf_k={DEFAULT_RRF_K}")
+    if concurrency not in {1, 2, 4}:
+        raise ValueError("concurrency must be one of 1, 2, or 4")
+
+    worker_retrievers = (
+        (retriever,) if retrievers is None else tuple(retrievers)
+    )
+    if len(worker_retrievers) < concurrency:
+        raise ValueError("one independent retriever is required per worker")
+    worker_retrievers = worker_retrievers[:concurrency]
+    if len({id(worker) for worker in worker_retrievers}) != concurrency:
+        raise ValueError("worker retrievers must be distinct instances")
 
     plans_path = Path(plans_path)
     plans = load_query_plans(plans_path)
@@ -534,6 +627,10 @@ def run_query_baseline(
             "query plan SHA-256 does not match the pinned baseline query plan"
         )
     corpus_identity = _corpus_identity(retriever)
+    if any(
+        _corpus_identity(worker) != corpus_identity for worker in worker_retrievers
+    ):
+        raise ValueError("all worker retrievers must use the same corpus identity")
 
     output_root = Path(output_root).expanduser().absolute()
     if output_root.is_symlink():
@@ -554,6 +651,8 @@ def run_query_baseline(
             corpus_identity=corpus_identity,
             baseline=baseline,
             retriever=retriever,
+            worker_retrievers=worker_retrievers,
+            concurrency=concurrency,
             run_dir=run_dir,
             run_id=run_id,
             top_k=top_k,
@@ -570,6 +669,8 @@ def _run_query_baseline_locked(
     corpus_identity: dict[str, Any],
     baseline: str,
     retriever: RetrieverLike,
+    worker_retrievers: Sequence[RetrieverLike],
+    concurrency: int,
     run_dir: Path,
     run_id: str,
     top_k: int,
@@ -639,70 +740,19 @@ def _run_query_baseline_locked(
                 "top_k": top_k,
                 "rrf_k": rrf_k,
                 "transport_retries": 0,
+                "concurrency": concurrency,
                 "counts": _manifest_counts(plans, checkpoints, topics),
             },
         )
 
-    write_manifest("running")
-    for topic_number, plan in enumerate(plans, start=1):
-        query_records: list[dict[str, Any]] = []
-        for query_index, query in enumerate(_queries_for(plan, baseline), start=1):
-            key = (plan.topic_id, query_index)
-            checkpoint = checkpoints.get(key)
-            if (
-                checkpoint is not None
-                and checkpoint.get("status") == "success"
-                and checkpoint.get("query") == query
-                and checkpoint.get("pipeline") == PIPELINE
-            ):
-                query_records.append(checkpoint)
-                continue
-
-            attempt = int(checkpoint.get("attempt", 0)) + 1 if checkpoint else 1
-            started_at = _now()
-            started = time.perf_counter()
-            try:
-                result = retriever.retrieve(
-                    query,
-                    pipeline=PIPELINE,
-                    top_k=top_k,
-                    max_content_fallbacks=0,
-                    fallback_on_hf_error=False,
-                )
-            except (RagtimeError, HuggingFaceError, LocalCorpusError) as exc:
-                checkpoint = {
-                    "topic_id": plan.topic_id,
-                    "query_index": query_index,
-                    "query": query,
-                    "query_chars": len(query),
-                    "pipeline": PIPELINE,
-                    "started_at": started_at,
-                    "status": "error",
-                    "duration_seconds": round(time.perf_counter() - started, 3),
-                    "attempt": attempt,
-                    "error_type": type(exc).__name__,
-                    "error_detail": str(exc),
-                    "hits": [],
-                }
-            else:
-                checkpoint = _query_record_from_result(
-                    topic_id=plan.topic_id,
-                    query_index=query_index,
-                    query=query,
-                    result=result,
-                    started_at=started_at,
-                    duration_seconds=time.perf_counter() - started,
-                    attempt=attempt,
-                    top_k=top_k,
-                )
-            checkpoints[key] = checkpoint
-            _write_jsonl(
-                queries_path,
-                _ordered_query_records(plans, baseline, checkpoints),
-            )
-            write_manifest("running")
-            query_records.append(checkpoint)
-
+    def publish_topic(plan: QueryPlan) -> bool:
+        query_records = _query_records_for_topic(
+            plan,
+            baseline=baseline,
+            checkpoints=checkpoints,
+        )
+        if query_records is None:
+            return False
         try:
             topic = _topic_record(
                 plan,
@@ -732,9 +782,107 @@ def _run_query_baseline_locked(
         if progress is not None:
             counts = _manifest_counts(plans, checkpoints, topics)
             progress(
-                f"{topic_number}/{len(plans)} topic={plan.topic_id} "
+                f"{len(topics)}/{len(plans)} topic={plan.topic_id} "
                 f"status={topic['status']} failed_queries={counts['failed_queries']}"
             )
+        return True
+
+    tasks: list[QueryTask] = []
+    pending_keys: set[tuple[str, int]] = set()
+    ordinal = 0
+    for plan in plans:
+        for query_index, query in enumerate(_queries_for(plan, baseline), start=1):
+            key = (plan.topic_id, query_index)
+            checkpoint = checkpoints.get(key)
+            if (
+                checkpoint is not None
+                and checkpoint.get("status") == "success"
+                and checkpoint.get("query") == query
+                and checkpoint.get("pipeline") == PIPELINE
+            ):
+                continue
+            attempt = int(checkpoint.get("attempt", 0)) + 1 if checkpoint else 1
+            tasks.append(
+                QueryTask(
+                    ordinal=ordinal,
+                    topic_id=plan.topic_id,
+                    query_index=query_index,
+                    query=query,
+                    attempt=attempt,
+                )
+            )
+            pending_keys.add(key)
+            ordinal += 1
+
+    write_manifest("running")
+    task_iterator = iter(tasks)
+    executor = ThreadPoolExecutor(
+        max_workers=concurrency,
+        thread_name_prefix="ragtime-baseline",
+    )
+    stopped_on_failure = False
+    total_queries = sum(len(_queries_for(plan, baseline)) for plan in plans)
+    try:
+        while True:
+            wave = list(islice(task_iterator, concurrency))
+            if not wave:
+                break
+            futures: dict[Future[dict[str, Any]], QueryTask] = {
+                executor.submit(
+                    _run_query_task,
+                    task,
+                    retriever=worker,
+                    top_k=top_k,
+                ): task
+                for worker, task in zip(
+                    worker_retrievers[: len(wave)], wave, strict=True
+                )
+            }
+            wave_failed = False
+            while futures:
+                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda item: futures[item].ordinal):
+                    task = futures.pop(future)
+                    checkpoint = future.result()
+                    key = (task.topic_id, task.query_index)
+                    checkpoints[key] = checkpoint
+                    pending_keys.discard(key)
+                    _write_jsonl(
+                        queries_path,
+                        _ordered_query_records(plans, baseline, checkpoints),
+                    )
+                    write_manifest("running")
+                    wave_failed = wave_failed or checkpoint["status"] == "error"
+                    if progress is not None:
+                        counts = _manifest_counts(plans, checkpoints, topics)
+                        progress(
+                            f"queries={counts['query_records']}/{total_queries} "
+                            f"topic={task.topic_id} query={task.query_index} "
+                            f"status={checkpoint['status']} "
+                            f"failed_queries={counts['failed_queries']}"
+                        )
+            if wave_failed and concurrency > 1:
+                stopped_on_failure = True
+                break
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    for plan in plans:
+        plan_keys = {
+            (plan.topic_id, query_index)
+            for query_index, _query in enumerate(
+                _queries_for(plan, baseline), start=1
+            )
+        }
+        if plan_keys.isdisjoint(pending_keys):
+            publish_topic(plan)
+
+    if stopped_on_failure:
+        write_manifest("stopped_on_failure")
+        raise ConcurrentRetrievalStopped(
+            "concurrent retrieval stopped after an explicit failed query; "
+            "resume with lower concurrency"
+        )
 
     write_manifest("complete")
     return run_dir
@@ -789,6 +937,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(DEFAULT_RRF_K,),
         default=DEFAULT_RRF_K,
     )
+    parser.add_argument(
+        "--concurrency",
+        type=_positive_int,
+        choices=(1, 2, 4),
+        default=1,
+        help="independent retrieval workers (default: %(default)s)",
+    )
     return parser
 
 
@@ -796,17 +951,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     from .retriever import RagtimeRetriever
 
-    with RagtimeRetriever.from_env(retries=0) as retriever:
-        run_dir = run_query_baseline(
-            arguments.plans,
-            baseline=arguments.baseline,
-            retriever=retriever,
-            output_root=arguments.output_root,
-            run_id=arguments.run_id,
-            top_k=arguments.top_k,
-            rrf_k=arguments.rrf_k,
-            progress=lambda line: print(line, flush=True),
-        )
+    try:
+        with ExitStack() as stack:
+            retrievers = tuple(
+                stack.enter_context(RagtimeRetriever.from_env(retries=0))
+                for _index in range(arguments.concurrency)
+            )
+            run_dir = run_query_baseline(
+                arguments.plans,
+                baseline=arguments.baseline,
+                retriever=retrievers[0],
+                retrievers=retrievers,
+                concurrency=arguments.concurrency,
+                output_root=arguments.output_root,
+                run_id=arguments.run_id,
+                top_k=arguments.top_k,
+                rrf_k=arguments.rrf_k,
+                progress=lambda line: print(line, flush=True),
+            )
+    except ConcurrentRetrievalStopped as exc:
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+        return 2
     print(f"Baseline artifact: {run_dir}")
     return 0
 
