@@ -17,6 +17,8 @@
 - Checkpoint every query and preserve every failure explicitly.
 - Store artifacts under the shared git-common-dir cache.
 - Never print or persist credentials.
+- Use at most four independent retriever instances and one artifact-writer
+  thread; fall back to two workers if the live load test or run shows timeouts.
 
 ---
 
@@ -72,6 +74,62 @@ git add docs/superpowers/specs/2026-08-09-query-baseline-runner-design.md \
 git commit -m "feat: add resumable query baseline runner"
 ```
 
+### Task 1B: Bounded concurrent retrieval
+
+**Files:**
+- Modify: `src/trec_ragtime/query_baselines.py`
+- Modify: `tests/test_query_baselines.py`
+- Modify: `docs/superpowers/specs/2026-08-09-query-baseline-runner-design.md`
+
+**Interfaces:**
+- Consumes: `run_query_baseline(..., retrievers: Sequence[RetrieverLike], concurrency: int)`.
+- Produces: immediate deterministic checkpoints from at most four in-flight
+  organizer requests; CLI option `--concurrency {1,2,4}` with default `4`.
+
+- [ ] **Step 1: Write failing scheduler tests**
+
+Cover a measured maximum of four overlapping retrieval calls, one in-flight
+call per retriever instance, deterministic plan-ordered JSONL after
+out-of-order completion, immediate checkpoint writes, exact resume of the
+existing sequential B artifact, and parser rejection above four.
+
+- [ ] **Step 2: Verify the focused tests fail**
+
+Run: `uv run python -m unittest tests.test_query_baselines -v`
+
+Expected: failures because `run_query_baseline` and the CLI do not expose
+bounded concurrency.
+
+- [ ] **Step 3: Implement the dynamic scheduler**
+
+Use `ThreadPoolExecutor` with one independent retriever per slot. Submit at
+most one query per retriever, process futures in the main thread, atomically
+write each completed query checkpoint, and immediately refill the freed slot.
+Only the main thread may mutate checkpoint/topic mappings or artifact files.
+
+- [ ] **Step 4: Verify focused and complete offline suites**
+
+Run:
+
+```bash
+uv run python -m unittest tests.test_query_baselines -v
+uv run python -m unittest discover -s tests -v
+git diff --check
+```
+
+Expected: all tests pass and `git diff --check` exits zero.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/trec_ragtime/query_baselines.py tests/test_query_baselines.py \
+  docs/superpowers/specs/2026-08-09-query-baseline-runner-design.md \
+  docs/superpowers/plans/2026-08-09-query-baseline-runner.md
+git commit -m "feat: add bounded baseline retrieval concurrency"
+```
+
+---
+
 ### Task 2: Execute and validate B/C
 
 **Files:**
@@ -79,7 +137,7 @@ git commit -m "feat: add resumable query baseline runner"
 - Create runtime artifacts only under `<git-common-dir>/ragtime-cache/experiments/query-baselines/`.
 
 **Interfaces:**
-- Consumes: Task 1 CLI.
+- Consumes: Task 1B CLI.
 - Produces: complete B and C run directories.
 
 - [x] **Step 1: Decrypt and verify the live endpoint**

@@ -31,6 +31,24 @@ compete for organizer capacity. Existing successful cache entries for the exact
 `ragtime2` request are reused by `RagtimeClient`; historical `ragtime2%100`
 artifact records are not imported into the new baseline.
 
+## Bounded request concurrency
+
+Within one locked B or C run, use a dynamic scheduler with at most four
+independent `RagtimeRetriever` instances. Each instance owns its own HTTP
+session and may have only one in-flight query. The main thread is the sole
+artifact writer: as each future completes, it writes that exact query's latest
+checkpoint atomically, then builds a topic artifact as soon as every planned
+query for that topic has a terminal checkpoint. Topic and query JSONL output
+remain in query-plan order regardless of completion order.
+
+Concurrency is execution metadata, not retrieval semantics, so an existing
+run created sequentially can resume with four workers. Before the batch, issue
+four real requests concurrently as a load test. Use four workers only when all
+four return 100 hits without timeout. If timeouts appear or the failure rate
+materially rises during a run, stop and resume with two workers; never exceed
+four. Keep the baseline-root process lock so B and C themselves remain
+sequential.
+
 ## Ranking
 
 Baseline B preserves organizer rank and score for the first 100 documents.
@@ -74,6 +92,8 @@ before retrieval.
 - Clip every checkpointed organizer list to `top_k=100`; the official CLI
   rejects any other retrieval depth or RRF constant.
 - Print one concise progress line per topic.
+- Report cumulative failed queries while concurrent work is running; do not
+  hide failures or replace them with another query.
 - Never print document text, bearer tokens, or raw response bodies.
 
 ## Verification
