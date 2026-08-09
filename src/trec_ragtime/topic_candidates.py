@@ -20,9 +20,10 @@ from .models import RetrievalResult, RetrievedDocument
 from .paths import default_project_cache_dir
 
 
-_TOPIC_FIELDS = frozenset(
+_REQUIRED_TOPIC_FIELDS = frozenset(
     {"topic_id", "collection_id", "problem_statement", "background", "limit"}
 )
+_TOPIC_FIELDS = _REQUIRED_TOPIC_FIELDS | {"title"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,7 @@ class Topic:
     problem_statement: str
     background: str
     limit: int
+    title: str | None = None
 
 
 class RetrieverLike(Protocol):
@@ -85,7 +87,7 @@ def load_topics(path: Path) -> tuple[Topic, ...]:
                 raise ValueError(f"line {line_number}: topic must be a JSON object")
 
             fields = set(payload)
-            missing = sorted(_TOPIC_FIELDS - fields)
+            missing = sorted(_REQUIRED_TOPIC_FIELDS - fields)
             unexpected = sorted(fields - _TOPIC_FIELDS)
             if missing:
                 raise ValueError(
@@ -116,6 +118,14 @@ def load_topics(path: Path) -> tuple[Topic, ...]:
             background = _non_blank_string(
                 payload["background"], field="background", line_number=line_number
             )
+            raw_title = payload.get("title")
+            title = (
+                None
+                if raw_title is None
+                else _non_blank_string(
+                    raw_title, field="title", line_number=line_number
+                )
+            )
             limit = payload["limit"]
             if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
                 raise ValueError(
@@ -129,6 +139,7 @@ def load_topics(path: Path) -> tuple[Topic, ...]:
                     problem_statement=problem_statement,
                     background=background,
                     limit=limit,
+                    title=title,
                 )
             )
 
@@ -424,7 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--topics",
         type=Path,
-        default=Path("topics/topics.all.2026.v0625.jsonl"),
+        default=Path("topics/topics.all.2026.v0625-fix.jsonl"),
         help="topic JSONL source (default: %(default)s)",
     )
     parser.add_argument(

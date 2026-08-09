@@ -47,6 +47,7 @@ class TopicHelpersTests(unittest.TestCase):
                 {
                     "topic_id": "2000",
                     "collection_id": "ragtime/2/all",
+                    "title": "First topic",
                     "problem_statement": "first problem",
                     "background": "first background",
                     "limit": 5000,
@@ -64,6 +65,8 @@ class TopicHelpersTests(unittest.TestCase):
         topics = load_topics(self.topic_file)
 
         self.assertEqual([topic.topic_id for topic in topics], ["2000", "2001"])
+        self.assertEqual(topics[0].title, "First topic")
+        self.assertIsNone(topics[1].title)
         self.assertEqual(topics[0].limit, 5000)
 
     def test_build_topic_query_uses_problem_statement_only(self) -> None:
@@ -467,13 +470,16 @@ class ControlACommandLineTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
-    def test_parser_defaults_to_user_facing_top_k_100(self) -> None:
+    def test_parser_defaults_to_corrected_official_topics(self) -> None:
         arguments = build_parser().parse_args(["--run-id", "run-1"])
 
         self.assertEqual(arguments.top_k, 100)
         self.assertEqual(
-            arguments.topics, Path("topics/topics.all.2026.v0625.jsonl")
+            arguments.topics, Path("topics/topics.all.2026.v0625-fix.jsonl")
         )
+        topics = load_topics(arguments.topics)
+        self.assertEqual(len(topics), 103)
+        self.assertEqual(topics[0].title, "Anti-vaping Legislation")
 
     def test_parser_accepts_custom_paths_and_depth(self) -> None:
         arguments = build_parser().parse_args(
