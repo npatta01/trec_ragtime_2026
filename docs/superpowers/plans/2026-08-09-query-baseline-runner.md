@@ -148,22 +148,33 @@ git commit -m "feat: add bounded baseline retrieval concurrency"
 Run one short `ragtime2` query with `retries=0`; require 100 hits before the
 batch.
 
-- [ ] **Step 2: Run Baseline B**
+- [x] **Step 2: Run Baseline B**
 
 Run the CLI with baseline `b`, the existing query-plan path, and a unique run
 ID. Resume the same run ID after interruption.
 
-- [ ] **Step 3: Validate Baseline B**
+- [x] **Step 3: Validate Baseline B**
 
 Require 103 topic records; reconcile manifest success/error and candidate
 counts against JSONL records.
 
-- [ ] **Step 4: Run Baseline C**
+- [x] **Step 4: Run Baseline C**
 
 Run the CLI with baseline `c`, the same plan path, and a unique run ID. Resume
 the same run ID after interruption.
 
-- [ ] **Step 5: Validate Baseline C and compare A/B/C**
+- [x] **Step 5: Validate Baseline C and compare A/B/C**
 
 Require 103 topic records; recompute RRF for sampled topics; reconcile all
 manifest counts; report every failed query/topic and artifact path.
+
+**Completed 2026-08-09:**
+
+- Baseline B: 103/103 successful queries and topics, 10,300 candidates, no
+  unresolved documents or missing translations.
+- Baseline C: 752/752 successful facet queries and 103/103 successful topics,
+  10,300 candidates, no unresolved documents or missing translations.
+- Recomputed RRF over all 103 Baseline C topics and verified exact top-100
+  ordering, scores, ranks, source-query provenance, and manifest counts.
+- Baseline A remains an explicit partial baseline: 90/103 successful topics,
+  13 recorded endpoint failures, and 9,000 candidates.
