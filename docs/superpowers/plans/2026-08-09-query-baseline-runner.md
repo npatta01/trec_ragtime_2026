@@ -176,5 +176,8 @@ manifest counts; report every failed query/topic and artifact path.
   10,300 candidates, no unresolved documents or missing translations.
 - Recomputed RRF over all 103 Baseline C topics and verified exact top-100
   ordering, scores, ranks, source-query provenance, and manifest counts.
-- Baseline A remains an explicit partial baseline: 90/103 successful topics,
-  13 recorded endpoint failures, and 9,000 candidates.
+- The original Baseline A artifact remains immutable and explicit: 90/103
+  successful topics, 13 recorded endpoint failures, and 9,000 candidates.
+  A corrected-endpoint retry recovered all 13 exact problem queries in a new
+  artifact with 103/103 topics, 10,300 candidates, and no unresolved documents
+  or missing translations.
