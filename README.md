@@ -337,8 +337,8 @@ token.
 - [`src/trec_ragtime`](src/trec_ragtime): reusable private API client, local
   DuckDB corpus index and builder, Dataset Viewer fallback, high-level
   retriever, typed responses, and cross-worktree caches.
-- [`topics/topics.all.2026.v0625.jsonl`](topics/topics.all.2026.v0625.jsonl):
-  [official June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625.jsonl),
+- [`topics/topics.all.2026.v0625-fix.jsonl`](topics/topics.all.2026.v0625-fix.jsonl):
+  [official corrected June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625-fix.jsonl),
   normalized to one JSON object per line.
 - [`index.html`](index.html): compact GitHub Pages landing page for the project.
 - [`reports/2026-quick-reference-and-2025-reproduction-playbook/index.html`](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html):
