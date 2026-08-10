@@ -36,9 +36,11 @@ PACKAGE_NAMES = (
 
 class PairAwareCjkLength:
     fingerprint = "benchmark-fake-cross-encoder-pair-v1"
+    passage_length_function = len
+    max_passage_length = 501
 
     def __call__(self, text: str) -> int:
-        return len(text) + 8
+        return len(text) + 11
 
 
 def package_versions() -> dict[str, str]:
@@ -208,9 +210,9 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
 
 
 def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
-    text = "第一二三四五六七八九十。"
+    text = "中" * 502
     length_function = PairAwareCjkLength()
-    chunk_size = 16
+    chunk_size = 512
     if len(text) > chunk_size or length_function(text) <= chunk_size:
         raise AssertionError(
             "pair-aware fixture must fit by characters but exceed by pairs"
@@ -236,9 +238,13 @@ def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
         passage.boundary == "oversized_sentence_fallback" for passage in passages
     ):
         raise AssertionError("pair-aware fixture did not use sentence fallback")
-    return tuple(
+    records = tuple(
         (passage.start_char, passage.end_char, passage.text) for passage in passages
     )
+    expected = ((0, 501, text[:501]), (501, 502, text[501:]))
+    if records != expected:
+        raise AssertionError(f"pair-aware fixture under-packed: {records!r}")
+    return records
 
 
 def main() -> int:

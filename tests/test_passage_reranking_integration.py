@@ -200,7 +200,7 @@ def _retrieval_fixture() -> RetrievalResult:
 
 
 def _dense_cjk_retrieval_fixture() -> RetrievalResult:
-    text = "中" * 251 + " " + "中" * 250
+    text = "中" * 502
     document = RetrievedDocument(
         rank=1,
         document_id="dense-cjk",
@@ -464,7 +464,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             [(passage.start_char, passage.end_char) for passage in passages],
-            [(0, 252), (252, 502)],
+            [(0, 501), (501, 502)],
         )
         self.assertEqual("".join(passage.text for passage in passages), selected_text)
         self.assertTrue(
@@ -523,7 +523,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
                 (evidence.start_char, evidence.end_char)
                 for evidence in document.passage_evidence
             ],
-            [(0, 252), (252, 502)],
+            [(0, 501), (501, 502)],
         )
         self.assertTrue(
             all(

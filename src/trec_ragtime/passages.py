@@ -93,6 +93,45 @@ def _validate_fingerprint(value: object) -> None:
         raise PassageValidationError("chunker_fingerprint is malformed")
 
 
+def _packing_policy(
+    length_function: Callable[[str], int], chunk_size: int
+) -> tuple[Callable[[str], int], int, str]:
+    passage_length_function = getattr(length_function, "passage_length_function", None)
+    max_passage_length = getattr(length_function, "max_passage_length", None)
+    if passage_length_function is None and max_passage_length is None:
+        return length_function, chunk_size, "authoritative-length-function"
+    if not callable(passage_length_function):
+        raise PassageValidationError(
+            "length_function.passage_length_function must be callable"
+        )
+    if (
+        isinstance(max_passage_length, bool)
+        or not isinstance(max_passage_length, int)
+        or max_passage_length <= 0
+    ):
+        raise PassageValidationError(
+            "length_function.max_passage_length must be a positive integer"
+        )
+    if max_passage_length > chunk_size:
+        raise PassageValidationError(
+            "length_function.max_passage_length must not exceed chunk_size"
+        )
+
+    passage_fingerprint = getattr(passage_length_function, "fingerprint", None)
+    if passage_length_function is len:
+        passage_fingerprint = _DEFAULT_LENGTH_FUNCTION_FINGERPRINT
+    elif not isinstance(passage_fingerprint, str) or not passage_fingerprint.strip():
+        passage_fingerprint = (
+            f"derived-from-{getattr(length_function, 'fingerprint', 'length-function')}"
+        )
+    _validate_fingerprint(passage_fingerprint)
+    return (
+        cast(Callable[[str], int], passage_length_function),
+        max_passage_length,
+        f"passage-length={passage_fingerprint};budget={max_passage_length}",
+    )
+
+
 def _passage_id(
     *,
     document_id: str,
@@ -313,6 +352,7 @@ def _default_fingerprint(config: "ChunkerConfig") -> str:
             "passages-v2",
             f"chunk_size={config.chunk_size}",
             f"length_function={config.resolved_length_function_fingerprint}",
+            f"packing_policy={config.packing_policy_fingerprint}",
             f"pipeline={config.pipeline_name or 'language-map'}",
             f"pinned_mapping={_PINNED_PIPELINE_MAPPING_ID}",
             f"runtime_distributions={';'.join(_runtime_distribution_versions(config.pipeline_name))}",
@@ -349,6 +389,9 @@ class ChunkerConfig:
     overlap_tokens: int = 0
     max_length: int = 1_000_000
     _resolved_length_function_fingerprint: str = field(init=False, repr=False)
+    _packing_length_function: Callable[[str], int] = field(init=False, repr=False)
+    _packing_chunk_size: int = field(init=False, repr=False)
+    _packing_policy_fingerprint: str = field(init=False, repr=False)
     _resolved_fingerprint: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -362,6 +405,12 @@ class ChunkerConfig:
             )
         if not callable(self.length_function):
             raise PassageValidationError("length_function must be callable")
+        packing_length_function, packing_chunk_size, packing_fingerprint = (
+            _packing_policy(self.length_function, self.chunk_size)
+        )
+        object.__setattr__(self, "_packing_length_function", packing_length_function)
+        object.__setattr__(self, "_packing_chunk_size", packing_chunk_size)
+        object.__setattr__(self, "_packing_policy_fingerprint", packing_fingerprint)
         if self.length_function_fingerprint is not None:
             _validate_fingerprint(self.length_function_fingerprint)
         else:
@@ -424,6 +473,18 @@ class ChunkerConfig:
     @property
     def resolved_fingerprint(self) -> str:
         return self._resolved_fingerprint
+
+    @property
+    def packing_length_function(self) -> Callable[[str], int]:
+        return self._packing_length_function
+
+    @property
+    def packing_chunk_size(self) -> int:
+        return self._packing_chunk_size
+
+    @property
+    def packing_policy_fingerprint(self) -> str:
+        return self._packing_policy_fingerprint
 
 
 class PassageChunker(Protocol):
@@ -506,8 +567,8 @@ class LangChainPassageChunker:
             strip_whitespace=False,
             chunk_overlap=0,
             add_start_index=True,
-            chunk_size=self.config.chunk_size,
-            length_function=self.config.length_function,
+            chunk_size=self.config.packing_chunk_size,
+            length_function=self.config.packing_length_function,
         )
 
     def _sentence_splitter(self, pipeline_name: str) -> object:
@@ -525,8 +586,8 @@ class LangChainPassageChunker:
                     strip_whitespace=False,
                     chunk_overlap=0,
                     add_start_index=True,
-                    chunk_size=self.config.chunk_size,
-                    length_function=self.config.length_function,
+                    chunk_size=self.config.packing_chunk_size,
+                    length_function=self.config.packing_length_function,
                 )
         except (OSError, ImportError, ValueError) as error:
             raise PassageChunkingError(
@@ -543,8 +604,8 @@ class LangChainPassageChunker:
             strip_whitespace=False,
             chunk_overlap=0,
             add_start_index=True,
-            chunk_size=self.config.chunk_size,
-            length_function=self.config.length_function,
+            chunk_size=self.config.packing_chunk_size,
+            length_function=self.config.packing_length_function,
         )
 
     @staticmethod
@@ -738,15 +799,18 @@ class LangChainPassageChunker:
         validate_passages(selected_text, with_neighbors)
         return with_neighbors
 
-    @staticmethod
     def _validate_final_spans(
-        selected_text: str, final_spans: Sequence[tuple[_Span, Boundary]]
+        self, selected_text: str, final_spans: Sequence[tuple[_Span, Boundary]]
     ) -> None:
         cursor = 0
         chunks: list[str] = []
         for span, boundary in final_spans:
             if boundary not in _BOUNDARIES:
                 raise PassageChunkingError("unknown final boundary")
+            if self.config.length_function(span.text) > self.config.chunk_size:
+                raise PassageChunkingError(
+                    "final passage exceeded the configured ceiling"
+                )
             if span.start_char != cursor:
                 raise PassageChunkingError("final spans are not adjacent")
             if selected_text[span.start_char : span.end_char] != span.text:

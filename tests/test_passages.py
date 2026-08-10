@@ -43,9 +43,31 @@ class FingerprintedLength:
 
 class PairAwareCjkLength:
     fingerprint = "fake-cross-encoder-pair-v1"
+    passage_length_function = len
+    max_passage_length = 8
 
     def __call__(self, text: str) -> int:
         return len(text) + 8
+
+
+class PairAwareContiguousCjkLength:
+    fingerprint = "fake-cross-encoder-contiguous-cjk-v1"
+    passage_length_function = len
+    max_passage_length = 501
+
+    def __call__(self, text: str) -> int:
+        return len(text) + 11
+
+
+class PairAwareBudgetLength:
+    fingerprint = "fake-cross-encoder-budget-v1"
+    passage_length_function = len
+
+    def __init__(self, max_passage_length: int) -> None:
+        self.max_passage_length = max_passage_length
+
+    def __call__(self, text: str) -> int:
+        return len(text) + 11
 
 
 RUNTIME_DISTRIBUTION_VERSIONS = {
@@ -113,6 +135,18 @@ assert 'transformers' not in sys.modules
             config.resolved_length_function_fingerprint,
             "fake-pair-v1",
         )
+
+    def test_chunker_fingerprint_includes_additive_passage_budget(self) -> None:
+        first = ChunkerConfig(
+            chunk_size=512,
+            length_function=PairAwareBudgetLength(501),
+        )
+        second = ChunkerConfig(
+            chunk_size=512,
+            length_function=PairAwareBudgetLength(500),
+        )
+
+        self.assertNotEqual(first.resolved_fingerprint, second.resolved_fingerprint)
 
     def test_custom_length_function_requires_a_stable_identity(self) -> None:
         with self.assertRaises(PassageValidationError):
@@ -586,6 +620,46 @@ class LangChainPassageChunkerTests(unittest.TestCase):
             )
         )
         self.assertEqual("".join(passage.text for passage in passages), text)
+        validate_passages(text, passages)
+
+    def test_contiguous_cjk_uses_additive_passage_budget_without_under_packing(
+        self,
+    ) -> None:
+        text = "中" * 502
+        length_function = PairAwareContiguousCjkLength()
+        self.assertEqual(length_function(text), 513)
+        chunker = LangChainPassageChunker(
+            ChunkerConfig(chunk_size=512, length_function=length_function)
+        )
+
+        passages = chunker.chunk(
+            document_id="doc-contiguous-cjk",
+            canonical_text=text,
+            selected_text=text,
+            representation="canonical",
+            language="zho",
+        )
+        repeated = chunker.chunk(
+            document_id="doc-contiguous-cjk",
+            canonical_text=text,
+            selected_text=text,
+            representation="canonical",
+            language="zho",
+        )
+
+        self.assertEqual(len(passages), 2)
+        self.assertEqual(
+            [(passage.start_char, passage.end_char) for passage in passages],
+            [(0, 501), (501, 502)],
+        )
+        self.assertEqual("".join(passage.text for passage in passages), text)
+        self.assertTrue(
+            all(length_function(passage.text) <= 512 for passage in passages)
+        )
+        self.assertEqual(
+            [passage.passage_id for passage in passages],
+            [passage.passage_id for passage in repeated],
+        )
         validate_passages(text, passages)
 
     def test_passage_ids_are_stable_across_subprocesses(self) -> None:
