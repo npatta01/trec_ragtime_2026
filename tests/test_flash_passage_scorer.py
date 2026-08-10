@@ -438,6 +438,11 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         self.assertEqual(asyncio.run(host_call()), {passage.content_hash: 7.0})
 
     def test_bridge_startup_error_is_propagated_without_a_live_thread(self) -> None:
+        existing_loop_threads = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "trec-ragtime-flash-loop" and thread.is_alive()
+        }
         with patch(
             "trec_ragtime.flash_passage_scorer.asyncio.new_event_loop",
             side_effect=RuntimeError("cannot start loop"),
@@ -445,11 +450,13 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             with self.assertRaises(FlashScoringError):
                 _EventLoopBridge()
 
-        self.assertFalse(
-            any(
-                thread.name == "trec-ragtime-flash-loop" and thread.is_alive()
+        self.assertEqual(
+            existing_loop_threads,
+            {
+                thread.ident
                 for thread in threading.enumerate()
-            )
+                if thread.name == "trec-ragtime-flash-loop" and thread.is_alive()
+            },
         )
 
     def test_bridge_discards_cancellation_resistant_tasks_and_joins_thread(self) -> None:
@@ -630,6 +637,15 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
 
 class EndpointRunnerTests(unittest.TestCase):
+    def _make_runner(
+        self,
+        config: RunpodFlashConfig,
+        **kwargs: Any,
+    ) -> FlashEndpointBatchRunner:
+        runner = FlashEndpointBatchRunner(config, **kwargs)
+        self.addCleanup(runner.close)
+        return runner
+
     def test_endpoint_runner_uses_async_run_then_job_wait(self) -> None:
         calls: list[tuple[str, Any]] = []
         config = RunpodFlashConfig(endpoint_id="endpoint-id", request_timeout=3.0)
@@ -660,7 +676,7 @@ class EndpointRunnerTests(unittest.TestCase):
             schema_version=WIRE_SCHEMA_VERSION,
             scorer_fingerprint=config.fingerprint,
         )
-        runner = FlashEndpointBatchRunner(
+        runner = self._make_runner(
             config,
             endpoint_factory=Endpoint,
         )
@@ -719,7 +735,7 @@ class EndpointRunnerTests(unittest.TestCase):
                     async def run(self, input_data: Any) -> Job:
                         return job
 
-                runner = FlashEndpointBatchRunner(
+                runner = self._make_runner(
                     request_config,
                     endpoint_factory=Endpoint,
                 )
@@ -744,7 +760,7 @@ class EndpointRunnerTests(unittest.TestCase):
                 raise RuntimeError("run failed")
 
         with self.assertRaises(FlashScoringError):
-            FlashEndpointBatchRunner(config, endpoint_factory=EndpointRunError).run_batch_sync(request)
+            self._make_runner(config, endpoint_factory=EndpointRunError).run_batch_sync(request)
 
         for output in (None, {"scores": [{"hash": "bad"}]}):
             with self.subTest(output=output):
@@ -767,7 +783,7 @@ class EndpointRunnerTests(unittest.TestCase):
                         return Job()
 
                 with self.assertRaises(FlashScoringError):
-                    FlashEndpointBatchRunner(config, endpoint_factory=Endpoint).run_batch_sync(request)
+                    self._make_runner(config, endpoint_factory=Endpoint).run_batch_sync(request)
 
     def test_endpoint_runner_cancels_job_when_its_async_call_is_cancelled(self) -> None:
         config = RunpodFlashConfig(endpoint_id="endpoint-id")
@@ -802,7 +818,7 @@ class EndpointRunnerTests(unittest.TestCase):
         )
 
         async def cancel_call() -> None:
-            runner = FlashEndpointBatchRunner(config, endpoint_factory=Endpoint)
+            runner = self._make_runner(config, endpoint_factory=Endpoint)
             task = asyncio.create_task(runner.run_batch(request))
             while not started.is_set():
                 await asyncio.sleep(0)
