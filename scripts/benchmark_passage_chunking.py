@@ -14,6 +14,7 @@ from unittest.mock import patch
 from trec_ragtime.passages import (
     Passage,
     PassageChunker,
+    PassageChunkingError,
     sha256_bytes,
     validate_passages,
 )
@@ -59,6 +60,20 @@ class PairAwareCjkLength:
 
     def __call__(self, text: str) -> int:
         return len(text) + 11
+
+
+class MultiSentencePairLength:
+    """Structural pair seam where a packed multi-sentence span overflows."""
+
+    fingerprint = "benchmark-multi-sentence-guard-v1"
+    passage_length_function = staticmethod(lambda text: len(text.split()))
+    max_length = 5
+    max_passage_length = 3
+
+    def __call__(self, text: str) -> int:
+        if text.count(".") >= 2:
+            return 6
+        return self.passage_length_function(text) + 1
 
 
 def package_versions() -> dict[str, str]:
@@ -168,16 +183,17 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
     records: list[bytes] = []
     passage_count = 0
     started = time.perf_counter()
-    chunkers: dict[tuple[str, str, int, int, int], PassageChunker] = {}
+    chunkers: dict[tuple[str, str, str, int, int, int], PassageChunker] = {}
     for case in cases:
+        pair_length = FixturePairLength(case)
         key = (
             str(case["language"]),
             str(case["pipeline_name"]),
+            pair_length.fingerprint,
             int(case["max_length"]),
             int(case["max_passage_length"]),
             int(case["overlap_tokens"]),
         )
-        pair_length = FixturePairLength(case)
         chunker = chunkers.setdefault(
             key,
             PassageChunker(
@@ -213,6 +229,43 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
         )
         passage_count += len(passages)
     return records, passage_count, time.perf_counter() - started
+
+
+def verify_multi_sentence_guard() -> bool:
+    text = "One. Two."
+    pair_length = MultiSentencePairLength()
+    individual_sentences = ("One.", "Two.")
+    if any(
+        pair_length(sentence) > pair_length.max_length
+        for sentence in individual_sentences
+    ):
+        raise AssertionError("guard fixture sentence does not fit its pair ceiling")
+    if pair_length(text) <= pair_length.max_length:
+        raise AssertionError("guard fixture does not exceed its pair ceiling")
+
+    chunker = PassageChunker(pair_length, overlap_tokens=0)
+    with patch.object(
+        PassageChunker,
+        "_recursive_splitter",
+        side_effect=AssertionError(
+            "RCTS must not receive a multi-sentence over-ceiling span"
+        ),
+    ):
+        try:
+            chunker.chunk(
+                document_id="benchmark-multi-sentence-guard",
+                canonical_text=text,
+                selected_text=text,
+                representation="canonical",
+                language="eng",
+            )
+        except PassageChunkingError as error:
+            if str(error) != "RCTS requires exactly one underlying sentence":
+                raise AssertionError(
+                    "multi-sentence guard raised an unexpected error"
+                ) from error
+            return True
+    raise AssertionError("multi-sentence over-ceiling span was not rejected")
 
 
 class _FakeDocument:
@@ -326,6 +379,7 @@ def main() -> int:
         raise AssertionError(
             "pair-aware benchmark runs produced different passage records"
         )
+    oversized_sentence_rcts_only = verify_multi_sentence_guard()
 
     oversized_cases = [
         case for case in cases if case["name"] == "oversized_sentence"
@@ -340,7 +394,10 @@ def main() -> int:
     print("failures=0")
     print("full_source_coverage=true")
     print("sentence_only_overlap=true")
-    print("oversized_sentence_rcts_only=true")
+    print(
+        "oversized_sentence_rcts_only="
+        + str(oversized_sentence_rcts_only).lower()
+    )
     print("pair_ceiling=true")
     print("deterministic_records=true")
     print("pair_aware_model_loader_calls=0")

@@ -35,6 +35,11 @@ class FixturePairLength:
 
 
 class PassageContractTests(unittest.TestCase):
+    def test_benchmark_guard_rejects_multi_sentence_rcts(self) -> None:
+        from scripts.benchmark_passage_chunking import verify_multi_sentence_guard
+
+        self.assertTrue(verify_multi_sentence_guard())
+
     def test_benchmark_records_only_compact_passage_fields(self) -> None:
         from scripts.benchmark_passage_chunking import record_passages
 
