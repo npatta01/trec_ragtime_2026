@@ -24,6 +24,7 @@ from .huggingface import (
     HuggingFaceHydrationError,
     HuggingFaceProtocolError,
 )
+from .llm_cache import CachedChatCompletions
 from .local_corpus import (
     LocalCorpusBuildError,
     LocalCorpusConfigurationError,
@@ -51,6 +52,7 @@ from .retriever import (
     RagtimeRetriever,
 )
 __all__ = [
+    "CachedChatCompletions",
     "DEFAULT_CONTENT_COLLECTION",
     "DEFAULT_HF_BASE_URL",
     "DEFAULT_HF_CONFIG",
