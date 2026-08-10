@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import importlib.metadata
 import subprocess
 import sys
 import types
@@ -9,10 +10,11 @@ from dataclasses import FrozenInstanceError, is_dataclass, replace
 from typing import Any
 from unittest.mock import patch
 
-from trec_ragtime.passages import Passage, sha256_bytes
+from trec_ragtime.passages import ChunkerConfig, Passage, sha256_bytes
 from trec_ragtime.passage_scoring import (
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_REVISION,
+    CrossEncoderPairLengthFunction,
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
     PassageScoreValidationError,
@@ -74,6 +76,32 @@ class RecordingModel:
         return [self.logits_by_text[passage] for _, passage in inputs]
 
 
+class PairCountingTokenizer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def __call__(self, query: str, passage: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+        self.calls.append((query, passage, kwargs))
+        query_tokens = sum(2 if character == "你" else 1 for character in query)
+        passage_tokens = sum(2 if character == "中" else 1 for character in passage)
+        # Three explicit special tokens model a complete cross-encoder pair.
+        count = 3 + query_tokens + passage_tokens
+        return {"input_ids": [list(range(count))]}
+
+
+def _runtime_versions() -> dict[str, str]:
+    distributions = {
+        "sentence_transformers_version": "sentence-transformers",
+        "transformers_version": "transformers",
+        "tokenizers_version": "tokenizers",
+        "torch_version": "torch",
+    }
+    return {
+        field_name: importlib.metadata.version(distribution)
+        for field_name, distribution in distributions.items()
+    }
+
+
 class PassageScoreValidatorTests(unittest.TestCase):
     def test_validator_returns_one_float_for_each_unique_hash(self) -> None:
         first = _passage("same", document_id="first")
@@ -124,6 +152,8 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
         self.assertEqual(config.__class__.__slots__, config.__slots__)
         self.assertEqual(config.model_name, DEFAULT_MODEL_NAME)
         self.assertEqual(config.revision, DEFAULT_MODEL_REVISION)
+        self.assertEqual(config.tokenizer_name, DEFAULT_MODEL_NAME)
+        self.assertEqual(config.tokenizer_revision, DEFAULT_MODEL_REVISION)
         self.assertEqual(config.effective_device, "cpu")
         with self.assertRaises(FrozenInstanceError):
             config.batch_size = 4  # type: ignore[misc]
@@ -136,12 +166,13 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
         self.assertEqual(rocm.fingerprint, cuda.fingerprint)
 
     def test_fingerprint_changes_for_every_result_affecting_setting(self) -> None:
-        base = LocalCrossEncoderConfig(sentence_transformers_version="5.7.0")
+        base = LocalCrossEncoderConfig()
         variants = (
             replace(base, schema_version=2),
             replace(base, model_name="other/model"),
             replace(base, revision="other-revision"),
-            replace(base, sentence_transformers_version="5.7.1"),
+            replace(base, tokenizer_name="other/tokenizer"),
+            replace(base, tokenizer_revision="other-tokenizer-revision"),
             replace(base, device="cuda"),
             replace(base, precision="float16"),
             replace(base, batch_size=16),
@@ -152,6 +183,40 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
 
         self.assertEqual(len({variant.fingerprint for variant in variants}), len(variants))
         self.assertTrue(all(variant.fingerprint != base.fingerprint for variant in variants))
+
+    def test_each_runtime_version_rotates_fingerprint_when_installed_metadata_rotates(self) -> None:
+        base_versions = _runtime_versions()
+        base = LocalCrossEncoderConfig(**base_versions)
+        distributions = {
+            "sentence_transformers_version": "sentence-transformers",
+            "transformers_version": "transformers",
+            "tokenizers_version": "tokenizers",
+            "torch_version": "torch",
+        }
+
+        for field_name, distribution in distributions.items():
+            with self.subTest(field_name=field_name):
+                rotated_versions = dict(base_versions)
+                rotated_versions[field_name] = "rotated-" + base_versions[field_name]
+
+                with patch.object(
+                    importlib.metadata,
+                    "version",
+                    side_effect=lambda name, versions=rotated_versions, mapping=distributions: versions[
+                        next(field for field, dist in mapping.items() if dist == name)
+                    ],
+                ):
+                    rotated = LocalCrossEncoderConfig(**rotated_versions)
+
+                self.assertNotEqual(rotated.fingerprint, base.fingerprint)
+
+    def test_declared_runtime_version_mismatch_fails_closed_at_config_construction(self) -> None:
+        installed = _runtime_versions()
+        declared = dict(installed)
+        declared["transformers_version"] = "not-installed-" + installed["transformers_version"]
+
+        with self.assertRaisesRegex(ValueError, "transformers_version"):
+            LocalCrossEncoderConfig(**declared)
 
     def test_fingerprint_encoding_separates_delimiter_containing_values(self) -> None:
         left = LocalCrossEncoderConfig(
@@ -179,7 +244,103 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
                     LocalCrossEncoderConfig(**kwargs)
 
 
+class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
+    def test_lazy_full_pair_length_formats_query_and_counts_special_tokens(self) -> None:
+        config = LocalCrossEncoderConfig(max_length=16, query_format="Q: {query}")
+        tokenizer = PairCountingTokenizer()
+        load_calls: list[LocalCrossEncoderConfig] = []
+
+        def loader(loaded_config: LocalCrossEncoderConfig) -> PairCountingTokenizer:
+            load_calls.append(loaded_config)
+            return tokenizer
+
+        length_function = CrossEncoderPairLengthFunction(
+            config,
+            "exact 你",
+            loader=loader,
+        )
+
+        self.assertEqual(load_calls, [])
+        pair_length = length_function("中文")
+        self.assertEqual(pair_length, 17)
+        self.assertGreater(pair_length, config.max_length)
+        self.assertEqual(length_function.fingerprint, length_function.length_function_fingerprint)
+        chunker_config = ChunkerConfig(
+            chunk_size=config.max_length,
+            length_function=length_function,
+            length_function_fingerprint=length_function.fingerprint,
+        )
+        self.assertEqual(
+            chunker_config.resolved_length_function_fingerprint,
+            length_function.fingerprint,
+        )
+        self.assertEqual(
+            tokenizer.calls,
+            [("Q: exact 你", "中文", {"truncation": False, "return_length": True})],
+        )
+
+    def test_pair_length_loader_is_tokenizer_only_and_never_imports_model_stack(self) -> None:
+        tokenizer = PairCountingTokenizer()
+        loader_calls = 0
+
+        def loader(config: LocalCrossEncoderConfig) -> PairCountingTokenizer:
+            nonlocal loader_calls
+            loader_calls += 1
+            return tokenizer
+
+        length_function = CrossEncoderPairLengthFunction(LocalCrossEncoderConfig(), "query", loader=loader)
+        self.assertEqual(loader_calls, 0)
+        model_stack_before = {
+            name
+            for name in sys.modules
+            if name == "sentence_transformers" or name == "torch"
+        }
+
+        self.assertEqual(length_function("passage"), 3 + len("query") + len("passage"))
+        self.assertEqual(loader_calls, 1)
+        self.assertEqual(length_function("passage"), 3 + len("query") + len("passage"))
+        self.assertEqual(loader_calls, 1)
+        self.assertEqual(
+            model_stack_before,
+            {
+                name
+                for name in sys.modules
+                if name == "sentence_transformers" or name == "torch"
+            },
+        )
+
+
 class LocalCrossEncoderScorerTests(unittest.TestCase):
+    def test_runtime_metadata_drift_fails_before_custom_loader(self) -> None:
+        config = LocalCrossEncoderConfig(**_runtime_versions())
+        load_calls = 0
+        installed = _runtime_versions()
+        drifted = dict(installed)
+        drifted["torch_version"] = "drifted-" + installed["torch_version"]
+        distributions = {
+            "sentence_transformers_version": "sentence-transformers",
+            "transformers_version": "transformers",
+            "tokenizers_version": "tokenizers",
+            "torch_version": "torch",
+        }
+
+        def loader(config: LocalCrossEncoderConfig) -> object:
+            nonlocal load_calls
+            load_calls += 1
+            return object()
+
+        with patch.object(
+            importlib.metadata,
+            "version",
+            side_effect=lambda name, versions=drifted, mapping=distributions: versions[
+                next(field for field, dist in mapping.items() if dist == name)
+            ],
+        ):
+            with self.assertRaisesRegex(ValueError, "torch_version"):
+                LocalCrossEncoderScorer(config, loader=loader)
+
+        self.assertEqual(load_calls, 0)
+
     def test_import_is_lazy_and_does_not_import_model_stack(self) -> None:
         code = """
 import sys
@@ -234,8 +395,11 @@ assert 'torch' not in sys.modules
     def test_default_loader_and_predict_path_uses_pinned_runtime_seam(self) -> None:
         passage = _passage("passage")
         constructor_calls: list[tuple[str, dict[str, Any]]] = []
+        tokenizer_loader_calls: list[tuple[str, dict[str, Any]]] = []
+        loaded_tokenizers: list[Any] = []
         tokenizer_calls: list[tuple[str, str, dict[str, Any]]] = []
         predict_calls: list[tuple[list[tuple[str, str]], dict[str, Any]]] = []
+        models: list[Any] = []
         dtype = object()
 
         class FakeTokenizer:
@@ -254,14 +418,25 @@ assert 'torch' not in sys.modules
         class FakeCrossEncoder:
             def __init__(self, model_name: str, **kwargs: Any) -> None:
                 constructor_calls.append((model_name, kwargs))
-                self.tokenizer = FakeTokenizer()
+                self.tokenizer = object()
+                models.append(self)
 
             def predict(self, inputs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
                 predict_calls.append((list(inputs), kwargs))
                 return [4.75]
 
+        class FakeAutoTokenizer:
+            @classmethod
+            def from_pretrained(cls, model_name: str, **kwargs: Any) -> FakeTokenizer:
+                tokenizer_loader_calls.append((model_name, kwargs))
+                tokenizer = FakeTokenizer()
+                loaded_tokenizers.append(tokenizer)
+                return tokenizer
+
         fake_sentence_transformers = types.ModuleType("sentence_transformers")
         fake_sentence_transformers.CrossEncoder = FakeCrossEncoder  # type: ignore[attr-defined]
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoTokenizer = FakeAutoTokenizer  # type: ignore[attr-defined]
         fake_torch = types.ModuleType("torch")
         fake_torch.float32 = dtype  # type: ignore[attr-defined]
         fake_torch.float16 = object()  # type: ignore[attr-defined]
@@ -274,11 +449,14 @@ assert 'torch' not in sys.modules
             batch_size=4,
             max_length=17,
             query_format="Q: {query}",
+            tokenizer_name="explicit/tokenizer",
+            tokenizer_revision="tokenizer-revision",
         )
         with patch.dict(
             sys.modules,
             {
                 "sentence_transformers": fake_sentence_transformers,
+                "transformers": fake_transformers,
                 "torch": fake_torch,
             },
         ):
@@ -289,11 +467,19 @@ assert 'torch' not in sys.modules
         self.assertEqual(len(constructor_calls), 1)
         model_name, constructor_kwargs = constructor_calls[0]
         self.assertEqual(model_name, DEFAULT_MODEL_NAME)
+        self.assertEqual(
+            tokenizer_loader_calls,
+            [(
+                "explicit/tokenizer",
+                {"revision": "tokenizer-revision"},
+            )],
+        )
         self.assertEqual(constructor_kwargs["revision"], DEFAULT_MODEL_REVISION)
         self.assertEqual(constructor_kwargs["device"], "cuda")
         self.assertEqual(constructor_kwargs["max_length"], 17)
         self.assertEqual(constructor_kwargs["model_kwargs"], {"torch_dtype": dtype})
         self.assertEqual(len(tokenizer_calls), 1)
+        self.assertIs(models[0].tokenizer, loaded_tokenizers[0])
         self.assertEqual(tokenizer_calls[0][0:2], ("Q: query", "passage"))
         self.assertIs(tokenizer_calls[0][2]["truncation"], False)
         self.assertEqual(tokenizer_calls[0][2]["max_length"], 17)
@@ -410,6 +596,20 @@ assert 'torch' not in sys.modules
             scorer.score("query", (first, overflowing))
 
         self.assertEqual(len(tokenizer.calls), 2)
+        self.assertEqual(model.predict_calls, [])
+
+    def test_query_only_overflow_is_rejected_before_model_prediction(self) -> None:
+        passage = _passage("p")
+        model = RecordingModel({"p": 1.0})
+        tokenizer = RecordingTokenizer()
+        scorer = LocalCrossEncoderScorer(
+            LocalCrossEncoderConfig(max_length=3),
+            loader=lambda config: (model, tokenizer),
+        )
+
+        with self.assertRaisesRegex(PassageScoringError, "overflow"):
+            scorer.score("query", (passage,))
+
         self.assertEqual(model.predict_calls, [])
 
     def test_contradictory_duplicate_hash_text_or_lineage_is_rejected(self) -> None:

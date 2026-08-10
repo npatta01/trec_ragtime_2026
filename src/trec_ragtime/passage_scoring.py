@@ -19,13 +19,22 @@ from .passages import Passage, sha256_bytes
 
 DEFAULT_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 DEFAULT_MODEL_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+DEFAULT_TOKENIZER_NAME = DEFAULT_MODEL_NAME
+DEFAULT_TOKENIZER_REVISION = DEFAULT_MODEL_REVISION
 DEFAULT_SCHEMA_VERSION = 1
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_QUERY_FORMAT = "{query}"
 DEFAULT_QUERY_POLICY = "literal-v1"
 _HASH_LENGTH = 32
-_FINGERPRINT_PREFIX = "local-cross-encoder-v1/"
+_FINGERPRINT_PREFIX = "local-cross-encoder-v2/"
+_PAIR_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-pair-length-v1/"
+_RUNTIME_DISTRIBUTIONS = (
+    ("sentence_transformers_version", "sentence-transformers"),
+    ("transformers_version", "transformers"),
+    ("tokenizers_version", "tokenizers"),
+    ("torch_version", "torch"),
+)
 _PRECISION_ALIASES = {
     "float32": "float32",
     "fp32": "float32",
@@ -44,11 +53,27 @@ class PassageScoreValidationError(PassageScoringError):
     """Raised when a score mapping does not exactly validate."""
 
 
-def _installed_sentence_transformers_version() -> str:
+def _installed_runtime_version(distribution: str) -> str:
     try:
-        return importlib.metadata.version("sentence-transformers")
+        return importlib.metadata.version(distribution)
     except importlib.metadata.PackageNotFoundError:
         return "unavailable"
+
+
+def _installed_sentence_transformers_version() -> str:
+    return _installed_runtime_version("sentence-transformers")
+
+
+def _installed_transformers_version() -> str:
+    return _installed_runtime_version("transformers")
+
+
+def _installed_tokenizers_version() -> str:
+    return _installed_runtime_version("tokenizers")
+
+
+def _installed_torch_version() -> str:
+    return _installed_runtime_version("torch")
 
 
 def _non_blank_string(value: object, field_name: str) -> str:
@@ -95,6 +120,21 @@ def _query_format_fields(query_format: str) -> tuple[str, ...]:
     return tuple(fields)
 
 
+def _validate_runtime_versions(config: "LocalCrossEncoderConfig") -> None:
+    for field_name, distribution in _RUNTIME_DISTRIBUTIONS:
+        declared = getattr(config, field_name)
+        installed = _installed_runtime_version(distribution)
+        if installed == "unavailable":
+            raise ValueError(
+                f"{field_name} cannot be validated because {distribution!r} is not installed"
+            )
+        if declared != installed:
+            raise ValueError(
+                f"{field_name}={declared!r} does not match installed "
+                f"{distribution}={installed!r}"
+            )
+
+
 def _fingerprint_for_config(config: "LocalCrossEncoderConfig") -> str:
     material = msgspec.msgpack.encode(
         (
@@ -102,7 +142,12 @@ def _fingerprint_for_config(config: "LocalCrossEncoderConfig") -> str:
             config.schema_version,
             config.model_name,
             config.revision,
+            config.tokenizer_name,
+            config.tokenizer_revision,
             config.sentence_transformers_version,
+            config.transformers_version,
+            config.tokenizers_version,
+            config.torch_version,
             config.effective_device,
             config.effective_precision,
             config.batch_size,
@@ -122,9 +167,14 @@ class LocalCrossEncoderConfig:
     schema_version: int = DEFAULT_SCHEMA_VERSION
     model_name: str = DEFAULT_MODEL_NAME
     revision: str = DEFAULT_MODEL_REVISION
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME
+    tokenizer_revision: str = DEFAULT_TOKENIZER_REVISION
     sentence_transformers_version: str = field(
         default_factory=_installed_sentence_transformers_version
     )
+    transformers_version: str = field(default_factory=_installed_transformers_version)
+    tokenizers_version: str = field(default_factory=_installed_tokenizers_version)
+    torch_version: str = field(default_factory=_installed_torch_version)
     device: str = "cpu"
     precision: str = "float32"
     batch_size: int = DEFAULT_BATCH_SIZE
@@ -142,6 +192,8 @@ class LocalCrossEncoderConfig:
             raise ValueError("schema_version must be positive")
         _non_blank_string(self.model_name, "model_name")
         _non_blank_string(self.revision, "revision")
+        _non_blank_string(self.tokenizer_name, "tokenizer_name")
+        _non_blank_string(self.tokenizer_revision, "tokenizer_revision")
         _non_blank_string(
             self.sentence_transformers_version,
             "sentence_transformers_version",
@@ -159,6 +211,7 @@ class LocalCrossEncoderConfig:
         _non_blank_string(self.query_format, "query_format")
         _query_format_fields(self.query_format)
         _non_blank_string(self.query_policy, "query_policy")
+        _validate_runtime_versions(self)
         object.__setattr__(self, "_effective_device_value", effective_device)
         object.__setattr__(self, "_effective_precision_value", effective_precision)
         object.__setattr__(self, "_fingerprint", _fingerprint_for_config(self))
@@ -300,9 +353,33 @@ def validate_passage_scores(
     return {key: normalized[key] for key in sorted(normalized)}
 
 
-def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
-    """Load the pinned local model only when the first score is requested."""
+def _format_query(config: LocalCrossEncoderConfig, query: str) -> str:
+    if not isinstance(query, str) or not query.strip():
+        raise PassageScoringError("query must be a non-blank string")
+    try:
+        return config.query_format.format(query=query)
+    except (IndexError, KeyError, ValueError) as error:
+        raise PassageScoringError("query could not be formatted") from error
 
+
+def _default_tokenizer_loader(config: LocalCrossEncoderConfig) -> Any:
+    """Load only the explicitly pinned tokenizer, without model weights."""
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.tokenizer_name,
+        revision=config.tokenizer_revision,
+    )
+    if not callable(tokenizer):
+        raise PassageScoringError("AutoTokenizer returned a non-callable tokenizer")
+    return tokenizer
+
+
+def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
+    """Load the pinned local model and assign its explicitly pinned tokenizer."""
+
+    tokenizer = _default_tokenizer_loader(config)
     from sentence_transformers import CrossEncoder
     import torch
 
@@ -318,9 +395,10 @@ def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
         max_length=config.max_length,
         model_kwargs={"torch_dtype": dtype},
     )
-    tokenizer = getattr(model, "tokenizer", None)
-    if tokenizer is None:
-        raise PassageScoringError("loaded CrossEncoder does not expose a tokenizer")
+    try:
+        model.tokenizer = tokenizer
+    except Exception as error:
+        raise PassageScoringError("loaded CrossEncoder does not accept the pinned tokenizer") from error
     return model, tokenizer
 
 
@@ -377,6 +455,121 @@ def _token_length(encoded: object) -> int:
     return length
 
 
+class CrossEncoderPairLengthFunction:
+    """Lazily count complete pinned-tokenizer tokens for one formatted query."""
+
+    __slots__ = (
+        "_config",
+        "_query",
+        "_formatted_query",
+        "_loader",
+        "_load_lock",
+        "_tokenizer",
+        "_fingerprint",
+    )
+
+    def __init__(
+        self,
+        config: LocalCrossEncoderConfig,
+        query: str,
+        *,
+        loader: Callable[[LocalCrossEncoderConfig], object] | None = None,
+        tokenizer_loader: Callable[[LocalCrossEncoderConfig], object] | None = None,
+    ) -> None:
+        if not isinstance(config, LocalCrossEncoderConfig):
+            raise TypeError("config must be a LocalCrossEncoderConfig")
+        if loader is not None and tokenizer_loader is not None:
+            raise TypeError("pass either loader or tokenizer_loader, not both")
+        if loader is not None and not callable(loader):
+            raise TypeError("loader must be callable")
+        if tokenizer_loader is not None and not callable(tokenizer_loader):
+            raise TypeError("tokenizer_loader must be callable")
+        _validate_runtime_versions(config)
+        formatted_query = _format_query(config, query)
+        material = msgspec.msgpack.encode(
+            (
+                "cross-encoder-pair-length-v1",
+                config.fingerprint,
+                query,
+                formatted_query,
+            )
+        )
+        self._config = config
+        self._query = query
+        self._formatted_query = formatted_query
+        self._loader = (
+            tokenizer_loader
+            or loader
+            or _default_tokenizer_loader
+        )
+        self._load_lock = threading.Lock()
+        self._tokenizer: Any | None = None
+        self._fingerprint = _PAIR_LENGTH_FINGERPRINT_PREFIX + hashlib.sha256(material).hexdigest()
+
+    @property
+    def config(self) -> LocalCrossEncoderConfig:
+        """Return the immutable scoring configuration used by this callable."""
+
+        return self._config
+
+    @property
+    def query(self) -> str:
+        """Return the exact raw query captured by this callable."""
+
+        return self._query
+
+    @property
+    def formatted_query(self) -> str:
+        """Return the formatted query passed to the tokenizer."""
+
+        return self._formatted_query
+
+    @property
+    def fingerprint(self) -> str:
+        """Return the stable identity suitable for ChunkerConfig."""
+
+        return self._fingerprint
+
+    @property
+    def length_function_fingerprint(self) -> str:
+        """Alias usable as ChunkerConfig.length_function_fingerprint."""
+
+        return self._fingerprint
+
+    def _ensure_tokenizer(self) -> Any:
+        if self._tokenizer is not None:
+            return self._tokenizer
+        with self._load_lock:
+            if self._tokenizer is None:
+                try:
+                    tokenizer = self._loader(self._config)
+                except PassageScoringError:
+                    raise
+                except Exception as error:
+                    raise PassageScoringError("unable to load the pinned tokenizer") from error
+                if not callable(tokenizer):
+                    raise PassageScoringError("tokenizer loader must return a callable tokenizer")
+                self._tokenizer = tokenizer
+        return cast(Any, self._tokenizer)
+
+    def __call__(self, passage: str) -> int:
+        if not isinstance(passage, str):
+            raise PassageScoringError("passage must be a string")
+        tokenizer = self._ensure_tokenizer()
+        try:
+            encoded = tokenizer(
+                self._formatted_query,
+                passage,
+                truncation=False,
+                return_length=True,
+            )
+        except PassageScoringError:
+            raise
+        except Exception as error:
+            raise PassageScoringError("tokenizer failed while counting a passage pair") from error
+        return _token_length(encoded)
+
+
 def _prediction_values(result: object, expected_count: int) -> list[object]:
     converted = _as_sequence(result)
     if isinstance(converted, (str, bytes, bytearray)):
@@ -413,6 +606,7 @@ class LocalCrossEncoderScorer:
             raise TypeError("config must be a LocalCrossEncoderConfig")
         if loader is not None and not callable(loader):
             raise TypeError("loader must be callable")
+        _validate_runtime_versions(config)
         self._config = config
         self._loader = loader or _default_loader
         self._load_lock = threading.Lock()
@@ -467,13 +661,11 @@ class LocalCrossEncoderScorer:
         query: str,
         passages: Sequence[Passage],
     ) -> Mapping[bytes, float]:
-        if not isinstance(query, str) or not query.strip():
-            raise PassageScoringError("query must be a non-blank string")
+        formatted_query = _format_query(self._config, query)
         unique = _unique_passages(passages)
         if not unique:
             return {}
 
-        formatted_query = self._config.query_format.format(query=query)
         pairs = tuple((formatted_query, text) for _, text in unique)
         model, tokenizer = self._ensure_loaded()
         self._tokenize_pairs(tokenizer, pairs)
@@ -516,9 +708,12 @@ __all__ = [
     "DEFAULT_MAX_LENGTH",
     "DEFAULT_MODEL_NAME",
     "DEFAULT_MODEL_REVISION",
+    "DEFAULT_TOKENIZER_NAME",
+    "DEFAULT_TOKENIZER_REVISION",
     "DEFAULT_QUERY_FORMAT",
     "DEFAULT_QUERY_POLICY",
     "DEFAULT_SCHEMA_VERSION",
+    "CrossEncoderPairLengthFunction",
     "LocalCrossEncoderConfig",
     "LocalCrossEncoderScorer",
     "PassageScoreValidationError",
