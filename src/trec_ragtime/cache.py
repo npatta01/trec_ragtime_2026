@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -51,27 +52,65 @@ class CacheEntry:
     payload: dict[str, Any]
     stored_at: float
 
-# These names are never part of a result-bearing request.  Dropping them at
+# These names are never part of a result-bearing request.  Rejecting them at
 # canonicalization is a defense-in-depth boundary: an accidentally forwarded
-# Authorization/token field can neither alter identity nor be persisted.
+# Authorization/token field cannot silently create an identity collision or
+# be persisted in an artifact.
 _CREDENTIAL_FIELDS = frozenset(
     {
-        "access_token",
-        "api_key",
-        "apikey",
-        "auth",
         "authorization",
-        "bearer_token",
+        "authentication",
+        "auth",
+        "auth_header",
+        "credential",
         "credentials",
         "password",
+        "passwd",
         "secret",
         "token",
+        "api_key",
+        "apikey",
     }
 )
 
 
+def _normalized_field_name(name: str) -> str:
+    # Split camelCase before replacing separators so accessToken, access-token,
+    # and access_token all have one security classification.
+    split_camel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", split_camel).strip("_")
+    return re.sub(r"_+", "_", normalized).casefold()
+
+
 def _is_credential_field(name: str) -> bool:
-    return name.casefold().replace("-", "_") in _CREDENTIAL_FIELDS
+    normalized = _normalized_field_name(name)
+    if normalized in _CREDENTIAL_FIELDS:
+        return True
+    parts = normalized.split("_")
+    # A token/secret/password/auth/credential component is sensitive even when
+    # prefixed by a provider-specific name (client_secret, refresh_token, ...).
+    if any(
+        part in {
+            "auth",
+            "authorization",
+            "authentication",
+            "credential",
+            "credentials",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "apikey",
+        }
+        for part in parts
+    ):
+        return True
+    # API keys use a two-part marker; accepting a leading x-/client-/server-
+    # component covers the common header and configuration spellings.
+    return any(
+        parts[index : index + 2] == ["api", "key"]
+        for index in range(len(parts) - 1)
+    )
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -81,8 +120,13 @@ def _normalize_base_url(base_url: str) -> str:
     if not normalized:
         raise ValueError("base URL must not be empty")
     parsed = urlsplit(normalized)
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("base URL must not contain credentials")
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("base URL must not contain credentials, a query, or a fragment")
     return normalized
 
 
@@ -111,7 +155,8 @@ def canonicalize_json(value: Any) -> Any:
     """Return recursively sorted JSON-like data suitable for MessagePack.
 
     Mapping keys must be strings, mapping order is discarded recursively, list
-    order is retained, and credentials are excluded from the persisted value.
+    order is retained, and credential-bearing fields are rejected before an
+    identity or persisted artifact is produced.
     Unsupported values and non-finite floats are rejected before encoding.
     """
 
@@ -127,7 +172,7 @@ def canonicalize_json(value: Any) -> Any:
             if not isinstance(key, str):
                 raise TypeError("cache mapping keys must be strings")
             if _is_credential_field(key):
-                continue
+                raise ValueError("cache mappings must not contain credential fields")
             normalized[key] = canonicalize_json(nested)
         return {key: normalized[key] for key in sorted(normalized)}
     if isinstance(value, list):

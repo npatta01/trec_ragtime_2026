@@ -137,28 +137,68 @@ class ResponseCacheTestCase(unittest.TestCase):
             self.object_key(),
         )
 
-    def test_credentials_do_not_affect_or_appear_in_key_or_bytes(self) -> None:
-        key = self.cache.object_key(
+    def test_base_url_query_and_fragment_credentials_are_rejected(self) -> None:
+        for base_url in (
+            "https://api.example.test?token=secret-token",
+            "https://api.example.test#authorization=secret-token",
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(ValueError) as raised:
+                    self.cache.object_key(
+                        base_url=base_url,
+                        operation=self.operation,
+                        request=self.request,
+                    )
+                self.assertNotIn("secret-token", str(raised.exception))
+
+    def test_representative_credential_fields_are_rejected_without_persistence(self) -> None:
+        credential_fields = (
+            "client_secret",
+            "refresh_token",
+            "x-api-key",
+            "accessToken",
+            "clientSecret",
+            "bearerToken",
+            "clientAPIKey",
+            "Authorization",
+            "password",
+            "secret",
+            "token",
+            "api-key",
+        )
+        for field in credential_fields:
+            with self.subTest(field=field):
+                request = {"query": "hello", field: "secret-value"}
+                with self.assertRaises(ValueError) as raised:
+                    self.cache.object_key(
+                        base_url=self.base_url,
+                        operation=self.operation,
+                        request=request,
+                    )
+                self.assertNotIn("secret-value", str(raised.exception))
+                with self.assertRaises(ValueError) as raised:
+                    self.cache.put(
+                        base_url=self.base_url,
+                        operation=self.operation,
+                        request=self.request,
+                        response={"scores": {}, field: "secret-value"},
+                        stored_at=100.0,
+                    )
+                self.assertNotIn("secret-value", str(raised.exception))
+        self.assertEqual(self.store.write_calls, [])
+
+    def test_ordinary_semantically_distinct_mappings_do_not_collide(self) -> None:
+        first = self.cache.object_key(
             base_url=self.base_url,
             operation=self.operation,
-            request={"query": "hello", "token": "secret-token"},
+            request={"query": "hello", "mode": "first"},
         )
-        other_key = self.cache.object_key(
+        second = self.cache.object_key(
             base_url=self.base_url,
             operation=self.operation,
-            request={"query": "hello", "token": "different-token"},
+            request={"query": "hello", "mode": "second"},
         )
-        self.assertEqual(key, other_key)
-        self.cache.put(
-            base_url=self.base_url,
-            operation=self.operation,
-            request={"query": "hello", "token": "secret-token"},
-            response=self.response,
-            stored_at=100.0,
-        )
-        artifact = self.store.write_calls[-1][1]
-        self.assertNotIn(b"secret-token", artifact)
-        self.assertNotIn(b"Authorization", artifact)
+        self.assertNotEqual(first, second)
 
     def test_canonical_request_fixture_and_binary_digests_are_stable(self) -> None:
         expected = independent_request_bytes(
