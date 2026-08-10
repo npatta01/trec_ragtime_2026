@@ -29,10 +29,11 @@ class CachedChatCompletions:
         client: Any,
         store: ArtifactStoreLike,
         *,
-        namespace: str = DEFAULT_CACHE_NAMESPACE,
+        namespace: str | None = None,
     ) -> None:
         self._client = client
-        self._base_url = str(client.base_url)
+        if namespace is None:
+            namespace = getattr(store, "namespace", DEFAULT_CACHE_NAMESPACE)
         self._cache = ResponseCache(
             store,
             namespace=namespace,
@@ -44,6 +45,7 @@ class CachedChatCompletions:
             raise TypeError("refresh must be a boolean")
         if request.get("stream") is True:
             return self._client.chat.completions.create(**request)
+        base_url = str(self._client.base_url)
         identity = {
             key: value
             for key, value in request.items()
@@ -51,13 +53,13 @@ class CachedChatCompletions:
         }
         if refresh:
             self._cache.object_key(
-                base_url=self._base_url,
+                base_url=base_url,
                 operation=LLM_CHAT_COMPLETIONS_OPERATION,
                 request=identity,
             )
         else:
             hit = self._cache.get(
-                base_url=self._base_url,
+                base_url=base_url,
                 operation=LLM_CHAT_COMPLETIONS_OPERATION,
                 request=identity,
                 ttl_seconds=None,
@@ -70,7 +72,7 @@ class CachedChatCompletions:
             raise TypeError("chat completions create returned an unexpected response type")
         try:
             self._cache.put(
-                base_url=self._base_url,
+                base_url=base_url,
                 operation=LLM_CHAT_COMPLETIONS_OPERATION,
                 request=identity,
                 response=response.model_dump(mode="json"),

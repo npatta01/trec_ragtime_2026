@@ -178,6 +178,43 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         self.assertEqual(len(keys), 3)
         self.assertEqual(len(set(keys)), 3)
 
+    def test_store_namespace_is_inherited_without_explicit_override(self) -> None:
+        first_store = MemoryArtifactStore()
+        first_store.namespace = "store-namespace-one"
+        second_store = MemoryArtifactStore()
+        second_store.namespace = "store-namespace-two"
+        first = CachedChatCompletions(FakeClient(), first_store)
+        second = CachedChatCompletions(FakeClient(), second_store)
+        first.create(model="m", messages=[])
+        second.create(model="m", messages=[])
+        self.assertNotEqual(first_store.write_calls[0][0], second_store.write_calls[0][0])
+
+    def test_explicit_namespace_overrides_store_namespace(self) -> None:
+        first_store = MemoryArtifactStore()
+        first_store.namespace = "store-namespace-one"
+        second_store = MemoryArtifactStore()
+        second_store.namespace = "store-namespace-two"
+        first = CachedChatCompletions(FakeClient(), first_store, namespace="explicit-namespace")
+        second = CachedChatCompletions(FakeClient(), second_store, namespace="explicit-namespace")
+        first.create(model="m", messages=[])
+        second.create(model="m", messages=[])
+        self.assertEqual(first_store.write_calls[0][0], second_store.write_calls[0][0])
+
+    def test_mutated_client_base_url_is_captured_per_call(self) -> None:
+        client = FakeClient(
+            responses=[
+                completion("first", completion_id="base-url-one"),
+                completion("second", completion_id="base-url-two"),
+            ]
+        )
+        cached = CachedChatCompletions(client, self.store)
+        first = cached.create(model="m", messages=[])
+        client.base_url = "https://changed.example.test"
+        second = cached.create(model="m", messages=[])
+        self.assertEqual([first.id, second.id], ["base-url-one", "base-url-two"])
+        self.assertEqual(len(client.chat.completions.calls), 2)
+        self.assertNotEqual(self.store.write_calls[0][0], self.store.write_calls[1][0])
+
     def test_transport_options_and_client_credentials_are_excluded(self) -> None:
         secret_one = "authorization-secret-one"
         secret_two = "authorization-secret-two"

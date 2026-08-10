@@ -196,6 +196,15 @@ class ResponseCacheTestCase(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry.value, response)
 
+    def test_filter_response_credentials_requires_a_boolean(self) -> None:
+        for value in (0, 1, None, "true", "false"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                TypeError, "filter_response_credentials must be a boolean"
+            ):
+                ResponseCache(self.store, filter_response_credentials=value)
+        self.assertEqual(self.store.read_validated_calls, [])
+        self.assertEqual(self.store.write_calls, [])
+
     def test_complete_response_mode_does_not_relax_request_identity(self) -> None:
         cache = ResponseCache(self.store, filter_response_credentials=False)
         with self.assertRaisesRegex(ValueError, "credential fields"):

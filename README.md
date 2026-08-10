@@ -309,6 +309,10 @@ cached = CachedChatCompletions(client, ArtifactStore.from_env())
 response = cached.create(model=model, messages=messages)
 ```
 
+When `namespace` is omitted, the wrapper inherits a store's validated
+`namespace` metadata; stores without namespace metadata use the default
+`ragtime2-2026-v1`. Pass `namespace=` explicitly to override the store.
+
 For OpenRouter, use `provider_url = "https://openrouter.ai/api/v1"` and keep
 the provider key in the environment or another private configuration source.
 For a LiteLLM deployment, set `provider_url` to that deployment's configured
