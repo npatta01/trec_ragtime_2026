@@ -357,6 +357,42 @@ The manifest contains only source hash/size, destination bucket metadata, and
 sanitized counts; it contains no request text, response bodies, URLs with
 credentials, or tokens. The source database is never deleted or modified.
 
+### Reuse Existing Retrieval Runs
+
+Control-A and Baseline B/C runs are mutable JSONL checkpoints for audit and
+resume. Their durable cross-process cache is one complete hydrated query object
+per exact semantic request in the private artifact store:
+
+```text
+retrieval/v1/<retriever-fingerprint>/<request-prefix>/<request-digest>.mpk
+```
+
+The runners first try that object. A warm B/C topic reconstruction loads the
+objects by exact query context and performs no organizer request or DuckDB
+hydration. Baseline C imports every successful facet checkpoint, including IDs
+that were not retained in the fused topic's top-100 candidates.
+
+To migrate an existing immutable run directory, decrypt `.env` first and give
+the importer an explicit local manifest path:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env
+uv run ragtime-retrieval-import \
+  /absolute/path/to/control-a-or-query-baseline-run \
+  --corpus /absolute/path/to/ragtime2-corpus-v2.duckdb \
+  --manifest /absolute/path/to/retrieval-import-manifest.json
+```
+
+The importer accepts only `control_a_v1` and `query_baseline_v1` B/C
+directories. It validates source hashes and pinned corpus identity, hydrates
+exact IDs only through `LocalCorpusIndex.enrich_documents`, writes complete
+objects through `RetrievalArtifactCache`, then evicts its disposable L1 copy
+and independently rereads the private L2 object. Failed or partial records are
+counted as skipped; they are never turned into successful artifacts. The
+source run files are read-only and the owner-only manifest contains only file
+hashes, sanitized counts, corpus provenance, and retrieval object keys—not
+queries, document bodies, credentials, or local cache secrets.
+
 ## Repository Map
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the

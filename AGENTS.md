@@ -120,6 +120,20 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   opens the legacy source read-only, validates canonical rows, preserves
   `stored_at`, independently verifies every destination artifact, and writes a
   sanitized owner-only manifest. It never deletes or modifies the source.
+- The explicit `ragtime-retrieval-import` command is the only importer for
+  existing Control-A/B/C retrieval run directories. It accepts only
+  `control_a_v1` and `query_baseline_v1`, validates immutable run/source hashes
+  and the pinned local corpus identity, and hydrates exact hit IDs only through
+  `LocalCorpusIndex.enrich_documents`. It must not construct a participant
+  client, call `/content`, or use Dataset Viewer. Complete queries are written
+  through `RetrievalArtifactCache`, then their L1 candidate is evicted and the
+  typed object is independently reread from L2. Failed/partial records are
+  skipped rather than upgraded to success. The output manifest is explicit,
+  atomic, owner-only, and sanitized: source hashes, counts, corpus provenance,
+  and object keys are allowed; query/body payloads, credentials, and local
+  cache secrets are not. The mutable JSONL run remains an audit/checkpoint
+  input; the `retrieval/v1/<fingerprint>/<prefix>/<request>.mpk` object is the
+  durable shared query cache reused by warm runners.
 - The Dataset Viewer fallback cache is TTL/namespace based and does not pin a
   Hub revision. Keep it only for environments without the complete local
   index. Do not build another FAISS/vector index for hydration; document IDs
