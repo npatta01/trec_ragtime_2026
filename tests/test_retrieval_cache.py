@@ -5,6 +5,7 @@ import unittest
 from typing import Any, Callable
 
 import msgspec
+import trec_ragtime as public_api
 
 from trec_ragtime.artifact_store import ArtifactValidationError
 from trec_ragtime.models import (
@@ -19,6 +20,7 @@ from trec_ragtime.retrieval_cache import (
     RetrievalArtifactReference,
     RetrievalEnvelope,
     RetrievalRequestIdentity,
+    RetrievalRequestWire,
     retrieval_object_key,
     retriever_fingerprint,
 )
@@ -111,6 +113,140 @@ def result_fixture(**changes: Any) -> RetrievalResult:
 
 
 class RetrievalCacheTestCase(unittest.TestCase):
+    def test_non_integer_or_boolean_schema_versions_are_rejected_everywhere(self) -> None:
+        for version in (True, 1.0, "1"):
+            with self.subTest(version=version):
+                with self.assertRaises((TypeError, ValueError)):
+                    request_fixture(schema_version=version)
+                with self.assertRaises((TypeError, ValueError)):
+                    retriever_fingerprint(
+                        request_fixture().base_url,
+                        request_fixture().corpus_identity,
+                        schema_version=version,
+                    )
+
+    def test_non_integer_or_boolean_hit_ranks_are_rejected_before_write(self) -> None:
+        store = MemoryArtifactStore()
+        search = PipelineResult(
+            query="¿qué ocurrió? 中文",
+            pipeline="ragtime2%20",
+            hits=(SearchHit(rank=1.0, document_id="doc-1", score=0.75),),
+            processed=True,
+            local_cache_hit=True,
+            remote_cached=None,
+            server_timestamp=12.0,
+            cache_stored_at=13.0,
+        )
+        result = result_fixture(search_result=search)
+        with self.assertRaises((TypeError, ValueError)):
+            RetrievalArtifactCache(store).put(request_fixture(), result)
+        self.assertEqual(store.writes, [])
+
+    def test_duplicate_top_level_and_nested_map_keys_are_rejected(self) -> None:
+        store = MemoryArtifactStore()
+        cache = RetrievalArtifactCache(store)
+        request = request_fixture()
+        cache.put(request, result_fixture())
+        key, payload = store.writes[0]
+
+        # A fixmap with one extra schema_version pair is accepted by a normal
+        # last-wins decoder, but must fail canonical re-encoding.
+        self.assertEqual(payload[0], 0x85)
+        top_level_duplicate = (
+            bytes([0x86])
+            + payload[1:]
+            + msgspec.msgpack.encode("schema_version")
+            + msgspec.msgpack.encode(1)
+        )
+        store.objects[key] = top_level_duplicate
+        with self.assertRaises(ArtifactValidationError):
+            cache.get(request)
+
+        cache.put(request, result_fixture())
+        key, payload = store.writes[-1]
+        # Add two entries with the same key inside the nested ``extra`` map.
+        original = b"\xa5extra\x80"
+        replacement = b"\xa5extra\x82\xa1a\x01\xa1a\x02"
+        self.assertIn(original, payload)
+        store.objects[key] = payload.replace(original, replacement, 1)
+        with self.assertRaises(ArtifactValidationError):
+            cache.get(request)
+
+    def test_identity_nested_context_and_backend_policy_are_deeply_immutable(self) -> None:
+        request = request_fixture(
+            query_context={"nested": {"ordered": ["a", "b"]}},
+            backend_policy={"policy": {"strict": True}},
+        )
+        before = (request.request_digest, request.retriever_fingerprint, request.object_key)
+        with self.assertRaises(TypeError):
+            request.query_context["nested"]["ordered"] += ("c",)
+        with self.assertRaises(TypeError):
+            request.backend_policy["policy"]["strict"] = False
+        self.assertEqual(before, (request.request_digest, request.retriever_fingerprint, request.object_key))
+
+    def test_invalid_language_and_provenance_combinations_are_rejected(self) -> None:
+        invalid_language = result_fixture(
+            documents=(
+                RetrievedDocument(
+                    rank=1,
+                    document_id="doc-1",
+                    score=0.75,
+                    text="source bytes",
+                    url=None,
+                    date=None,
+                    language="martian",
+                    content_source="huggingface",
+                    content_local_cache_hit=True,
+                    english_text="English translation",
+                ),
+            )
+        )
+        invalid_source = result_fixture(
+            documents=(
+                RetrievedDocument(
+                    rank=1,
+                    document_id="doc-1",
+                    score=0.75,
+                    text="source bytes",
+                    url=None,
+                    date=None,
+                    language="spa",
+                    content_source="foreign_backend",
+                    content_local_cache_hit=True,
+                    english_text="English translation",
+                ),
+            )
+        )
+        for invalid in (invalid_language, invalid_source):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    RetrievalArtifactCache(MemoryArtifactStore()).put(request_fixture(), invalid)
+
+        # The private /content fallback has source text but no corpus language
+        # or translation metadata and is a valid cacheable retrieval status.
+        fallback = result_fixture(
+            documents=(
+                RetrievedDocument(
+                    rank=1,
+                    document_id="doc-1",
+                    score=0.75,
+                    text="source bytes",
+                    url=None,
+                    date=None,
+                    language=None,
+                    content_source="ragtime_api",
+                    content_local_cache_hit=True,
+                    english_text=None,
+                ),
+            ),
+            missing_translation_ids=("doc-1",),
+        )
+        cache = RetrievalArtifactCache(MemoryArtifactStore())
+        cache.put(request_fixture(), fallback)
+
+    def test_request_wire_is_publicly_exported(self) -> None:
+        self.assertIs(public_api.RetrievalRequestWire, RetrievalRequestWire)
+
     def test_identity_is_stable_across_machine_path_refresh_and_credentials(self) -> None:
         first = request_fixture()
         second = request_fixture(

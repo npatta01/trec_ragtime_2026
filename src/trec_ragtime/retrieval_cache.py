@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 import msgspec
@@ -85,6 +86,19 @@ def _canonical_json(value: Any) -> Any:
     return canonicalize_json(value)
 
 
+def _freeze_json(value: Any) -> Any:
+    """Return a recursively immutable canonical JSON-like value."""
+
+    canonical = _canonical_json(value)
+    if isinstance(canonical, dict):
+        return MappingProxyType(
+            {key: _freeze_json(nested) for key, nested in canonical.items()}
+        )
+    if isinstance(canonical, list):
+        return tuple(_freeze_json(item) for item in canonical)
+    return canonical
+
+
 def _corpus_without_path(corpus_identity: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(corpus_identity, Mapping):
         raise TypeError("corpus_identity must be a mapping")
@@ -111,6 +125,12 @@ def _validate_version(value: str, *, name: str) -> str:
     return value
 
 
+def _validate_schema_version(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value != RETRIEVAL_SCHEMA_VERSION:
+        raise ValueError("unsupported retrieval schema version")
+    return value
+
+
 def retriever_fingerprint(
     base_url: str | RetrievalRequestIdentity,
     corpus_identity: Mapping[str, Any] | None = None,
@@ -131,8 +151,7 @@ def retriever_fingerprint(
         return request.retriever_fingerprint
     if corpus_identity is None:
         raise TypeError("corpus_identity is required")
-    if schema_version != RETRIEVAL_SCHEMA_VERSION:
-        raise ValueError("unsupported retrieval schema version")
+    _validate_schema_version(schema_version)
     normalized = _normalized_base_url(base_url)
     payload = {
         "schema_version": schema_version,
@@ -180,8 +199,7 @@ class RetrievalRequestIdentity:
     translation_behavior_version: str = TRANSLATION_BEHAVIOR_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != RETRIEVAL_SCHEMA_VERSION:
-            raise ValueError("unsupported retrieval schema version")
+        _validate_schema_version(self.schema_version)
         if not isinstance(self.query, str):
             raise TypeError("query must be a string")
         if not isinstance(self.pipeline, str) or not self.pipeline:
@@ -207,13 +225,17 @@ class RetrievalRequestIdentity:
         if self.query_context is not None and not isinstance(self.query_context, Mapping):
             raise TypeError("query_context must be a mapping or None")
         object.__setattr__(self, "base_url", _normalized_base_url(self.base_url))
-        object.__setattr__(self, "backend_policy", _canonical_json(self.backend_policy))
+        object.__setattr__(self, "backend_policy", _freeze_json(self.backend_policy))
         object.__setattr__(
             self,
             "query_context",
-            None if self.query_context is None else _canonical_json(self.query_context),
+            None if self.query_context is None else _freeze_json(self.query_context),
         )
-        object.__setattr__(self, "corpus_identity", _corpus_without_path(self.corpus_identity))
+        object.__setattr__(
+            self,
+            "corpus_identity",
+            _freeze_json(_corpus_without_path(self.corpus_identity)),
+        )
         for name in (
             "client_behavior_version",
             "retriever_behavior_version",
@@ -253,8 +275,10 @@ class RetrievalRequestIdentity:
             "max_content_fallbacks": self.max_content_fallbacks,
             "fallback_on_hf_error": self.fallback_on_hf_error,
             "content_collection": self.content_collection,
-            "backend_policy": self.backend_policy,
-            "query_context": self.query_context,
+            "backend_policy": _canonical_json(self.backend_policy),
+            "query_context": (
+                None if self.query_context is None else _canonical_json(self.query_context)
+            ),
         }
         return msgspec.msgpack.encode(payload)
 
@@ -425,6 +449,9 @@ class RetrievalRequestWire(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
     fallback_behavior_version: str
     translation_behavior_version: str
 
+    def __post_init__(self) -> None:
+        _validate_schema_version(self.schema_version)
+
 
 class RetrievalEnvelope(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     schema_version: int
@@ -433,10 +460,19 @@ class RetrievalEnvelope(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     stored_at: float
     result: RetrievalResultWire
 
+    def __post_init__(self) -> None:
+        _validate_schema_version(self.schema_version)
+
 
 # Stable descriptive aliases for callers that prefer endpoint-oriented names.
 RetrievalSearchHitWire = RetrievalHitWire
 RetrievalRetrievedDocumentWire = RetrievalDocumentWire
+
+
+_SUPPORTED_LANGUAGES = frozenset({"eng", "spa", "rus", "zho"})
+_CORPUS_CONTENT_SOURCES = frozenset(
+    {"huggingface", "huggingface_local_index", "local_corpus"}
+)
 
 
 def _validate_result(request: RetrievalRequestIdentity, result: RetrievalResult) -> None:
@@ -467,7 +503,7 @@ def _validate_result(request: RetrievalRequestIdentity, result: RetrievalResult)
     for expected_rank, hit in enumerate(hits, start=1):
         if not isinstance(hit, SearchHit):
             raise TypeError("search hits must be SearchHit values")
-        if isinstance(hit.rank, bool) or hit.rank != expected_rank:
+        if isinstance(hit.rank, bool) or not isinstance(hit.rank, int) or hit.rank != expected_rank:
             raise ValueError("search hit ranks must be contiguous and one-based")
         if not isinstance(hit.document_id, str) or not hit.document_id:
             raise ValueError("search hit IDs must be non-empty strings")
@@ -505,6 +541,23 @@ def _validate_result(request: RetrievalRequestIdentity, result: RetrievalResult)
             document.content_local_cache_hit, bool
         ):
             raise TypeError("content_local_cache_hit must be a boolean or None")
+        if document.language is not None and document.language not in _SUPPORTED_LANGUAGES:
+            raise ValueError("document language is not a supported corpus split")
+        if document.content_source in _CORPUS_CONTENT_SOURCES:
+            if document.language is None:
+                raise ValueError("corpus content requires a supported language")
+        elif document.content_source == "ragtime_api":
+            if (
+                document.language is not None
+                or document.url is not None
+                or document.date is not None
+                or document.english_text is not None
+            ):
+                raise ValueError("ragtime_api content has invalid corpus metadata")
+            if not isinstance(document.content_local_cache_hit, bool):
+                raise ValueError("ragtime_api content must record cache provenance")
+        else:
+            raise ValueError("document content source is not supported")
 
     if result.hydration_failures:
         raise ValueError("operational hydration failures are not cacheable")
@@ -610,6 +663,37 @@ def _from_wire(wire: RetrievalResultWire) -> RetrievalResult:
     return result
 
 
+def _canonical_envelope_bytes(envelope: RetrievalEnvelope) -> bytes:
+    """Encode a decoded envelope in the one canonical wire representation."""
+
+    search = envelope.result.search_result
+    canonical_result = RetrievalResultWire(
+        search_result=RetrievalPipelineWire(
+            query=search.query,
+            pipeline=search.pipeline,
+            hits=search.hits,
+            processed=search.processed,
+            local_cache_hit=search.local_cache_hit,
+            remote_cached=search.remote_cached,
+            server_timestamp=search.server_timestamp,
+            cache_stored_at=search.cache_stored_at,
+            extra=_canonical_json(search.extra),
+        ),
+        documents=envelope.result.documents,
+        hydration_failures=envelope.result.hydration_failures,
+        missing_translation_ids=envelope.result.missing_translation_ids,
+    )
+    return msgspec.msgpack.encode(
+        RetrievalEnvelope(
+            schema_version=envelope.schema_version,
+            retriever_fingerprint=envelope.retriever_fingerprint,
+            request_digest=envelope.request_digest,
+            stored_at=envelope.stored_at,
+            result=canonical_result,
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _DecodedArtifact:
     result: RetrievalResult
@@ -640,12 +724,14 @@ class RetrievalArtifactCache:
             except (msgspec.DecodeError, msgspec.ValidationError, TypeError, ValueError):
                 raise self._decode_error("cached retrieval envelope is invalid") from None
             try:
+                _validate_schema_version(envelope.schema_version)
                 if (
-                    envelope.schema_version != RETRIEVAL_SCHEMA_VERSION
-                    or envelope.retriever_fingerprint != request.retriever_fingerprint
+                    envelope.retriever_fingerprint != request.retriever_fingerprint
                     or envelope.request_digest != request.request_digest
                 ):
                     raise ValueError("cached retrieval identity is invalid")
+                if _canonical_envelope_bytes(envelope) != payload:
+                    raise ValueError("cached retrieval wire encoding is not canonical")
                 _finite(envelope.stored_at, name="stored_at")
                 result = _from_wire(envelope.result)
                 _validate_result(request, result)
