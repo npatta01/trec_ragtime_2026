@@ -41,6 +41,7 @@ from .retrieval_cache import (
 )
 
 DEFAULT_MAX_CONTENT_FALLBACKS = 5
+_MISSING = object()
 
 
 class DocumentCorpus(Protocol):
@@ -83,11 +84,17 @@ class RagtimeRetriever:
         self.retrieval_cache = retrieval_cache
         self._document_backend_snapshot: str | None = None
         self._retrieval_corpus_identity_snapshot: Mapping[str, Any] | None = None
+        self._corpus_publication_token: tuple[Any, ...] | None = None
         if retrieval_cache is not None:
             # LocalCorpusIndex validates its published database at
             # construction. Capture the resulting immutable provenance once so
-            # warm artifact hits never reopen DuckDB for metadata.
+            # warm artifact hits never reopen DuckDB for metadata. The cheap
+            # publication token below is only a lifecycle guard; it is not
+            # included in the artifact identity or digest.
             self._document_backend_snapshot = corpus.backend_name
+            self._corpus_publication_token = (
+                self._capture_corpus_publication_token()
+            )
             self._retrieval_corpus_identity_snapshot = copy.deepcopy(
                 dict(self._capture_retrieval_corpus_identity())
             )
@@ -198,6 +205,68 @@ class RagtimeRetriever:
             if not isinstance(identity, Mapping):
                 raise
             return identity
+
+    @staticmethod
+    def _freeze_publication_token(value: Any) -> Any:
+        """Return a comparison-safe snapshot of a custom generation token."""
+
+        if value is None or isinstance(value, (bool, int, float, str, bytes)):
+            return value
+        if isinstance(value, Mapping):
+            frozen_items = [
+                (
+                    RagtimeRetriever._freeze_publication_token(key),
+                    RagtimeRetriever._freeze_publication_token(nested),
+                )
+                for key, nested in value.items()
+            ]
+            return tuple(sorted(frozen_items, key=repr))
+        if isinstance(value, (list, tuple)):
+            return tuple(
+                RagtimeRetriever._freeze_publication_token(item) for item in value
+            )
+        raise LocalCorpusConfigurationError(
+            "cache-enabled custom corpus_generation must be a scalar or nested "
+            "JSON-like value"
+        )
+
+    def _capture_corpus_publication_token(self) -> tuple[Any, ...]:
+        """Capture a cheap corpus publication token without opening DuckDB."""
+
+        if isinstance(self.corpus, LocalCorpusIndex):
+            try:
+                file_stat = Path(self.corpus.path).stat()
+            except (AttributeError, OSError, TypeError, ValueError) as exc:
+                raise LocalCorpusConfigurationError(
+                    "local corpus publication token is unavailable; "
+                    "create a new RagtimeRetriever after repairing the corpus"
+                ) from exc
+            return (
+                "local-stat",
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+            )
+
+        generation = getattr(self.corpus, "corpus_generation", _MISSING)
+        if generation is _MISSING:
+            raise LocalCorpusConfigurationError(
+                "cache-enabled custom corpus must expose corpus_generation; "
+                "create a new RagtimeRetriever when the corpus changes"
+            )
+        return ("custom-generation", self._freeze_publication_token(generation))
+
+    def _assert_corpus_publication_unchanged(self) -> None:
+        """Reject cache use after the corpus publication boundary moves."""
+
+        if self.retrieval_cache is None:
+            return
+        current_token = self._capture_corpus_publication_token()
+        if current_token != self._corpus_publication_token:
+            raise LocalCorpusConfigurationError(
+                "corpus publication changed; create a new RagtimeRetriever"
+            )
 
     def _retrieval_corpus_identity(self) -> Mapping[str, Any]:
         if self._retrieval_corpus_identity_snapshot is not None:
@@ -316,6 +385,7 @@ class RagtimeRetriever:
         )
         if self.retrieval_cache is None:
             return None
+        self._assert_corpus_publication_unchanged()
         return self.retrieval_cache.get(identity)
 
     def retrieve_cached(self, *args: Any, **kwargs: Any) -> RetrievalResult | None:
@@ -395,9 +465,12 @@ class RagtimeRetriever:
                 query_context=query_context,
             )
             if not retrieval_refresh:
+                self._assert_corpus_publication_unchanged()
                 cached = self.retrieval_cache.get(identity)
                 if cached is not None:
                     return cached
+
+            self._assert_corpus_publication_unchanged()
 
         search_result = self.client.search(
             query,
@@ -503,6 +576,7 @@ class RagtimeRetriever:
                 if hit.document_id in missing_report_text_ids
             ),
         )
+        self._assert_corpus_publication_unchanged()
         if (
             self.retrieval_cache is not None
             and result.fully_hydrated

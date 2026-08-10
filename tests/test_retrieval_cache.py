@@ -131,6 +131,7 @@ class RetrievalCacheTestCase(unittest.TestCase):
         class NoWorkCorpus:
             backend_name = "local"
             corpus_identity = request_fixture().corpus_identity
+            corpus_generation = 0
 
             def __init__(self) -> None:
                 self.calls = 0

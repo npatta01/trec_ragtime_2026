@@ -18,6 +18,8 @@ from trec_ragtime import (
     HuggingFaceHydrationError,
     HydrationFailure,
     HydrationResult,
+    LocalCorpusConfigurationError,
+    LocalCorpusIndex,
     PipelineResult,
     RagtimeApiError,
     RagtimeClient,
@@ -235,17 +237,24 @@ class FakeRagtimeClient:
 class FakeCorpus:
     backend_name = "fake"
 
-    def __init__(self, result: HydrationResult):
+    def __init__(
+        self,
+        result: HydrationResult,
+        *,
+        corpus_revision: str = "fake-revision",
+        corpus_generation: int = 0,
+    ):
         self.result = result
         self.calls: list[dict[str, Any]] = []
         self.closed = False
         self.raise_on_access = False
+        self.corpus_generation = corpus_generation
         self._corpus_identity = {
             "backend": "fake",
             "schema_version": 1,
             "dataset": "trec-ragtime/ragtime2",
             "config": "default",
-            "revision": "fake-revision",
+            "revision": corpus_revision,
             "document_count": 1,
             "shard_count": 1,
             "splits": ["eng", "spa", "rus", "zho"],
@@ -533,6 +542,8 @@ class RagtimeRetrieverTests(unittest.TestCase):
         *,
         text: str = "cached text",
         document_result: HydrationResult | None = None,
+        corpus_revision: str = "fake-revision",
+        corpus_generation: int = 0,
     ) -> tuple[RagtimeRetriever, FakeRagtimeClient, FakeCorpus]:
         client = FakeRagtimeClient(pipeline_result(["doc-1"]))
         corpus = FakeCorpus(
@@ -542,7 +553,9 @@ class RagtimeRetrieverTests(unittest.TestCase):
                 documents=(hf_document("doc-1", text),),
                 unresolved_ids=(),
                 failures=(),
-            )
+            ),
+            corpus_revision=corpus_revision,
+            corpus_generation=corpus_generation,
         )
         return RagtimeRetriever(
             client,
@@ -740,6 +753,10 @@ class RagtimeRetrieverTests(unittest.TestCase):
                 RagtimeRetriever,
                 "_capture_retrieval_corpus_identity",
                 return_value=corpus.corpus_identity,
+            ), patch.object(
+                RagtimeRetriever,
+                "_capture_corpus_publication_token",
+                return_value=("custom", 0),
             ):
                 retriever = RagtimeRetriever.from_env(local_index_path=index_path)
         self.assertIsNotNone(retriever.retrieval_cache)
@@ -778,6 +795,139 @@ class RagtimeRetrieverTests(unittest.TestCase):
         self.assertTrue(second.retrieval_artifact.cache_hit)
         self.assertEqual(second.documents[0].text, "captured")
         self.assertEqual(first.retrieval_artifact.object_key, second.retrieval_artifact.object_key)
+
+    def test_corpus_generation_change_fails_before_hit_and_requires_new_retriever(self) -> None:
+        store = MemoryArtifactStore()
+        retriever, client, corpus = self._cached_retriever(
+            store,
+            text="old corpus",
+            corpus_revision="old-revision",
+            corpus_generation=0,
+        )
+        first = retriever.retrieve("query")
+        corpus._corpus_identity["revision"] = "new-revision"
+        corpus.corpus_generation = 1
+        client.raise_on_search = True
+
+        with self.assertRaisesRegex(
+            LocalCorpusConfigurationError, "create a new RagtimeRetriever"
+        ):
+            retriever.retrieve("query")
+        self.assertEqual(len(store.read_calls), 1)
+        self.assertEqual(len(store.write_calls), 1)
+
+        with self.assertRaisesRegex(
+            LocalCorpusConfigurationError, "create a new RagtimeRetriever"
+        ):
+            retriever.retrieve("query", refresh=True)
+        self.assertEqual(len(store.read_calls), 1)
+        self.assertEqual(len(store.write_calls), 1)
+
+        replacement, replacement_client, replacement_corpus = self._cached_retriever(
+            store,
+            text="new corpus",
+            corpus_revision="new-revision",
+            corpus_generation=1,
+        )
+        result = replacement.retrieve("query")
+        self.assertFalse(result.retrieval_artifact.cache_hit)
+        self.assertNotEqual(
+            first.retrieval_artifact.object_key,
+            result.retrieval_artifact.object_key,
+        )
+        self.assertEqual(result.documents[0].text, "new corpus")
+        self.assertEqual(len(replacement_client.search_calls), 1)
+        self.assertEqual(len(replacement_corpus.calls), 1)
+        self.assertEqual(len(store.write_calls), 2)
+
+    def test_replaced_local_corpus_file_fails_before_cache_hit(self) -> None:
+        class LocalCorpusProbe(LocalCorpusIndex):
+            def __init__(self, path: Path, result: HydrationResult):
+                self.path = path
+                self.result = result
+                self.calls = 0
+
+            def enrich_documents(
+                self, document_ids: Any, *, refresh: bool
+            ) -> HydrationResult:
+                self.calls += 1
+                return self.result
+
+            def close(self) -> None:
+                return None
+
+        store = MemoryArtifactStore()
+        old_identity = FakeCorpus(
+            HydrationResult(documents=(), unresolved_ids=(), failures=())
+        ).corpus_identity
+        new_identity = {**old_identity, "revision": "new-revision"}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "corpus.duckdb"
+            path.write_bytes(b"old publication")
+            old_corpus = LocalCorpusProbe(
+                path,
+                HydrationResult(
+                    documents=(hf_document("doc-1", "old corpus"),),
+                    unresolved_ids=(),
+                    failures=(),
+                ),
+            )
+            old_client = FakeRagtimeClient(pipeline_result(["doc-1"]))
+            with patch.object(
+                RagtimeRetriever,
+                "_capture_retrieval_corpus_identity",
+                return_value=old_identity,
+            ):
+                old = RagtimeRetriever(
+                    old_client,
+                    old_corpus,
+                    retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+                )
+            first = old.retrieve("query")
+
+            replacement_path = Path(temporary) / "replacement.duckdb"
+            replacement_path.write_bytes(b"new publication with a different size")
+            os.replace(replacement_path, path)
+            old_client.raise_on_search = True
+            with self.assertRaisesRegex(
+                LocalCorpusConfigurationError, "create a new RagtimeRetriever"
+            ):
+                old.retrieve("query")
+            with self.assertRaisesRegex(
+                LocalCorpusConfigurationError, "create a new RagtimeRetriever"
+            ):
+                old.retrieve("query", refresh=True)
+            self.assertEqual(len(store.read_calls), 1)
+            self.assertEqual(len(store.write_calls), 1)
+
+            new_corpus = LocalCorpusProbe(
+                path,
+                HydrationResult(
+                    documents=(hf_document("doc-1", "new corpus"),),
+                    unresolved_ids=(),
+                    failures=(),
+                ),
+            )
+            new_client = FakeRagtimeClient(pipeline_result(["doc-1"]))
+            with patch.object(
+                RagtimeRetriever,
+                "_capture_retrieval_corpus_identity",
+                return_value=new_identity,
+            ):
+                new = RagtimeRetriever(
+                    new_client,
+                    new_corpus,
+                    retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+                )
+            result = new.retrieve("query")
+
+        self.assertFalse(result.retrieval_artifact.cache_hit)
+        self.assertEqual(result.documents[0].text, "new corpus")
+        self.assertNotEqual(
+            first.retrieval_artifact.object_key,
+            result.retrieval_artifact.object_key,
+        )
+        self.assertEqual(len(store.write_calls), 2)
 
     def test_refresh_refreshes_private_content_fallback(self) -> None:
         store = MemoryArtifactStore()
