@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from trec_ragtime.passages import (
     Passage,
@@ -20,16 +21,6 @@ def load_cases() -> list[dict[str, object]]:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["cases"]
 
 
-class FakePairLength:
-    fingerprint = "fake-pair-v1"
-    max_length = 8
-    max_passage_length = 6
-    passage_length_function = staticmethod(lambda text: len(text.split()))
-
-    def __call__(self, text: str) -> int:
-        return len(text.split()) + 2
-
-
 class FixturePairLength:
     passage_length_function = staticmethod(lambda text: len(text.split()))
 
@@ -43,6 +34,21 @@ class FixturePairLength:
 
 
 class PassageContractTests(unittest.TestCase):
+    def test_package_exports_compact_passage_api(self) -> None:
+        namespace: dict[str, object] = {}
+        exec(
+            "from trec_ragtime import Boundary, Passage, PassageChunker, "
+            "PassageChunkingError, Representation, sha256_bytes, validate_passages",
+            namespace,
+        )
+        self.assertIs(namespace["Passage"], Passage)
+        self.assertIs(namespace["PassageChunker"], PassageChunker)
+        self.assertIs(namespace["PassageChunkingError"], PassageChunkingError)
+        self.assertIs(namespace["sha256_bytes"], sha256_bytes)
+        self.assertIs(namespace["validate_passages"], validate_passages)
+        self.assertEqual(namespace["Boundary"], Boundary)
+        self.assertEqual(namespace["Representation"], Representation)
+
     def test_passage_contract_is_compact_and_immutable(self) -> None:
         fields = tuple(Passage.__dataclass_fields__)
         self.assertEqual(
@@ -132,6 +138,35 @@ class PassageValidationTests(unittest.TestCase):
 
 
 class PassageChunkerTests(unittest.TestCase):
+    def test_multi_sentence_over_ceiling_rejects_before_rcts(self) -> None:
+        class PairLength:
+            fingerprint = "multi-sentence-guard-v1"
+            max_length = 5
+            max_passage_length = 3
+            passage_length_function = staticmethod(lambda text: len(text.split()))
+
+            def __call__(self, text: str) -> int:
+                if text.count(".") >= 2:
+                    return 6
+                return len(text.split()) + 1
+
+        chunker = PassageChunker(PairLength(), overlap_tokens=0)
+        with patch.object(
+            PassageChunker,
+            "_recursive_splitter",
+            side_effect=AssertionError("RCTS must not receive multiple sentences"),
+        ):
+            with self.assertRaisesRegex(
+                PassageChunkingError, "exactly one underlying sentence"
+            ):
+                chunker.chunk(
+                    document_id="doc-multi-sentence-over-ceiling",
+                    canonical_text="One. Two.",
+                    selected_text="One. Two.",
+                    representation="canonical",
+                    language="eng",
+                )
+
     def assert_exact_passages(
         self,
         selected_text: str,

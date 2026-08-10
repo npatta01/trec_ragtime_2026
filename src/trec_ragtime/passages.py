@@ -6,7 +6,7 @@ import hashlib
 import importlib.metadata
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Mapping, Sequence, cast
+from typing import Any, Literal, Mapping, Sequence, cast
 
 
 Representation = Literal["canonical", "report_text"]
@@ -482,8 +482,9 @@ class PassageChunker:
             )
 
         pipeline = self._pipeline_for_language(language)
+        sentence_splitter = self._sentence_splitter(pipeline)
         sentence_spans = self._split_exact(
-            self._sentence_splitter(pipeline),
+            sentence_splitter,
             selected_text,
             parent_name="sentence",
         )
@@ -493,14 +494,24 @@ class PassageChunker:
                 final_spans.append((sentence_span, "sentence"))
                 continue
 
-            confirmed = self._split_exact(
-                self._sentence_splitter(pipeline),
+            underlying_sentences = self._spacy_sentence_units(
+                sentence_splitter,
                 sentence_span.text,
-                parent_name="sentence confirmation",
             )
-            if len(confirmed) != 1:
+            if len(underlying_sentences) != 1:
                 raise PassageChunkingError(
-                    "a multi-sentence chunk exceeded the full-pair ceiling"
+                    "RCTS requires exactly one underlying sentence"
+                )
+            underlying_sentence = underlying_sentences[0]
+            if (
+                underlying_sentence.start_char > 0
+                and not sentence_span.text[: underlying_sentence.start_char].isspace()
+            ) or (
+                underlying_sentence.end_char < len(sentence_span.text)
+                and not sentence_span.text[underlying_sentence.end_char :].isspace()
+            ):
+                raise PassageChunkingError(
+                    "RCTS sentence span does not cover the complete unit"
                 )
             recursive_spans = self._split_exact(
                 self._recursive_splitter(),
@@ -540,16 +551,6 @@ class PassageChunker:
                     "final passage exceeded the full-pair ceiling"
                 )
         return passages
-
-
-def __getattr__(name: str) -> object:
-    """Keep stale package exports importable until later slices update them."""
-
-    if name == "PassageValidationError":
-        return PassageChunkingError
-    if name in {"ChunkerConfig", "LangChainPassageChunker"}:
-        return PassageChunker
-    raise AttributeError(name)
 
 
 __all__ = [
