@@ -12,9 +12,11 @@ from types import SimpleNamespace
 from trec_ragtime import (
     PipelineResult,
     RagtimeApiError,
+    RetrievalArtifactReference,
     RetrievalResult,
     RetrievedDocument,
     SearchHit,
+    retrieval_object_key,
 )
 from trec_ragtime.topic_candidates import (
     Topic,
@@ -200,6 +202,7 @@ class FakeRetriever:
     def __init__(self, results: list[object]) -> None:
         self.results = iter(results)
         self.calls: list[dict[str, object]] = []
+        self.query_contexts: list[dict[str, object] | None] = []
         self.cache_configuration = {
             "namespace": "ragtime2-2026-v1",
             "bucket_id": "owner/ragtime-cache",
@@ -219,6 +222,7 @@ class FakeRetriever:
         top_k: int | None,
         max_content_fallbacks: int | None,
         fallback_on_hf_error: bool,
+        query_context: dict[str, object] | None = None,
     ) -> RetrievalResult:
         self.calls.append(
             {
@@ -229,6 +233,7 @@ class FakeRetriever:
                 "fallback_on_hf_error": fallback_on_hf_error,
             }
         )
+        self.query_contexts.append(query_context)
         result = next(self.results)
         if isinstance(result, BaseException):
             raise result
@@ -241,6 +246,8 @@ def make_retrieval_result(
     *,
     missing_translation_ids: tuple[str, ...] = (),
 ) -> RetrievalResult:
+    request_digest = hashlib.sha256(query.encode("utf-8")).digest()
+    fingerprint = hashlib.sha256(b"control-a-test-retriever").digest()
     return RetrievalResult(
         search_result=PipelineResult(
             query=query,
@@ -261,6 +268,13 @@ def make_retrieval_result(
         ),
         documents=documents,
         missing_translation_ids=missing_translation_ids,
+        retrieval_artifact=RetrievalArtifactReference(
+            object_key=retrieval_object_key(fingerprint, request_digest),
+            request_digest=request_digest,
+            retriever_fingerprint=fingerprint,
+            stored_at=123.0,
+            cache_hit=False,
+        ),
     )
 
 
@@ -377,7 +391,14 @@ class ControlARunnerTests(unittest.TestCase):
         self.assertEqual(manifest["counts"]["topics"], 2)
         self.assertEqual(manifest["counts"]["candidates"], 2)
         self.assertEqual(
-            manifest["topic_status"],
+            [
+                {
+                    key: value
+                    for key, value in status.items()
+                    if key != "retrieval_artifact"
+                }
+                for status in manifest["topic_status"]
+            ],
             [
                 {"missing_translation_ids": [], "topic_id": "1", "unresolved_ids": ["doc-unresolved"]},
                 {"missing_translation_ids": ["doc-translation"], "topic_id": "2", "unresolved_ids": []},
@@ -402,6 +423,47 @@ class ControlARunnerTests(unittest.TestCase):
             hashlib.sha256(self.topic_file.read_bytes()).hexdigest(),
         )
         self.assertNotIn("bearer_token", json.dumps(manifest).lower())
+
+    def test_runner_uses_stable_context_and_persists_one_reference_per_success(self) -> None:
+        first = RetrievedDocument(
+            rank=1,
+            document_id="doc-first",
+            score=1.0,
+            text="first text",
+            url=None,
+            date=None,
+            language="eng",
+            content_source="local_corpus",
+            content_local_cache_hit=True,
+        )
+        retriever = FakeRetriever(
+            [
+                make_retrieval_result("first problem", (first,)),
+                RagtimeApiError("HTTP 504"),
+            ]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="context-and-references",
+        )
+
+        self.assertEqual(
+            retriever.query_contexts,
+            [
+                {"kind": "control_a", "query_construction": "problem_only_v1"},
+                {"kind": "control_a", "query_construction": "problem_only_v1"},
+            ],
+        )
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        statuses = manifest["topic_status"]
+        self.assertIn("retrieval_artifact", statuses[0])
+        self.assertNotIn("retrieval_artifact", statuses[1])
+        self.assertEqual(
+            statuses[0]["retrieval_artifact"]["cache_hit"], False
+        )
 
     def test_runner_refuses_to_overwrite_existing_run(self) -> None:
         run_dir = self.output_root / "existing"
@@ -449,8 +511,16 @@ class ControlARunnerTests(unittest.TestCase):
         self.assertEqual(manifest["counts"]["topics"], 2)
         self.assertEqual(manifest["counts"]["candidates"], 1)
         self.assertEqual(manifest["counts"]["failed_topics"], 1)
+        statuses_without_refs = [
+            {
+                key: value
+                for key, value in status.items()
+                if key != "retrieval_artifact"
+            }
+            for status in manifest["topic_status"]
+        ]
         self.assertEqual(
-            manifest["topic_status"],
+            statuses_without_refs,
             [
                 {
                     "error": {"type": "RagtimeApiError"},

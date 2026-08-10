@@ -18,6 +18,7 @@ from .client import RagtimeError
 from .huggingface import HuggingFaceError
 from .models import RetrievalResult, RetrievedDocument
 from .paths import default_project_cache_dir
+from .retrieval_cache import RetrievalArtifactReference
 
 
 _REQUIRED_TOPIC_FIELDS = frozenset(
@@ -53,6 +54,7 @@ class RetrieverLike(Protocol):
         top_k: int | None,
         max_content_fallbacks: int | None,
         fallback_on_hf_error: bool,
+        query_context: Mapping[str, object] | None = None,
     ) -> RetrievalResult: ...
 
 
@@ -304,6 +306,17 @@ def _candidate_record(
     return record
 
 
+def _artifact_reference_record(result: RetrievalResult) -> dict[str, object]:
+    """Return the persisted reference required for a successful topic."""
+
+    reference = result.retrieval_artifact
+    if not isinstance(reference, RetrievalArtifactReference):
+        raise ValueError(
+            "successful Control-A retrieval is missing a RetrievalArtifactReference"
+        )
+    return reference.as_record()
+
+
 def _corpus_manifest(retriever: RetrieverLike) -> dict[str, object]:
     metadata = getattr(getattr(retriever, "corpus", None), "metadata", None)
     return {
@@ -349,8 +362,13 @@ def run_control_a(
                 top_k=top_k,
                 max_content_fallbacks=0,
                 fallback_on_hf_error=False,
+                query_context={
+                    "kind": "control_a",
+                    "query_construction": "problem_only_v1",
+                },
             )
-        except (RagtimeError, HuggingFaceError) as exc:
+            retrieval_artifact = _artifact_reference_record(result)
+        except (RagtimeError, HuggingFaceError, ValueError) as exc:
             failed_topic_count += 1
             topic_status.append(
                 {
@@ -370,6 +388,7 @@ def run_control_a(
                 "missing_translation_ids": sorted(missing_translation_ids),
                 "topic_id": topic.topic_id,
                 "unresolved_ids": unresolved_ids,
+                "retrieval_artifact": retrieval_artifact,
             }
         )
         records.extend(

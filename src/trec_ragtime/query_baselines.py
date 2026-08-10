@@ -9,7 +9,7 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -21,8 +21,9 @@ from typing import Any, Protocol
 from .client import RagtimeError
 from .huggingface import HuggingFaceError
 from .local_corpus import LocalCorpusError
-from .models import HydrationResult, RetrievalResult, SearchHit
+from .models import RetrievalResult, SearchHit
 from .paths import default_project_cache_dir
+from .retrieval_cache import RetrievalArtifactReference
 
 
 PIPELINE = "ragtime2"
@@ -58,6 +59,7 @@ class QueryTask:
     query_index: int
     query: str
     attempt: int
+    query_context: Mapping[str, object]
 
 
 class RetrieverLike(Protocol):
@@ -71,9 +73,19 @@ class RetrieverLike(Protocol):
         top_k: int | None,
         max_content_fallbacks: int | None,
         fallback_on_hf_error: bool,
+        query_context: Mapping[str, object] | None = None,
     ) -> RetrievalResult: ...
 
-    def enrich_documents(self, document_ids: Iterable[str]) -> HydrationResult: ...
+    def retrieve_cached(
+        self,
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+        query_context: Mapping[str, object] | None = None,
+    ) -> RetrievalResult | None: ...
 
     @property
     def corpus_identity(self) -> Mapping[str, Any]: ...
@@ -270,6 +282,46 @@ def _queries_for(plan: QueryPlan, baseline: str) -> tuple[str, ...]:
     return (plan.single_query,) if baseline == "b" else plan.facet_queries
 
 
+def _query_context(
+    *, baseline: str, plan_sha256: str, query_index: int
+) -> dict[str, object]:
+    if baseline == "b":
+        construction = "problem_background_single_query_v1"
+    elif baseline == "c":
+        construction = "problem_background_facets_v1"
+    else:  # pragma: no cover - validated by the public runner.
+        raise ValueError("baseline must be 'b' or 'c'")
+    return {
+        "kind": f"baseline_{baseline}",
+        "query_construction": construction,
+        "query_plan_sha256": plan_sha256,
+        "query_index": query_index,
+    }
+
+
+def _artifact_reference_record(result: RetrievalResult) -> dict[str, object]:
+    reference = result.retrieval_artifact
+    if not isinstance(reference, RetrievalArtifactReference):
+        raise ValueError(
+            "successful baseline retrieval is missing a RetrievalArtifactReference"
+        )
+    return reference.as_record()
+
+
+def _checkpoint_has_reference(record: Mapping[str, Any]) -> bool:
+    reference = record.get("retrieval_artifact")
+    if not isinstance(reference, Mapping):
+        return False
+    return (
+        isinstance(reference.get("object_key"), str)
+        and isinstance(reference.get("request_digest"), str)
+        and isinstance(reference.get("retriever_fingerprint"), str)
+        and isinstance(reference.get("stored_at"), (int, float))
+        and not isinstance(reference.get("stored_at"), bool)
+        and isinstance(reference.get("cache_hit"), bool)
+    )
+
+
 def _ordered_query_records(
     plans: Sequence[QueryPlan],
     baseline: str,
@@ -310,6 +362,7 @@ def _query_record_from_result(
         "remote_cached": search.remote_cached,
         "hit_count": len(hits),
         "hits": [hit.as_record() for hit in hits],
+        "retrieval_artifact": _artifact_reference_record(result),
     }
 
 
@@ -328,6 +381,7 @@ def _run_query_task(
             top_k=top_k,
             max_content_fallbacks=0,
             fallback_on_hf_error=False,
+            query_context=task.query_context,
         )
     except (RagtimeError, HuggingFaceError, LocalCorpusError) as exc:
         return {
@@ -344,16 +398,32 @@ def _run_query_task(
             "error_detail": str(exc),
             "hits": [],
         }
-    return _query_record_from_result(
-        topic_id=task.topic_id,
-        query_index=task.query_index,
-        query=task.query,
-        result=result,
-        started_at=started_at,
-        duration_seconds=time.perf_counter() - started,
-        attempt=task.attempt,
-        top_k=top_k,
-    )
+    try:
+        return _query_record_from_result(
+            topic_id=task.topic_id,
+            query_index=task.query_index,
+            query=task.query,
+            result=result,
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - started,
+            attempt=task.attempt,
+            top_k=top_k,
+        )
+    except ValueError as exc:
+        return {
+            "topic_id": task.topic_id,
+            "query_index": task.query_index,
+            "query": task.query,
+            "query_chars": len(task.query),
+            "pipeline": PIPELINE,
+            "started_at": started_at,
+            "status": "error",
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "attempt": task.attempt,
+            "error_type": type(exc).__name__,
+            "error_detail": str(exc),
+            "hits": [],
+        }
 
 
 def _query_records_for_topic(
@@ -375,41 +445,136 @@ def _query_records_for_topic(
     return records
 
 
-def _hydrate_candidates(
-    candidates: list[dict[str, Any]],
-    retriever: RetrieverLike,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if not candidates:
-        return candidates, {
-            "hydrated_count": 0,
-            "unresolved_ids": [],
-            "missing_translation_ids": [],
-            "failure_count": 0,
-        }
-    hydration = retriever.enrich_documents(
-        [candidate["document_id"] for candidate in candidates]
+def _reference_matches(
+    expected: Mapping[str, Any], actual: RetrievalArtifactReference
+) -> bool:
+    """Compare immutable identity provenance, allowing a warm-hit flag change."""
+
+    stored_at = expected.get("stored_at")
+    if isinstance(stored_at, bool) or not isinstance(stored_at, (int, float)):
+        return False
+    return (
+        expected.get("object_key") == actual.object_key
+        and expected.get("request_digest") == actual.request_digest_hex
+        and expected.get("retriever_fingerprint") == actual.retriever_fingerprint_hex
+        and float(stored_at) == actual.stored_at
     )
-    hydrated_by_id = hydration.by_id()
+
+
+def _load_cached_query_result(
+    record: Mapping[str, Any],
+    *,
+    baseline: str,
+    plan_sha256: str,
+    retriever: RetrieverLike,
+    top_k: int,
+) -> RetrievalResult:
+    if record.get("status") != "success" or not _checkpoint_has_reference(record):
+        raise ValueError(
+            "successful baseline query checkpoint is missing a retrieval artifact reference"
+        )
+    query = record.get("query")
+    query_index = record.get("query_index")
+    if not isinstance(query, str) or isinstance(query_index, bool) or not isinstance(query_index, int):
+        raise ValueError("baseline query checkpoint has an invalid query identity")
+    cached = retriever.retrieve_cached(
+        query,
+        pipeline=PIPELINE,
+        top_k=top_k,
+        max_content_fallbacks=0,
+        fallback_on_hf_error=False,
+        query_context=_query_context(
+            baseline=baseline,
+            plan_sha256=plan_sha256,
+            query_index=query_index,
+        ),
+    )
+    if cached is None:
+        raise ValueError(
+            f"retrieval artifact is missing for topic={record.get('topic_id')} "
+            f"query_index={query_index}"
+        )
+    reference = cached.retrieval_artifact
+    if not isinstance(reference, RetrievalArtifactReference):
+        raise ValueError("cache-only retrieval is missing its artifact reference")
+    checkpoint_reference = record["retrieval_artifact"]
+    assert isinstance(checkpoint_reference, Mapping)
+    if not _reference_matches(checkpoint_reference, reference):
+        raise ValueError(
+            f"retrieval artifact reference mismatch for topic={record.get('topic_id')} "
+            f"query_index={query_index}"
+        )
+    if cached.query != query or cached.pipeline != PIPELINE:
+        raise ValueError("cache-only retrieval does not match the query checkpoint")
+    cached_hits = [hit.as_record() for hit in cached.search_result.hits[:top_k]]
+    if cached_hits != record.get("hits"):
+        raise ValueError("cache-only retrieval hits disagree with the query checkpoint")
+    if cached.hydration_failures or not cached.fully_hydrated:
+        raise ValueError("cache-only retrieval artifact is not completely hydrated")
+    return cached
+
+
+def _document_signature(document: Any) -> tuple[Any, ...]:
+    """Canonical fields used to detect contradictory facet hydration."""
+
+    return (
+        document.text,
+        document.english_text,
+        document.report_text,
+        document.language,
+        document.content_source,
+        document.url,
+        document.date,
+    )
+
+
+def _assemble_candidates(
+    candidates: list[dict[str, Any]],
+    cached_results: Sequence[RetrievalResult],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    documents_by_id: dict[str, Any] = {}
+    for result in cached_results:
+        for document in result.documents:
+            previous = documents_by_id.get(document.document_id)
+            if previous is not None and _document_signature(previous) != _document_signature(document):
+                raise ValueError(
+                    "canonical document text disagreement for document_id="
+                    f"{document.document_id} across cached facet retrievals"
+                )
+            documents_by_id[document.document_id] = document
+
+    selected_ids = {candidate["document_id"] for candidate in candidates}
+    missing_translation_ids = {
+        document_id
+        for result in cached_results
+        for document_id in result.missing_translation_ids
+        if document_id in selected_ids
+    }
     enriched: list[dict[str, Any]] = []
     for candidate in candidates:
-        document = hydrated_by_id.get(candidate["document_id"])
+        document = documents_by_id.get(candidate["document_id"])
+        if document is None:
+            raise ValueError(
+                "cache-only retrieval is missing hydrated document_id="
+                f"{candidate['document_id']}"
+            )
         enriched.append(
             {
                 **candidate,
-                "hydrated": document is not None,
-                "text": None if document is None else document.text,
-                "report_text": None if document is None else document.report_text,
-                "english_text": None if document is None else document.english_text,
-                "language": None if document is None else document.language,
-                "url": None if document is None else document.url,
-                "date": None if document is None else document.date,
+                "hydrated": document.hydrated,
+                "text": document.text,
+                "report_text": document.report_text,
+                "english_text": document.english_text,
+                "language": document.language,
+                "url": document.url,
+                "date": document.date,
             }
         )
     return enriched, {
-        "hydrated_count": len(hydration.documents),
-        "unresolved_ids": list(hydration.unresolved_ids),
-        "missing_translation_ids": list(hydration.missing_translation_ids),
-        "failure_count": len(hydration.failures),
+        "hydrated_count": len(enriched),
+        "unresolved_ids": [],
+        "missing_translation_ids": sorted(missing_translation_ids),
+        "failure_count": 0,
     }
 
 
@@ -418,11 +583,22 @@ def _topic_record(
     *,
     baseline: str,
     query_records: Sequence[dict[str, Any]],
+    plan_sha256: str,
     retriever: RetrieverLike,
     top_k: int,
     rrf_k: int,
 ) -> dict[str, Any]:
     successful = [record for record in query_records if record["status"] == "success"]
+    cached_results = [
+        _load_cached_query_result(
+            record,
+            baseline=baseline,
+            plan_sha256=plan_sha256,
+            retriever=retriever,
+            top_k=top_k,
+        )
+        for record in successful
+    ]
     ranked_lists = [
         tuple(SearchHit(**hit) for hit in record["hits"])
         for record in successful
@@ -440,7 +616,7 @@ def _topic_record(
     if baseline == "c":
         for candidate in candidates:
             candidate["score"] = None
-    candidates, hydration = _hydrate_candidates(candidates, retriever)
+    candidates, hydration = _assemble_candidates(candidates, cached_results)
     if not successful:
         status = "error"
     elif len(successful) == len(query_records):
@@ -758,11 +934,12 @@ def _run_query_baseline_locked(
                 plan,
                 baseline=baseline,
                 query_records=query_records,
+                plan_sha256=plan_sha256,
                 retriever=retriever,
                 top_k=top_k,
                 rrf_k=rrf_k,
             )
-        except (RagtimeError, HuggingFaceError, LocalCorpusError) as exc:
+        except (RagtimeError, HuggingFaceError, LocalCorpusError, ValueError) as exc:
             topic = _hydration_error_topic_record(
                 plan,
                 baseline=baseline,
@@ -799,6 +976,7 @@ def _run_query_baseline_locked(
                 and checkpoint.get("status") == "success"
                 and checkpoint.get("query") == query
                 and checkpoint.get("pipeline") == PIPELINE
+                and _checkpoint_has_reference(checkpoint)
             ):
                 continue
             attempt = int(checkpoint.get("attempt", 0)) + 1 if checkpoint else 1
@@ -809,6 +987,11 @@ def _run_query_baseline_locked(
                     query_index=query_index,
                     query=query,
                     attempt=attempt,
+                    query_context=_query_context(
+                        baseline=baseline,
+                        plan_sha256=plan_sha256,
+                        query_index=query_index,
+                    ),
                 )
             )
             pending_keys.add(key)
