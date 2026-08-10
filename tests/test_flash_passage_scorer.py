@@ -6,6 +6,7 @@ import inspect
 from io import StringIO
 import math
 import sys
+import threading
 import unittest
 from collections import UserDict
 from collections.abc import Callable
@@ -534,11 +535,99 @@ class StaticFlashWorkerTests(unittest.TestCase):
         worker.score(request)
         worker.score(request)
         self.assertEqual(len(loader.calls), 1)
-
         drifted = replace(policy, query_policy="drifted")
         with self.assertRaises(FlashScoringError):
             worker.score(_request_for_config(drifted))
         self.assertEqual(len(loader.calls), 1)
+
+    def test_concurrent_cold_start_binds_one_identity_before_prediction(self) -> None:
+        policy_a = LocalCrossEncoderConfig(revision="revision-a")
+        policy_b = replace(policy_a, revision="revision-b")
+        validated = threading.Barrier(2)
+        load_started = threading.Event()
+        release_load = threading.Event()
+        load_lock = threading.Lock()
+        loaded_revisions: list[object] = []
+        loaded_models: list[FakeModel] = []
+
+        def loader(
+            config: dict[str, object],
+        ) -> tuple[FakeModel, BatchEncodingTokenizer]:
+            with load_lock:
+                loaded_revisions.append(config["revision"])
+            model = FakeModel()
+            loaded_models.append(model)
+            load_started.set()
+            if not release_load.wait(timeout=2.0):
+                raise AssertionError("test loader was not released")
+            return model, BatchEncodingTokenizer()
+
+        worker = build_flash_worker(policy_a)(loader=loader)
+        original_validate = FlashPassageWorker._validate_request
+
+        def synchronized_validate(
+            cls: type[FlashPassageWorker], request: object
+        ) -> tuple[dict[str, object], str, str, list[tuple[bytes, str]]]:
+            result = original_validate(request)
+            try:
+                validated.wait(timeout=2.0)
+            except threading.BrokenBarrierError as error:
+                raise AssertionError("requests did not validate together") from error
+            return result
+
+        outcomes: list[tuple[str, object]] = []
+        outcomes_lock = threading.Lock()
+
+        def score(request: dict[str, object]) -> None:
+            try:
+                response = worker.score(request)
+            except Exception as error:
+                outcome = ("error", error)
+            else:
+                outcome = ("success", response)
+            with outcomes_lock:
+                outcomes.append(outcome)
+
+        with patch.object(
+            FlashPassageWorker,
+            "_validate_request",
+            classmethod(synchronized_validate),
+        ):
+            threads = [
+                threading.Thread(
+                    target=score,
+                    args=(_request_for_config(policy_a),),
+                ),
+                threading.Thread(
+                    target=score,
+                    args=(_request_for_config(policy_b),),
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+            self.assertTrue(load_started.wait(timeout=2.0))
+            release_load.set()
+            for thread in threads:
+                thread.join(timeout=2.0)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(loaded_revisions), 1)
+        self.assertEqual(
+            sum(outcome == "success" for outcome, _ in outcomes),
+            1,
+        )
+        self.assertEqual(
+            sum(outcome == "error" for outcome, _ in outcomes),
+            1,
+        )
+        self.assertEqual(sum(len(model.predict_calls) for model in loaded_models), 1)
+        successful_response = next(
+            response for outcome, response in outcomes if outcome == "success"
+        )
+        self.assertIn(
+            successful_response["scorer_fingerprint"],
+            {policy_a.fingerprint, policy_b.fingerprint},
+        )
 
     def test_falsey_callable_loader_is_used(self) -> None:
         policy = LocalCrossEncoderConfig()

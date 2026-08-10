@@ -216,6 +216,10 @@ class PassageChunker:
             f"langchain-text-splitters={_runtime_version('langchain-text-splitters')}",
             f"spacy={_runtime_version('spacy')}",
         )
+        pipeline_versions = tuple(
+            f"{pipeline}={_runtime_version(pipeline.replace('_', '-'))}"
+            for pipeline in _PIPELINES_BY_LANGUAGE.values()
+        )
         fingerprint_material = "|".join(
             (
                 "passage-chunker-v1",
@@ -225,6 +229,7 @@ class PassageChunker:
                 f"overlap-tokens={overlap_tokens}",
                 f"runtime={';'.join(versions)}",
                 f"pipelines={_PINNED_PIPELINE_MAPPING}",
+                f"pipeline-versions={';'.join(pipeline_versions)}",
             )
         )
         self._pair_length = pair_length
@@ -371,9 +376,9 @@ class PassageChunker:
                 raise PassageChunkingError(
                     f"{parent_name} splitter returned invalid start_index"
                 )
-            if start < 0:
-                if sentence_units is None:
-                    sentence_units = self._spacy_sentence_units(splitter, parent_text)
+            if sentence_units is None:
+                sentence_units = self._spacy_sentence_units(splitter, parent_text)
+            if sentence_units:
                 adapted = self._adapt_offset_from_sentence_units(
                     parent_text,
                     content,
@@ -381,11 +386,12 @@ class PassageChunker:
                     previous_start=previous_start,
                     previous_end=previous_end,
                 )
-                if adapted is None:
-                    raise PassageChunkingError(
-                        f"{parent_name} splitter returned invalid start_index"
-                    )
-                start = adapted.start_char
+                if adapted is not None:
+                    start = adapted.start_char
+            elif start < 0:
+                raise PassageChunkingError(
+                    f"{parent_name} splitter returned invalid start_index"
+                )
             end = start + len(content)
             if end > len(parent_text) or parent_text[start:end] != content:
                 raise PassageChunkingError(

@@ -297,3 +297,101 @@ class PassageChunkerTests(unittest.TestCase):
             len({(passage.start_char, passage.end_char) for passage in passages}),
             len(passages),
         )
+
+    def test_repeated_text_overlap_recovers_authoritative_intervals_and_coverage(
+        self,
+    ) -> None:
+        case = next(
+            case
+            for case in load_cases()
+            if case["name"] == "repeated_identical_sentences_overlap"
+        )
+        selected_text = str(case["selected_text"])
+        passages = self.chunk_case(case)
+
+        self.assert_exact_passages(
+            selected_text,
+            passages,
+            [tuple(span) for span in case["expected_spans"]],  # type: ignore[arg-type]
+        )
+        self.assertEqual(
+            [passage.text for passage in passages],
+            ["Repeat. Repeat. ", "Repeat. Repeat. ", "Repeat. Repeat. "],
+        )
+        self.assertEqual(len({passage.content_hash for passage in passages}), 1)
+        self.assertEqual(
+            len({(passage.start_char, passage.end_char) for passage in passages}),
+            len(passages),
+        )
+        overlaps = [
+            (
+                max(first.start_char, second.start_char),
+                min(first.end_char, second.end_char),
+            )
+            for first, second in zip(passages, passages[1:])
+        ]
+        self.assertEqual(overlaps, [(8, 16), (16, 24)])
+        self.assertTrue(all(start < end for start, end in overlaps))
+
+    def test_missing_pipeline_metadata_fails_without_source_text(self) -> None:
+        import trec_ragtime.passages as passages_module
+
+        versions = {
+            "langchain-text-splitters": "1.1.2",
+            "spacy": "3.8.0",
+            "en-core-web-sm": "3.8.0",
+            "es-core-news-sm": "3.8.0",
+            "ru-core-news-sm": "3.8.0",
+            "zh-core-web-sm": "3.8.0",
+        }
+        secret_text = "secret source text must not appear in metadata errors"
+
+        def version(distribution: str) -> str:
+            if distribution == "es-core-news-sm":
+                raise passages_module.importlib.metadata.PackageNotFoundError(
+                    distribution
+                )
+            return versions[distribution]
+
+        with patch.object(
+            passages_module.importlib.metadata,
+            "version",
+            side_effect=version,
+        ):
+            with self.assertRaises(PassageChunkingError) as context:
+                PassageChunker(FixturePairLength(load_cases()[0]), overlap_tokens=0)
+        self.assertIn("es-core-news-sm", str(context.exception))
+        self.assertNotIn(secret_text, str(context.exception))
+
+    def test_pipeline_distribution_version_rotates_chunker_fingerprint(self) -> None:
+        import trec_ragtime.passages as passages_module
+
+        base_versions = {
+            "langchain-text-splitters": "1.1.2",
+            "spacy": "3.8.0",
+            "en-core-web-sm": "3.8.0",
+            "es-core-news-sm": "3.8.0",
+            "ru-core-news-sm": "3.8.0",
+            "zh-core-web-sm": "3.8.0",
+        }
+
+        def versions_for(values: dict[str, str]):
+            return lambda distribution: values[distribution]
+
+        pair_length = FixturePairLength(load_cases()[0])
+        with patch.object(
+            passages_module.importlib.metadata,
+            "version",
+            side_effect=versions_for(base_versions),
+        ):
+            first = PassageChunker(pair_length, overlap_tokens=0)
+
+        changed_versions = base_versions | {"zh-core-web-sm": "3.8.1"}
+        with patch.object(
+            passages_module.importlib.metadata,
+            "version",
+            side_effect=versions_for(changed_versions),
+        ):
+            second = PassageChunker(pair_length, overlap_tokens=0)
+
+        self.assertNotEqual(first.fingerprint, second.fingerprint)

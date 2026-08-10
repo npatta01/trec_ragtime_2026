@@ -133,6 +133,28 @@
       ]
     },
     {
+      "name": "repeated_identical_sentences_overlap",
+      "document_id": "doc-repeat-overlap-001",
+      "canonical_text": "Repeat. Repeat. Repeat. Repeat. ",
+      "selected_text": "Repeat. Repeat. Repeat. Repeat. ",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 4,
+      "max_passage_length": 2,
+      "overlap_tokens": 1,
+      "expected_spans": [
+        [0, 16],
+        [8, 24],
+        [16, 32]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
       "name": "leading_trailing_whitespace",
       "document_id": "doc-whitespace-001",
       "canonical_text": "  One. Two.  ",

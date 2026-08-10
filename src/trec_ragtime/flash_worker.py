@@ -200,7 +200,7 @@ class FlashPassageWorker:
         if loader is not None and not callable(loader):
             raise self._error("loader must be callable")
         self._loader = loader if loader is not None else self._default_loader
-        self._load_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._model: object | None = None
         self._tokenizer: object | None = None
         self._model_config: dict[str, object] | None = None
@@ -254,18 +254,28 @@ class FlashPassageWorker:
             raise ValueError("loaded model did not expose a callable tokenizer")
         return model, tokenizer
 
-    def _ensure_loaded(self, config: dict[str, object]) -> tuple[object, object]:
-        if self._model is not None and self._tokenizer is not None:
-            return self._model, self._tokenizer
-        with self._load_lock:
-            if self._model is None or self._tokenizer is None:
+    def _ensure_loaded(
+        self,
+        config: dict[str, object],
+        fingerprint: str,
+    ) -> tuple[object, object]:
+        with self._state_lock:
+            if self._fingerprint is not None:
+                if self._fingerprint != fingerprint or self._model_config != config:
+                    raise self._error("worker scorer fingerprint drift")
+            else:
                 try:
                     model, tokenizer = self._unpack_loader_result(self._loader(config))
                 except Exception as error:
                     raise self._error("worker model loading failed") from error
+                self._model_config = config
+                self._fingerprint = fingerprint
                 self._model = model
                 self._tokenizer = tokenizer
-        return self._model, self._tokenizer
+
+            if self._model is None or self._tokenizer is None:
+                raise self._error("worker model state is incomplete")
+            return self._model, self._tokenizer
 
     @classmethod
     def _token_length(cls, encoded: object) -> int:
@@ -477,11 +487,7 @@ class FlashPassageWorker:
     def score(self, request: object) -> dict[str, object]:
         try:
             config, fingerprint, query, rows = self._validate_request(request)
-            if self._fingerprint is not None and self._fingerprint != fingerprint:
-                raise self._error("worker scorer fingerprint drift")
-            model, tokenizer = self._ensure_loaded(config)
-            self._model_config = config
-            self._fingerprint = fingerprint
+            model, tokenizer = self._ensure_loaded(config, fingerprint)
             scores = self._score_rows(config, query, rows, model, tokenizer)
             return {
                 "schema_version": self._WIRE_SCHEMA_VERSION,

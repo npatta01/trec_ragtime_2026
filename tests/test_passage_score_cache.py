@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import subprocess
 import sys
+import threading
 import unittest
 from collections.abc import Callable, Mapping, Sequence
 
@@ -102,6 +103,24 @@ class RecordingScorer:
             passage.content_hash: float(index + 1)
             for index, passage in enumerate(passages)
         }
+
+
+class BarrierScorer(RecordingScorer):
+    def __init__(
+        self,
+        barrier: threading.Barrier,
+        response: Mapping[bytes, object],
+    ) -> None:
+        super().__init__(response=response)
+        self._barrier = barrier
+
+    def score(self, query: str, passages: Sequence[Passage]) -> Mapping[bytes, object]:
+        response = super().score(query, passages)
+        try:
+            self._barrier.wait(timeout=2.0)
+        except threading.BrokenBarrierError:
+            pass
+        return response
 
 
 def _passage(
@@ -276,6 +295,72 @@ print(encode_score_map(scores).hex())
                 third.content_hash: 1.0,
             },
         )
+
+    def test_concurrent_extensions_keep_complete_union_and_warm_reads_do_not_rescore(
+        self,
+    ) -> None:
+        store = FakeArtifactStore()
+        h0 = _passage("h0", document_id="h0")
+        h1 = _passage("h1", document_id="h1")
+        h2 = _passage("h2", document_id="h2")
+        _cache(
+            store,
+            RecordingScorer(response={h0.content_hash: 10.0}),
+        ).score("query", (h0,))
+        store.write_calls.clear()
+
+        scorer_barrier = threading.Barrier(2)
+        cache_a = _cache(
+            store,
+            BarrierScorer(scorer_barrier, {h1.content_hash: 11.0}),
+        )
+        cache_b = _cache(
+            store,
+            BarrierScorer(scorer_barrier, {h2.content_hash: 12.0}),
+        )
+        start_barrier = threading.Barrier(3)
+        errors: list[BaseException] = []
+
+        def extend(cache: PassageScoreCache, passage: Passage) -> None:
+            try:
+                start_barrier.wait(timeout=2.0)
+                cache.score("query", (passage,))
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=extend, args=(cache_a, h1)),
+            threading.Thread(target=extend, args=(cache_b, h2)),
+        ]
+        for thread in threads:
+            thread.start()
+        start_barrier.wait(timeout=2.0)
+        for thread in threads:
+            thread.join(timeout=3.0)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        key = cache_a.object_key("query")
+        self.assertEqual(
+            decode_score_map(store.objects[key]),
+            {
+                h0.content_hash: 10.0,
+                h1.content_hash: 11.0,
+                h2.content_hash: 12.0,
+            },
+        )
+
+        warm_scorer = RecordingScorer(failure=AssertionError("warm hit rescored"))
+        warm_cache = _cache(store, warm_scorer)
+        self.assertEqual(
+            warm_cache.score("query", (h0, h1, h2)),
+            {
+                h0.content_hash: 10.0,
+                h1.content_hash: 11.0,
+                h2.content_hash: 12.0,
+            },
+        )
+        self.assertEqual(warm_scorer.calls, [])
 
     def test_cached_passage_scorer_delegates_to_one_cache(self) -> None:
         store = FakeArtifactStore()

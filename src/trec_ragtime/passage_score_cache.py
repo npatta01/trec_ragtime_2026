@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import numbers
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 CACHE_SCHEMA_VERSION = 1
 OBJECT_ROOT = "passage-scores/v1"
 _HASH_LENGTH = 32
+_SCORE_TRANSACTION_LOCK = threading.Lock()
 
 
 class PassageScoreArtifactValidationError(ValueError):
@@ -185,7 +187,12 @@ def _store_validation_exception(
 
 
 class PassageScoreCache:
-    """Cache-aside adapter for complete per-query passage score maps."""
+    """Cache-aside adapter for complete per-query passage score maps.
+
+    All cache instances share a process-local lock around the complete
+    read/score/merge/write transaction. A future cross-process
+    ``ArtifactStoreLike`` must provide its own atomic update operation.
+    """
 
     __slots__ = (
         "_store",
@@ -277,26 +284,28 @@ class PassageScoreCache:
             return {}
 
         key = self.object_key(query)
-        stored = self._store.read_validated(key, self._decoder)
-        prior_scores = {} if stored is None else _normalize_score_map(stored)
-        missing = tuple(
-            passage
-            for content_hash, passage in requested
-            if content_hash not in prior_scores
-        )
+        with _SCORE_TRANSACTION_LOCK:
+            stored = self._store.read_validated(key, self._decoder)
+            prior_scores = {} if stored is None else _normalize_score_map(stored)
+            missing = tuple(
+                passage
+                for content_hash, passage in requested
+                if content_hash not in prior_scores
+            )
 
-        if missing:
-            response = self._scorer.score(query, missing)
-            new_scores = validate_passage_scores(missing, response)
-            merged = dict(prior_scores)
-            merged.update(new_scores)
-            payload = encode_score_map(merged)
-            self._store.write(key, payload)
-            prior_scores = decode_score_map(payload)
+            if missing:
+                response = self._scorer.score(query, missing)
+                new_scores = validate_passage_scores(missing, response)
+                merged = dict(prior_scores)
+                merged.update(new_scores)
+                payload = encode_score_map(merged)
+                self._store.write(key, payload)
+                prior_scores = decode_score_map(payload)
 
-        return {
-            content_hash: prior_scores[content_hash] for content_hash, _ in requested
-        }
+            return {
+                content_hash: prior_scores[content_hash]
+                for content_hash, _ in requested
+            }
 
 
 class CachedPassageScorer:
