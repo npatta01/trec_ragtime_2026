@@ -2,7 +2,9 @@
 
 This repository is a small working companion for TREC RAGTIME 2026. It combines
 an at-a-glance track reference with a runnable notebook that previews the
-RAGTIME2 data without downloading the full collection.
+RAGTIME2 data without downloading the full collection. Passage reranking starts
+with the local scorer; the optional Flash path is only an explicit transport
+seam.
 
 ## Start Here
 
@@ -80,98 +82,100 @@ the token. The plaintext `.env` file is ignored by Git.
 
 ## Passage Reranking
 
-Passage reranking is a downstream, local-first layer over an existing
-`RetrievalResult`. The normal English report path selects each document's
-`report_text`: verified English machine translation for Spanish, Russian, and
-Chinese source documents, or the canonical text for an English source. Keep
-`representation="report_text"` explicit in report runs, then repeat with
-`representation="canonical"` when comparing multilingual source evidence.
-Documents that are unresolved or lack a report translation remain in the
-result with an explicit status; they are not silently dropped.
+Passage reranking is a local-first layer over an existing `RetrievalResult`.
+The normal English report path selects each document's `report_text`: verified
+English translation for Spanish, Russian, and Chinese source documents, or the
+canonical text for an English source. `representation="canonical"` selects the
+original-language source instead. Missing report translations and unresolved
+documents remain in the result with explicit statuses.
 
-The pinned local model is
-`BAAI/bge-reranker-v2-m3` at revision
-`953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`, using raw cross-encoder logits.
-The separately fingerprinted tokenizer name and revision are pinned to that
-same checkpoint and revision.
-Passage preparation uses the maintained LangChain `CharacterTextSplitter` and
-the pinned spaCy 3.8.0 pipelines (`en_core_web_sm`, `es_core_news_sm`,
-`ru_core_news_sm`, and `zh_core_web_sm`). Paragraphs and adjacent sentences
-are packed without reordering or whitespace normalization. The maintained
-`RecursiveCharacterTextSplitter` is used only when one individual sentence is
-over the model passage budget. Every passage retains exact Python character
-offsets, canonical/selected-representation SHA-256 hashes, content hashes,
-and stable lineage IDs; schema version 1 uses zero overlap.
-
-The primary local path is complete and lazy: pinned tokenizer assets load when
-`ChunkerConfig` resolves the query-specific passage budget, while model weights
-load only on the first score call. The snippet below is a continuation from the hydrated
-`RetrievalResult` created in
-[Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration);
-`retrieval` is that existing value, so this is not a standalone script:
+The pinned local model is `BAAI/bge-reranker-v2-m3` at revision
+`953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`, with the tokenizer name and revision
+pinned to the same checkpoint. The tokenizer-only
+`CrossEncoderPairLengthFunction` captures the retrieval query and loads no
+model weights. `LocalCrossEncoderScorer` loads model weights lazily, on the
+first score call, and returns raw cross-encoder logits.
+The supported local flow is below. `retrieval` is an existing hydrated
+`RetrievalResult`, such as the value returned by
+[Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration).
 
 ```python
 from trec_ragtime import (
-    ChunkerConfig,
+    CachedPassageScorer,
     CrossEncoderPairLengthFunction,
-    LangChainPassageChunker,
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
+    PassageChunker,
+    PassageScoreCache,
     rerank_retrieval,
 )
 
 policy = LocalCrossEncoderConfig(device="cpu")
 pair_length = CrossEncoderPairLengthFunction(policy, retrieval.query)
-chunker = LangChainPassageChunker(
-    ChunkerConfig(
-        chunk_size=policy.max_length,
-        length_function=pair_length,
-    )
-)
+chunker = PassageChunker(pair_length, overlap_tokens=64)
 scorer = LocalCrossEncoderScorer(policy)
+
+# Optional complete per-query cache. `store` is an ArtifactStoreLike supplied
+# by the caller; this project does not provide a concrete ArtifactStore.
+cache = PassageScoreCache(
+    store,
+    scorer,
+    chunker_fingerprint=chunker.fingerprint,
+    representation="report_text",
+    artifact_validation_error=ValueError,
+)
+scorer = CachedPassageScorer(cache)
+
 report_result = rerank_retrieval(
     retrieval,
-    topic_id="topic-1",
     chunker=chunker,
     scorer=scorer,
     representation="report_text",
 )
 ```
 
-`ChunkerConfig` automatically uses the pair-length callable's stable
-fingerprint, passage-only tokenizer length, and query/special-token-adjusted
-packing budget. It still validates every emitted chunk with the exact complete
-pair length. Keep this tokenizer-aware policy aligned with the scorer; a
-character-counting `len` budget can admit passages that overflow once the
-formatted query and tokenizer special tokens are included.
+`PassageChunker` uses the pinned language-specific spaCy pipelines through
+LangChain's sentence splitter. It preserves exact Python-character offsets,
+exact UTF-8 SHA-256 content hashes, and complete selected-text coverage. Normal
+overlap contains complete sentence units only; it never splits a sentence to
+manufacture overlap. If one sentence exceeds the full pair budget, only that
+sentence is passed to `RecursiveCharacterTextSplitter` (RCTS), and every
+fragment is rechecked against the exact pair ceiling. Keep the pair-length
+callable aligned with the scorer: a character count can admit a passage that
+overflows after query and special tokens are included.
 
 Use `device="cuda"` for CUDA PyTorch, or the user-facing `device="rocm"`
 alias on ROCm builds; `rocm` is normalized to PyTorch's `cuda` device. The
-scorer fingerprint includes result-affecting model, tokenizer, device,
-precision, batching, query-format, and length policy, so changing one of
-these settings isolates its score cache.
+scorer and chunker fingerprints include result-affecting model, tokenizer,
+device, precision, batching, query format, query policy, and pair-length
+settings. Changing one of these settings isolates its score cache.
 
-`PassageScoreCache` stores a complete per-query `dict[bytes, float]` union
-under a deterministic MessagePack envelope. It uses the issue #12
-`ArtifactStoreLike` interface (`read`, `read_validated`, `write`, and
-`evict_local`) and an injected artifact-validation exception factory. This
-branch does not provide or import a concrete ArtifactStore. A cache hit returns
-only the requested passage hashes, while overlapping requests merge into one
-complete object; failed or partial scoring is never written.
+`PassageScoreCache` stores one complete validated `dict[bytes, float]` per
+query. It uses the future `ArtifactStoreLike` seam with `read`,
+`read_validated`, `write`, and `evict_local`; there is no concrete store in
+this refactor. Cache reads return the requested hashes from a complete union,
+and a successful miss merges new scores into that union. Partial or failed
+scoring is never written.
+
+Reranking aggregates each document by its maximum passage score. Evidence is
+deduplicated by positional `(document_id, start_char, end_char)` identity, so
+identical text at distinct offsets remains distinct evidence while sharing a
+safe content-hash score. Ordering is deterministic by descending score,
+organizer rank, and document ID; evidence is ordered by source offsets.
 
 Flash remains an optional transport for the same `PassageScorer` contract; the
 local path above is the primary complete execution path. Install Flash
-separately with `uv sync --extra runpod`. One explicit policy can describe both
-an already-provisioned endpoint caller and a possible later worker definition:
+separately with `uv sync --extra runpod`. Bounded payload size, batch size,
+concurrency, request timeout, worker count, and idle timeout remain explicit.
+The adapter accepts the same complete score map, and the static worker accepts
+mapping-compatible Transformers `BatchEncoding` values. An existing endpoint
+caller and a later worker definition use the same pinned model policy:
 
 ```python
 from trec_ragtime import (
-    DEFAULT_FLASH_GPU,
-    DEFAULT_FLASH_WORKER_NAME,
-    ChunkerConfig,
     CrossEncoderPairLengthFunction,
     FlashEndpointBatchRunner,
-    LangChainPassageChunker,
+    PassageChunker,
     RunpodFlashPassageScorer,
     RunpodFlashConfig,
     build_flash_worker,
@@ -186,78 +190,64 @@ flash_policy = RunpodFlashConfig(
     max_payload_bytes=9_000_000,
     concurrency=4,
     request_timeout=60.0,
-    worker_name=DEFAULT_FLASH_WORKER_NAME,
-    gpu=DEFAULT_FLASH_GPU,
     workers=1,
     idle_timeout=300.0,
 )
 
 remote_policy = flash_policy.effective_model_config
 remote_pair_length = CrossEncoderPairLengthFunction(remote_policy, retrieval.query)
-remote_chunker = LangChainPassageChunker(
-    ChunkerConfig(
-        chunk_size=remote_policy.max_length,
-        length_function=remote_pair_length,
-    )
-)
+remote_chunker = PassageChunker(remote_pair_length, overlap_tokens=64)
 
 # Caller and scorer for an endpoint that already exists.
 with FlashEndpointBatchRunner(flash_policy) as endpoint_runner:
     with RunpodFlashPassageScorer(flash_policy, endpoint_runner) as flash_scorer:
         flash_result = rerank_retrieval(
             retrieval,
-            topic_id="topic-1",
             chunker=remote_chunker,
             scorer=flash_scorer,
             representation="report_text",
         )
 
-# Definition seam for a later, explicit `flash dev` workflow.
+# Definition seam for a later, explicit worker-definition workflow.
 from runpod_flash import Endpoint
 
-FlashPassageWorker = build_flash_worker(
+worker_definition = build_flash_worker(
     flash_policy,
     endpoint_factory=Endpoint,
 )
 ```
 
-`FlashEndpointBatchRunner` constructs `Endpoint(id=...)`, submits with
-`run()`, and waits with `job.wait()`. The Endpoint-style `build_flash_worker()`
-decoration carries `worker_name`, resolved `gpu`, `workers`, `idle_timeout`,
-and pinned runtime dependencies into the class-style warm worker definition.
-The explicit `device="cuda"` override produces a distinct immutable effective
-model policy and scorer fingerprint from the local CPU policy; deriving the
-remote pair-length chunker from it also isolates the chunker and score-cache
-identity. Both endpoint objects use context managers for deterministic cleanup.
-Building the worker definition does not deploy or provision it. Payload size,
-batching, concurrency, and request timeout remain explicit bounded caller
-controls; using `flash dev` remains a separate deferred paid smoke gate.
+`FlashEndpointBatchRunner` constructs an `Endpoint(id=...)`, submits with
+`run()`, and waits with `job.wait()`. `build_flash_worker` only returns the
+static worker or applies the explicit endpoint decorator with pinned
+dependencies. Building a worker definition does not deploy, provision, or
+make a paid request. No paid or deployment action is authorized by this
+refactor.
 
 Offline reranking verification starts after decrypting `.env` and makes no
 organizer, Hugging Face, Runpod, or model-download calls:
 
 ```bash
-sops decrypt --output .env config/secrets.sops.env
-uv run python -m unittest tests.test_passage_reranking_integration -v
-uv run python -m unittest \
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest tests.test_passage_reranking_integration -v
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest \
   tests.test_passages \
   tests.test_passage_scoring \
   tests.test_passage_score_cache \
   tests.test_reranking \
   tests.test_flash_passage_scorer \
   tests.test_passage_reranking_integration -v
-uv run python scripts/benchmark_passage_chunking.py
-uv run python -m unittest discover -s tests -v
-uv lock --check
-git diff --check
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python scripts/benchmark_passage_chunking.py
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest discover -s tests -v
 ```
 
-The following acceptance gates remain deferred: one real local batch with the
-pinned model and its large weight download; organizer-only versus canonical
-versus `report_text` ranking comparison; an ephemeral paid `flash dev`
-real-worker parity smoke; and L2/cross-machine score reuse after the issue #12
-ArtifactStore lands. Offline fakes and an in-memory Flash wire runner do not
-satisfy those gates.
+Offline fakes and an in-memory Flash wire runner intentionally replace all
+organizer, Dataset Viewer, endpoint, deployment, and model-weight calls in
+these checks. A real local model batch and live endpoint behavior remain
+explicit external acceptance gates.
 
 ## Hosted Retrieval Model
 

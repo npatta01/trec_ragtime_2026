@@ -7,29 +7,53 @@ from typing import Any
 import trec_ragtime
 from trec_ragtime import (
     CachedPassageScorer,
-    ChunkerConfig,
     CrossEncoderPairLengthFunction,
-    DEFAULT_FLASH_GPU,
-    DEFAULT_FLASH_WORKER_NAME,
-    DEFAULT_TOKENIZER_NAME,
-    DEFAULT_TOKENIZER_REVISION,
-    LangChainPassageChunker,
+    FlashEndpointBatchRunner,
+    FlashPassageWorker,
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
+    Passage,
+    PassageChunker,
+    PassageChunkingError,
+    PassageEvidence,
     PassageScoreCache,
-    PipelineResult,
-    RetrievalResult,
-    RetrievedDocument,
+    RerankedDocument,
+    RerankingResult,
     RunpodFlashConfig,
     RunpodFlashPassageScorer,
-    SearchHit,
-    decode_flash_request,
-    encode_flash_response,
+    build_flash_worker,
     rerank_retrieval,
+    sha256_bytes,
+    validate_passages,
 )
+from trec_ragtime.flash_passage_scorer import decode_flash_request, encode_flash_response
+from trec_ragtime.models import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
 
 
 _INTEGRATION_QUERY = "shared evidence and practical outcomes"
+_EXPECTED_PUBLIC_SURFACE = {
+    "Boundary",
+    "Passage",
+    "PassageChunker",
+    "PassageChunkingError",
+    "Representation",
+    "sha256_bytes",
+    "validate_passages",
+    "CrossEncoderPairLengthFunction",
+    "LocalCrossEncoderConfig",
+    "LocalCrossEncoderScorer",
+    "CachedPassageScorer",
+    "PassageScoreCache",
+    "PassageEvidence",
+    "RerankedDocument",
+    "RerankingResult",
+    "rerank_retrieval",
+    "FlashEndpointBatchRunner",
+    "RunpodFlashConfig",
+    "RunpodFlashPassageScorer",
+    "FlashPassageWorker",
+    "build_flash_worker",
+}
 
 
 def _fake_score(text: str) -> float:
@@ -37,7 +61,7 @@ def _fake_score(text: str) -> float:
 
 
 class ArtifactStoreFake:
-    """Strict test-local structural fake for the future ArtifactStoreLike."""
+    """Strict test-local structural fake for the future ArtifactStoreLike seam."""
 
     class ArtifactValidationError(Exception):
         pass
@@ -101,8 +125,6 @@ class FakeTokenizer:
     def pair_token_count(cls, query: str, passage: str) -> int:
         if query != _INTEGRATION_QUERY:
             raise AssertionError(f"unexpected pair query: {query!r}")
-        if not passage:
-            return 8
         return (
             cls.QUERY_NO_SPECIAL_TOKENS
             + cls.passage_no_special_token_count(passage)
@@ -292,18 +314,13 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
         policy: LocalCrossEncoderConfig,
         query: str,
         tokenizer: FakeTokenizer,
-    ) -> tuple[LangChainPassageChunker, CrossEncoderPairLengthFunction]:
+    ) -> tuple[PassageChunker, CrossEncoderPairLengthFunction]:
         pair_length = CrossEncoderPairLengthFunction(
             policy,
             query,
             tokenizer_loader=lambda _: tokenizer,
         )
-        return LangChainPassageChunker(
-            ChunkerConfig(
-                chunk_size=policy.max_length,
-                length_function=pair_length,
-            )
-        ), pair_length
+        return PassageChunker(pair_length, overlap_tokens=64), pair_length
 
     def _local_scorer(
         self,
@@ -316,196 +333,185 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             loader=lambda _: (model, tokenizer),
         ), model
 
-    def test_public_reranking_exports_exist_once(self) -> None:
+    def test_public_surface_has_no_deleted_compatibility_symbols(self) -> None:
         expected = {
-            "CrossEncoderPairLengthFunction": CrossEncoderPairLengthFunction,
-            "DEFAULT_TOKENIZER_NAME": DEFAULT_TOKENIZER_NAME,
-            "DEFAULT_TOKENIZER_REVISION": DEFAULT_TOKENIZER_REVISION,
-            "DEFAULT_FLASH_GPU": DEFAULT_FLASH_GPU,
-            "DEFAULT_FLASH_WORKER_NAME": DEFAULT_FLASH_WORKER_NAME,
+            "Passage",
+            "PassageChunker",
+            "CrossEncoderPairLengthFunction",
+            "LocalCrossEncoderConfig",
+            "LocalCrossEncoderScorer",
+            "PassageScoreCache",
+            "CachedPassageScorer",
+            "PassageEvidence",
+            "RerankedDocument",
+            "RerankingResult",
+            "rerank_retrieval",
+            "RunpodFlashPassageScorer",
+            "FlashPassageWorker",
         }
         self.assertEqual(len(trec_ragtime.__all__), len(set(trec_ragtime.__all__)))
-        self.assertTrue(expected.keys() <= set(trec_ragtime.__all__))
-        self.assertEqual(
-            {name: getattr(trec_ragtime, name) for name in expected},
-            expected,
-        )
+        self.assertTrue(expected <= set(trec_ragtime.__all__))
+        self.assertEqual(set(trec_ragtime.__all__), _EXPECTED_PUBLIC_SURFACE)
+        self.assertFalse(hasattr(trec_ragtime, "write_reranking_artifact"))
+        self.assertFalse(hasattr(trec_ragtime, "ChunkerConfig"))
+        self.assertFalse(hasattr(trec_ragtime, "LangChainPassageChunker"))
+        self.assertFalse(hasattr(trec_ragtime, "RerankedPassage"))
+        self.assertFalse(hasattr(trec_ragtime, "PassageValidationError"))
 
-    def test_public_local_workflow_uses_real_chunking_cache_and_warm_reuse(
-        self,
-    ) -> None:
-        self.assertEqual(
-            {
-                name
-                for name in ("read", "read_validated", "write", "evict_local")
-                if callable(getattr(ArtifactStoreFake, name, None))
-            },
-            {"read", "read_validated", "write", "evict_local"},
-        )
+    def test_offline_multilingual_reranking_cache_and_flash_parity(self) -> None:
         retrieval = _retrieval_fixture()
         policy = self._policy()
-        tokenizer = FakeTokenizer()
-        chunker, pair_length = self._chunker(policy, retrieval.query, tokenizer)
-        local, model = self._local_scorer(policy, tokenizer)
-        self.assertEqual(
-            chunker.config.resolved_length_function_fingerprint,
-            pair_length.fingerprint,
+        report_tokenizer = FakeTokenizer()
+        chunker, pair_length = self._chunker(
+            policy,
+            retrieval.query,
+            report_tokenizer,
         )
+        local, model = self._local_scorer(policy, report_tokenizer)
         store = ArtifactStoreFake()
         cache = PassageScoreCache(
             store,
             local,
-            chunker.fingerprint,
-            "report_text",
-            ArtifactStoreFake.ArtifactValidationError,
+            chunker_fingerprint=chunker.fingerprint,
+            representation="report_text",
+            artifact_validation_error=ArtifactStoreFake.ArtifactValidationError,
         )
-        cached = CachedPassageScorer(local, cache)
 
         first = rerank_retrieval(
             retrieval,
-            topic_id="topic-integration",
             chunker=chunker,
-            scorer=cached,
+            scorer=CachedPassageScorer(cache),
             representation="report_text",
         )
-        predict_calls_after_first = model.predict_calls
-        self.assertGreater(predict_calls_after_first, 0)
-        writes_after_first = len(store.write_calls)
+        model_calls = model.predict_calls
+        write_calls = len(store.write_calls)
         second = rerank_retrieval(
             retrieval,
-            topic_id="topic-integration",
             chunker=chunker,
-            scorer=cached,
+            scorer=CachedPassageScorer(cache),
             representation="report_text",
         )
 
         self.assertEqual(first, second)
-        self.assertEqual(model.predict_calls, predict_calls_after_first)
-        self.assertEqual(first.status_counts["scored"], 4)
-        self.assertEqual(first.status_counts["missing_representation"], 1)
-        self.assertEqual(first.status_counts["unresolved"], 1)
-        expected_statuses = {
-            "eng-1": "scored",
-            "spa-1": "scored",
-            "rus-1": "scored",
-            "zho-1": "scored",
-            "missing-translation": "missing_representation",
-            "unresolved": "unresolved",
-        }
-        self.assertEqual(
-            {document.document_id: document.status for document in first.documents},
-            expected_statuses,
+        self.assertGreater(model_calls, 0)
+        self.assertEqual(model.predict_calls, model_calls)
+        self.assertEqual(len(store.write_calls), write_calls)
+        self.assertEqual(first.query, retrieval.query)
+        self.assertEqual(first.documents[-1].status, "unresolved")
+        self.assertIn(
+            "missing-translation",
+            {row.document.document_id for row in first.documents},
         )
         self.assertEqual(
-            {document.document_id: document.status for document in second.documents},
-            expected_statuses,
-        )
-        self.assertEqual(len(store.write_calls), writes_after_first)
-        self.assertEqual(writes_after_first, 1)
-        self.assertTrue(
-            all(
-                document.selected_text
-                for document in first.documents
-                if document.status == "scored"
-            )
+            {
+                row.document.document_id: row.status
+                for row in first.documents
+            },
+            {
+                "eng-1": "scored",
+                "spa-1": "scored",
+                "rus-1": "scored",
+                "zho-1": "scored",
+                "missing-translation": "missing_representation",
+                "unresolved": "unresolved",
+            },
         )
         self.assertTrue(
             all(
-                document.language == "eng"
-                for document in first.documents
-                if document.status == "scored"
+                row.status == "scored" or not row.evidence
+                for row in first.documents
             )
-        )
-        self.assertEqual(
-            [
-                document.document_id
-                for document in first.documents
-                if document.status == "scored"
-            ],
-            [
-                document.document_id
-                for document in second.documents
-                if document.status == "scored"
-            ],
         )
 
-    def test_canonical_multilingual_and_flash_wire_fake_have_identical_rankings(
-        self,
-    ) -> None:
-        retrieval = _retrieval_fixture()
-        policy = self._policy()
-        tokenizer = FakeTokenizer()
-        chunker, _ = self._chunker(policy, retrieval.query, tokenizer)
-        local, _ = self._local_scorer(policy, tokenizer)
-        local_store = ArtifactStoreFake()
-        local_cache = PassageScoreCache(
-            local_store,
-            local,
-            chunker.fingerprint,
-            "canonical",
-            ArtifactStoreFake.ArtifactValidationError,
+        for row in first.documents:
+            if row.status != "scored":
+                continue
+            selected_text = row.document.report_text
+            self.assertIsNotNone(selected_text)
+            assert selected_text is not None
+            passages = chunker.chunk(
+                document_id=row.document.document_id,
+                canonical_text=row.document.text or "",
+                selected_text=selected_text,
+                representation="report_text",
+                language="eng",
+            )
+            validate_passages(selected_text, passages)
+            self.assertEqual(
+                [
+                    (evidence.start_char, evidence.end_char, evidence.content_hash)
+                    for evidence in row.evidence
+                ],
+                [
+                    (passage.start_char, passage.end_char, passage.content_hash)
+                    for passage in passages
+                ],
+            )
+            for evidence in row.evidence:
+                exact_text = selected_text[evidence.start_char : evidence.end_char]
+                self.assertEqual(evidence.content_hash, sha256_bytes(exact_text))
+
+        canonical_tokenizer = FakeTokenizer()
+        canonical_chunker, _ = self._chunker(
+            policy,
+            retrieval.query,
+            canonical_tokenizer,
         )
-        local_cached = CachedPassageScorer(local, local_cache)
-        local_result = rerank_retrieval(
+        canonical_local, _ = self._local_scorer(policy, canonical_tokenizer)
+        canonical_result = rerank_retrieval(
             retrieval,
-            topic_id="topic-canonical",
-            chunker=chunker,
-            scorer=local_cached,
+            chunker=canonical_chunker,
+            scorer=canonical_local,
             representation="canonical",
         )
 
-        config = local.config
-        remote = RunpodFlashPassageScorer(
-            RunpodFlashConfig(endpoint_id="offline-fake", model_config=config),
+        flash = RunpodFlashPassageScorer(
+            RunpodFlashConfig(endpoint_id="offline-fake", model_config=policy),
             InMemoryFlashWireRunner(),
         )
-        self.addCleanup(remote.close)
-        remote_result = rerank_retrieval(
+        self.addCleanup(flash.close)
+        flash_result = rerank_retrieval(
             retrieval,
-            topic_id="topic-canonical",
-            chunker=chunker,
-            scorer=remote,
+            chunker=canonical_chunker,
+            scorer=flash,
             representation="canonical",
         )
-
         self.assertEqual(
             [
-                (document.document_id, document.status)
-                for document in local_result.documents
+                (row.document.document_id, row.status, row.score)
+                for row in canonical_result.documents
             ],
             [
-                (document.document_id, document.status)
-                for document in remote_result.documents
+                (row.document.document_id, row.status, row.score)
+                for row in flash_result.documents
             ],
         )
         self.assertEqual(
-            [document.score for document in local_result.documents],
-            [document.score for document in remote_result.documents],
-        )
-        self.assertEqual(
-            [document.winning_content_hash for document in local_result.documents],
-            [document.winning_content_hash for document in remote_result.documents],
-        )
-        self.assertEqual(local_result.status_counts["unresolved"], 1)
-        self.assertEqual(local_result.status_counts["missing_representation"], 0)
-        self.assertEqual(
-            [document.representation for document in local_result.documents],
-            ["canonical"] * len(local_result.documents),
+            [
+                tuple(
+                    (evidence.start_char, evidence.end_char, evidence.content_hash)
+                    for evidence in row.evidence
+                )
+                for row in canonical_result.documents
+            ],
+            [
+                tuple(
+                    (evidence.start_char, evidence.end_char, evidence.content_hash)
+                    for evidence in row.evidence
+                )
+                for row in flash_result.documents
+            ],
         )
 
-    def test_token_dense_cjk_is_split_to_the_shared_pair_budget_before_scoring(
-        self,
-    ) -> None:
+    def test_contiguous_cjk_stays_within_exact_pair_budget(self) -> None:
         retrieval = _dense_cjk_retrieval_fixture()
-        selected_text = retrieval.documents[0].text
-        self.assertIsNotNone(selected_text)
-        assert selected_text is not None
         policy = self._policy()
         tokenizer = FakeTokenizer()
         chunker, pair_length = self._chunker(policy, retrieval.query, tokenizer)
-        local, model = self._local_scorer(policy, tokenizer)
+        selected_text = retrieval.documents[0].text
+        self.assertIsNotNone(selected_text)
+        assert selected_text is not None
 
-        self.assertLessEqual(len(selected_text), policy.max_length)
         self.assertEqual(pair_length(selected_text), 513)
         self.assertEqual(pair_length.passage_length_function(selected_text), 503)
         self.assertEqual(pair_length.max_passage_length, 502)
@@ -516,17 +522,19 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             representation="canonical",
             language="zho",
         )
+        validate_passages(selected_text, passages)
         self.assertEqual(
             [(passage.start_char, passage.end_char) for passage in passages],
             [(0, 251), (251, 502)],
         )
         self.assertEqual("".join(passage.text for passage in passages), selected_text)
-        self.assertTrue(
-            all(pair_length(passage.text) <= policy.max_length for passage in passages)
+        self.assertEqual(
+            [passage.boundary for passage in passages],
+            ["oversized_sentence", "oversized_sentence"],
         )
         self.assertTrue(
             all(
-                passage.boundary == "oversized_sentence_fallback"
+                pair_length(passage.text) <= policy.max_length
                 for passage in passages
             )
         )
@@ -539,62 +547,6 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             tokenizer.calls,
         )
         self.assertEqual(tokenizer.special_token_calls, [True])
-
-        store = ArtifactStoreFake()
-        cache = PassageScoreCache(
-            store,
-            local,
-            chunker.fingerprint,
-            "canonical",
-            ArtifactStoreFake.ArtifactValidationError,
-        )
-        cached = CachedPassageScorer(local, cache)
-        first = rerank_retrieval(
-            retrieval,
-            topic_id="topic-dense-cjk",
-            chunker=chunker,
-            scorer=cached,
-            representation="canonical",
-        )
-        predict_calls_after_first = model.predict_calls
-        second = rerank_retrieval(
-            retrieval,
-            topic_id="topic-dense-cjk",
-            chunker=chunker,
-            scorer=cached,
-            representation="canonical",
-        )
-
-        self.assertEqual(first, second)
-        self.assertGreater(predict_calls_after_first, 0)
-        self.assertEqual(model.predict_calls, predict_calls_after_first)
-        self.assertEqual(len(store.write_calls), 1)
-        self.assertEqual(
-            first.status_counts,
-            {
-                "scored": 1,
-                "unresolved": 0,
-                "missing_representation": 0,
-                "no_passages": 0,
-            },
-        )
-        document = first.documents[0]
-        self.assertEqual(document.document_id, "dense-cjk")
-        self.assertEqual(document.status, "scored")
-        self.assertEqual(
-            [
-                (evidence.start_char, evidence.end_char)
-                for evidence in document.passage_evidence
-            ],
-            [(0, 251), (251, 502)],
-        )
-        self.assertTrue(
-            all(
-                FakeTokenizer.pair_token_count(retrieval.query, evidence.text)
-                <= policy.max_length
-                for evidence in document.passage_evidence
-            )
-        )
 
 
 if __name__ == "__main__":
