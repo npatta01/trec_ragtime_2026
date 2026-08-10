@@ -327,13 +327,14 @@ class ArtifactStore:
         except FileNotFoundError:
             return False, None
 
-    def _best_effort_remove_candidate(self, candidate: Path) -> None:
-        """Remove a failed remote candidate without masking the remote miss."""
+    def _best_effort_remove_candidate(self, candidate: Path) -> bool:
+        """Remove a failed remote candidate and report eviction failure."""
 
         try:
             candidate.unlink(missing_ok=True)
         except OSError:
-            return
+            return False
+        return True
 
     def _read_remote(self, object_key: str) -> bytes | None:
         if self._remote_disabled:
@@ -370,7 +371,12 @@ class ArtifactStore:
         candidate = self.local_candidate(object_key)
         try:
             found, payload = self._read_local(candidate)
-        except (OSError, ArtifactStoreRemoteError):
+        except OSError:
+            if not self._best_effort_remove_candidate(candidate):
+                self._disable_remote()
+                return None
+            return self._read_remote(object_key)
+        except ArtifactStoreRemoteError:
             self._disable_remote()
             return None
         if found:
@@ -393,7 +399,19 @@ class ArtifactStore:
         candidate = self.local_candidate(object_key)
         try:
             found, payload = self._read_local(candidate)
-        except (OSError, ArtifactStoreRemoteError):
+        except OSError:
+            if not self._best_effort_remove_candidate(candidate):
+                self._disable_remote()
+                return None
+            payload = self._read_remote(object_key)
+            if payload is None:
+                return None
+            try:
+                return decoder(payload)
+            except ArtifactValidationError:
+                self._best_effort_remove_candidate(candidate)
+                return None
+        except ArtifactStoreRemoteError:
             self._disable_remote()
             return None
         if found:

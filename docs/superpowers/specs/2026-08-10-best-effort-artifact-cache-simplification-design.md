@@ -13,6 +13,14 @@ non-miss HF failure is fatal. Runtime cache reads and writes become best
 effort. The one-time importers still detect and report unsuccessful writes and
 verification misses rather than claiming migration success.
 
+## Competition-rules note
+
+The March 23, 2026 published [RAGTIME Track guidelines](https://docs.google.com/document/d/1XqypNTHxIdazxfnUebrp-EsUuGNhodhQGrJIDnYGaB4/edit)
+permit corpus downloads and do not state a prohibition on retaining private
+participant responses or using private third-party storage. The configured
+bucket is verified private; narrower future organizer terms require
+reevaluation.
+
 ## Module Shape
 
 Keep three modules with distinct responsibilities:

@@ -9,6 +9,8 @@ import warnings
 from pathlib import Path
 from unittest.mock import patch
 
+import fsspec
+
 from trec_ragtime.artifact_store import (
     ArtifactStore,
     ArtifactStoreConfigurationError,
@@ -102,6 +104,23 @@ class PartialMissingSimpleCache(FakeSimpleCache):
             self._candidate(path).write_bytes(b"partial")
             raise FileNotFoundError("remote disappeared")
         return super().open(path, mode)
+
+
+class EvictionRequiredSimpleCache(FakeSimpleCache):
+    """Return stale L1 bytes unless the caller evicts before L2 hydration."""
+
+    def open(self, path: str, mode: str):
+        if "r" not in mode:
+            return super().open(path, mode)
+        self.open_calls.append((path, mode))
+        candidate = self._candidate(path)
+        if candidate.exists():
+            return FakeRemoteFile(b"stale")
+        key = self._strip_protocol(path).removeprefix("buckets/")
+        if key not in self.remote:
+            raise FileNotFoundError(key)
+        candidate.write_bytes(self.remote[key])
+        return FakeRemoteFile(self.remote[key])
 
 
 class TamperingWriteFile(FakeWriteFile):
@@ -220,6 +239,29 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(store.read("object.mpk"), b"local")
         self.assertEqual(self.api_constructed, 0)
         self.assertEqual(self.fs_constructed, 0)
+
+    def test_local_candidate_matches_real_simplecache_mapper_without_hf_io(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_cache_dir:
+            cache_dir = Path(raw_cache_dir) / "artifacts"
+            store = ArtifactStore(
+                bucket_id="owner/bucket",
+                local_dir=cache_dir,
+                token=None,
+            )
+            sc = fsspec.filesystem(
+                "simplecache",
+                target_protocol="hf",
+                cache_storage=str(cache_dir),
+                target_options={"token": None},
+                skip_instance_cache=True,
+            )
+            key = "object.mpk"
+
+            self.assertEqual(
+                store.local_candidate(key),
+                Path(cache_dir)
+                / sc._mapper(sc._strip_protocol(store._remote_path(key))),
+            )
 
     def test_valid_l1_read_survives_a_disabled_remote(self) -> None:
         store = self.make_store(download_error=RuntimeError("token=secret-token"))
@@ -443,8 +485,84 @@ class ArtifactStoreTestCase(unittest.TestCase):
             store.read_validated("object.mpk", permission_failure)
         self.assertEqual(self.api_constructed, 0)
 
-    def test_local_l1_read_failure_is_a_warned_miss_and_disables_remote(self) -> None:
+    def test_local_l1_read_failure_falls_through_to_l2(self) -> None:
         store = self.make_store()
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"stale")
+
+        with patch.object(Path, "read_bytes", side_effect=OSError("permission denied")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertEqual(store.read("object.mpk"), b"remote")
+        self.assertEqual(caught, [])
+        self.assertEqual(self.fs_constructed, 1)
+        self.assertEqual(store.read("object.mpk"), b"remote")
+        assert self.fs is not None
+        self.assertEqual(
+            self.fs.open_calls,
+            [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
+        )
+
+    def test_local_l1_read_repair_requires_exact_eviction(self) -> None:
+        l2_fs: EvictionRequiredSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal l2_fs
+            l2_fs = EvictionRequiredSimpleCache(self.local_dir, self.remote)
+            return l2_fs
+
+        store = self.make_store(filesystem_factory_override=factory)
+        store.local_candidate("object.mpk").write_bytes(b"stale")
+
+        with patch.object(Path, "read_bytes", side_effect=OSError("permission denied")):
+            self.assertEqual(store.read("object.mpk"), b"remote")
+        assert l2_fs is not None
+        self.assertEqual(
+            l2_fs.open_calls,
+            [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
+        )
+
+    def test_local_l1_eviction_failure_warns_and_disables_without_l2(self) -> None:
+        store = self.make_store()
+        store.local_candidate("object.mpk").write_bytes(b"stale")
+
+        with patch.object(
+            Path, "read_bytes", side_effect=OSError("permission denied")
+        ), patch.object(Path, "unlink", side_effect=OSError("permission denied")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertIsNone(store.read("object.mpk"))
+                self.assertFalse(store.write("other.mpk", b"payload"))
+        self.assert_one_sanitized_warning(caught)
+        self.assertEqual(self.api_constructed, 0)
+        self.assertEqual(self.fs_constructed, 0)
+
+    def test_local_l1_validated_read_failure_falls_through_to_l2(self) -> None:
+        store = self.make_store()
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"stale")
+
+        with patch.object(Path, "read_bytes", side_effect=OSError("permission denied")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertEqual(
+                    store.read_validated("object.mpk", self.decoder), b"remote"
+                )
+        self.assertEqual(caught, [])
+        self.assertEqual(self.fs_constructed, 1)
+        self.assertEqual(
+            store.read_validated("object.mpk", self.decoder), b"remote"
+        )
+        assert self.fs is not None
+        self.assertEqual(
+            self.fs.open_calls,
+            [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
+        )
+
+    def test_local_l1_read_failure_then_l2_failure_warns_once_and_disables_remote(
+        self,
+    ) -> None:
+        store = self.make_store(download_error=OSError("server unavailable"))
         candidate = store.local_candidate("object.mpk")
         candidate.write_bytes(b"local")
 
@@ -454,8 +572,27 @@ class ArtifactStoreTestCase(unittest.TestCase):
                 self.assertIsNone(store.read("object.mpk"))
                 self.assertIsNone(store.read("object.mpk"))
         self.assert_one_sanitized_warning(caught)
-        self.assertEqual(self.api_constructed, 0)
-        self.assertEqual(self.fs_constructed, 0)
+        self.assertEqual(self.api_constructed, 1)
+        self.assertEqual(self.fs_constructed, 1)
+
+    def test_local_l1_validated_read_failure_then_l2_failure_warns_once_and_disables_remote(
+        self,
+    ) -> None:
+        store = self.make_store(download_error=OSError("server unavailable"))
+        store.local_candidate("object.mpk").write_bytes(b"local")
+
+        with patch.object(Path, "read_bytes", side_effect=OSError("permission denied")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertIsNone(
+                    store.read_validated("object.mpk", self.decoder)
+                )
+                self.assertIsNone(
+                    store.read_validated("object.mpk", self.decoder)
+                )
+        self.assert_one_sanitized_warning(caught)
+        self.assertEqual(self.api_constructed, 1)
+        self.assertEqual(self.fs_constructed, 1)
 
     def test_bucket_directory_is_private_and_symlink_is_rejected(self) -> None:
         store = self.make_store()

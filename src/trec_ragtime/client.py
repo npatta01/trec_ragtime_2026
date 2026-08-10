@@ -118,6 +118,8 @@ def _optional_artifact_store(*, namespace: str) -> ArtifactStore | None:
     try:
         return ArtifactStore.from_env(namespace=namespace)
     except ArtifactStoreUnavailableError:
+        # Explicit use_cache=True is best effort when configuration is absent:
+        # disable with a sanitized warning; present-but-invalid configuration still raises.
         warnings.warn(
             "artifact cache configuration is unavailable; caching is disabled",
             RuntimeWarning,
