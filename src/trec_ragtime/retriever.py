@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -80,6 +81,16 @@ class RagtimeRetriever:
         ):
             raise TypeError("retrieval_cache must be a RetrievalArtifactCache or None")
         self.retrieval_cache = retrieval_cache
+        self._document_backend_snapshot: str | None = None
+        self._retrieval_corpus_identity_snapshot: Mapping[str, Any] | None = None
+        if retrieval_cache is not None:
+            # LocalCorpusIndex validates its published database at
+            # construction. Capture the resulting immutable provenance once so
+            # warm artifact hits never reopen DuckDB for metadata.
+            self._document_backend_snapshot = corpus.backend_name
+            self._retrieval_corpus_identity_snapshot = copy.deepcopy(
+                dict(self._capture_retrieval_corpus_identity())
+            )
 
     @classmethod
     def from_env(
@@ -139,6 +150,8 @@ class RagtimeRetriever:
 
     @property
     def document_backend(self) -> str:
+        if self._document_backend_snapshot is not None:
+            return self._document_backend_snapshot
         return self.corpus.backend_name
 
     @property
@@ -170,7 +183,7 @@ class RagtimeRetriever:
             "translation_splits": list(metadata.translation_splits),
         }
 
-    def _retrieval_corpus_identity(self) -> Mapping[str, Any]:
+    def _capture_retrieval_corpus_identity(self) -> Mapping[str, Any]:
         """Return corpus provenance without requiring a hydration lookup.
 
         Production retrievers use the revision-pinned :class:`LocalCorpusIndex`.
@@ -185,6 +198,11 @@ class RagtimeRetriever:
             if not isinstance(identity, Mapping):
                 raise
             return identity
+
+    def _retrieval_corpus_identity(self) -> Mapping[str, Any]:
+        if self._retrieval_corpus_identity_snapshot is not None:
+            return self._retrieval_corpus_identity_snapshot
+        return self._capture_retrieval_corpus_identity()
 
     @staticmethod
     def _validate_retrieval_arguments(
@@ -365,19 +383,21 @@ class RagtimeRetriever:
             fallback_on_hf_error=fallback_on_hf_error,
             query_context=query_context,
         )
-        identity = self.build_retrieval_identity(
-            query,
-            pipeline=pipeline,
-            top_k=top_k,
-            max_content_fallbacks=max_content_fallbacks,
-            fallback_on_hf_error=fallback_on_hf_error,
-            query_context=query_context,
-        )
+        identity: RetrievalRequestIdentity | None = None
         retrieval_refresh = refresh or refresh_search or refresh_documents
-        if self.retrieval_cache is not None and not retrieval_refresh:
-            cached = self.retrieval_cache.get(identity)
-            if cached is not None:
-                return cached
+        if self.retrieval_cache is not None:
+            identity = self.build_retrieval_identity(
+                query,
+                pipeline=pipeline,
+                top_k=top_k,
+                max_content_fallbacks=max_content_fallbacks,
+                fallback_on_hf_error=fallback_on_hf_error,
+                query_context=query_context,
+            )
+            if not retrieval_refresh:
+                cached = self.retrieval_cache.get(identity)
+                if cached is not None:
+                    return cached
 
         search_result = self.client.search(
             query,
@@ -405,7 +425,7 @@ class RagtimeRetriever:
             try:
                 document = self.client.get_content(
                     document_id,
-                    refresh=refresh_documents,
+                    refresh=refresh or refresh_documents,
                 )
             except RagtimeError as exc:
                 failures.append(
@@ -488,6 +508,7 @@ class RagtimeRetriever:
             and result.fully_hydrated
             and not result.hydration_failures
         ):
+            assert identity is not None
             return self.retrieval_cache.put(identity, result)
         return result
 

@@ -240,7 +240,7 @@ class FakeCorpus:
         self.calls: list[dict[str, Any]] = []
         self.closed = False
         self.raise_on_access = False
-        self.corpus_identity = {
+        self._corpus_identity = {
             "backend": "fake",
             "schema_version": 1,
             "dataset": "trec-ragtime/ragtime2",
@@ -254,6 +254,13 @@ class FakeCorpus:
             "translation_shard_count": 0,
             "translation_splits": [],
         }
+        self.raise_on_metadata = False
+
+    @property
+    def corpus_identity(self) -> dict[str, Any]:
+        if self.raise_on_metadata:
+            raise AssertionError("warm retrieval hit must not reopen corpus metadata")
+        return self._corpus_identity
 
     def get_many(self, document_ids: Any, *, refresh: bool) -> HydrationResult:
         if self.raise_on_access:
@@ -729,11 +736,107 @@ class RagtimeRetrieverTests(unittest.TestCase):
             ), patch(
                 "trec_ragtime.retriever.LocalCorpusIndex",
                 return_value=corpus,
+            ), patch.object(
+                RagtimeRetriever,
+                "_capture_retrieval_corpus_identity",
+                return_value=corpus.corpus_identity,
             ):
                 retriever = RagtimeRetriever.from_env(local_index_path=index_path)
         self.assertIsNotNone(retriever.retrieval_cache)
         assert retriever.retrieval_cache is not None
         self.assertIs(retriever.retrieval_cache.store, store)
+
+    def test_direct_constructor_without_cache_preserves_legacy_retrieval(self) -> None:
+        client = FakeRagtimeClient(pipeline_result(["doc-1"]))
+        del client.base_url
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(hf_document("doc-1", "legacy text"),),
+                unresolved_ids=(),
+                failures=(),
+            )
+        )
+        del corpus._corpus_identity
+        retriever = RagtimeRetriever(client, corpus)
+
+        result = retriever.retrieve("query")
+
+        self.assertEqual(result.documents[0].text, "legacy text")
+        self.assertEqual(len(client.search_calls), 1)
+        self.assertEqual(len(corpus.calls), 1)
+
+    def test_warm_hits_reuse_captured_corpus_identity_without_metadata_access(self) -> None:
+        store = MemoryArtifactStore()
+        retriever, client, corpus = self._cached_retriever(store, text="captured")
+        first = retriever.retrieve("query")
+        corpus.raise_on_metadata = True
+        client.raise_on_search = True
+        corpus.raise_on_access = True
+
+        second = retriever.retrieve("query")
+
+        self.assertTrue(second.retrieval_artifact.cache_hit)
+        self.assertEqual(second.documents[0].text, "captured")
+        self.assertEqual(first.retrieval_artifact.object_key, second.retrieval_artifact.object_key)
+
+    def test_refresh_refreshes_private_content_fallback(self) -> None:
+        store = MemoryArtifactStore()
+        client = FakeRagtimeClient(
+            pipeline_result(["doc-1"]),
+            contents={"doc-1": private_document("doc-1", "fresh fallback")},
+        )
+        corpus = FakeCorpus(
+            HydrationResult(documents=(), unresolved_ids=("doc-1",), failures=())
+        )
+        retriever = RagtimeRetriever(
+            client,
+            corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        )
+
+        result = retriever.retrieve("query", refresh=True, max_content_fallbacks=1)
+
+        self.assertEqual(result.documents[0].text, "fresh fallback")
+        self.assertEqual(client.content_calls[0]["refresh"], True)
+
+        old_client, old_corpus = (
+            FakeRagtimeClient(pipeline_result(["doc-1"])),
+            FakeCorpus(
+                HydrationResult(
+                    documents=(hf_document("doc-1", "should not replace"),),
+                    unresolved_ids=(),
+                    failures=(),
+                )
+            ),
+        )
+        old = RagtimeRetriever(
+            old_client,
+            old_corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        )
+        old.retrieve("query", refresh=True)
+        failed_client = FakeRagtimeClient(
+            pipeline_result(["doc-1"]),
+            contents={"doc-1": RagtimeApiError("fallback unavailable")},
+        )
+        failed_corpus = FakeCorpus(
+            HydrationResult(documents=(), unresolved_ids=("doc-1",), failures=())
+        )
+        failed = RagtimeRetriever(
+            failed_client,
+            failed_corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        )
+        incomplete = failed.retrieve("query", refresh=True, max_content_fallbacks=1)
+        self.assertFalse(incomplete.fully_hydrated)
+        self.assertEqual(failed_client.content_calls[0]["refresh"], True)
+
+        check, check_client, check_corpus = self._cached_retriever(store, text="wrong")
+        check_client.raise_on_search = True
+        check_corpus.raise_on_access = True
+        cached = check.retrieve("query")
+        self.assertTrue(cached.retrieval_artifact.cache_hit)
+        self.assertEqual(cached.documents[0].text, "should not replace")
 
     def test_enriches_every_api_result_without_a_twenty_document_cap(self) -> None:
         document_ids = [f"doc-{index:03d}" for index in range(137)]
