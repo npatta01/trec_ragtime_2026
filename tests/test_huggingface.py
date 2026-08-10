@@ -39,7 +39,9 @@ class MemoryArtifactStore:
         self.write_calls: list[tuple[str, bytes]] = []
         self.repaired_local_candidates = 0
         self.read_error: BaseException | None = None
+        self.read_result = True
         self.write_error: BaseException | None = None
+        self.write_result = True
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], Any]
@@ -47,6 +49,8 @@ class MemoryArtifactStore:
         self.read_calls.append(object_key)
         if self.read_error is not None:
             raise self.read_error
+        if not self.read_result:
+            return None
         payload = self.local.get(object_key)
         if payload is not None:
             try:
@@ -61,12 +65,15 @@ class MemoryArtifactStore:
         self.local[object_key] = payload
         return value
 
-    def write(self, object_key: str, payload: bytes) -> None:
+    def write(self, object_key: str, payload: bytes) -> bool:
         if self.write_error is not None:
             raise self.write_error
         self.write_calls.append((object_key, payload))
+        if not self.write_result:
+            return False
         self.local[object_key] = payload
         self.remote[object_key] = payload
+        return True
 
 
 class FakeResponse:
@@ -413,19 +420,27 @@ class HuggingFaceCorpusTests(unittest.TestCase):
                 self.assertEqual(result.unresolved_ids, ("doc-1",))
                 self.assertEqual(store.write_calls, [])
 
-    def test_cache_read_and_write_failures_are_fatal(self) -> None:
+    def test_cache_read_and_write_failures_do_not_abort_viewer_requests(self) -> None:
         cache, store = make_cache()
-        store.read_error = OSError("cache read failed")
-        with self.assertRaises(OSError):
-            HuggingFaceCorpus(splits=("eng",), cache=cache, session=RecordingGetSession()).get_many(["doc-1"])
+        store.read_result = False
+        read_result = HuggingFaceCorpus(
+            splits=("eng",), cache=cache,
+            session=RecordingGetSession(
+                FakeResponse(filter_payload(document_row("doc-1", "text")))
+            ),
+        ).get_many(["doc-1"])
+        self.assertEqual(read_result.documents[0].text, "text")
 
         cache, store = make_cache()
-        store.write_error = OSError("cache write failed")
-        with self.assertRaises(OSError):
-            HuggingFaceCorpus(
-                splits=("eng",), cache=cache,
-                session=RecordingGetSession(FakeResponse(filter_payload(document_row("doc-1", "text")))),
-            ).get_many(["doc-1"])
+        store.write_result = False
+        write_result = HuggingFaceCorpus(
+            splits=("eng",), cache=cache,
+            session=RecordingGetSession(
+                FakeResponse(filter_payload(document_row("doc-1", "text")))
+            ),
+        ).get_many(["doc-1"])
+        self.assertEqual(write_result.documents[0].text, "text")
+        self.assertIsNone(write_result.documents[0].cache_stored_at)
 
     def test_legacy_settings_are_rejected_for_cache_opt_out_and_injected_cache(self) -> None:
         for variable in ("RAGTIME_CACHE_PATH", "RAGTIME_CACHE_DIR"):

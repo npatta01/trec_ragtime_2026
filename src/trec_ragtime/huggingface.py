@@ -6,6 +6,7 @@ import math
 import os
 import warnings
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,7 +18,6 @@ from urllib3.util.retry import Retry
 from .artifact_store import ArtifactStore, ArtifactStoreLike, _legacy_cache_setting_name
 from .cache import (
     DEFAULT_CACHE_NAMESPACE,
-    CacheEntry,
     ResponseCache,
     sanitized_cache_configuration,
 )
@@ -295,64 +295,6 @@ class HuggingFaceCorpus:
             "id": document_id,
         }
 
-    def _cache_get(
-        self, document_id: str, *, refresh: bool
-    ) -> HuggingFaceDocument | None:
-        if self.cache is None or refresh:
-            return None
-        request = self._cache_request(document_id)
-        entry = self.cache.get(
-            base_url=self.base_url,
-            operation=HF_CACHE_OPERATION,
-            request=request,
-            ttl_seconds=self.cache_ttl_seconds,
-            validator=lambda payload: self._parse_cached_payload(
-                payload, expected_document_id=document_id
-            ),
-        )
-        if entry is None:
-            return None
-        return self._parse_cached_document(entry, expected_document_id=document_id)
-
-    def _cache_put(self, document: HuggingFaceDocument) -> HuggingFaceDocument:
-        if self.cache is None:
-            return document
-        payload: dict[str, Any] = {
-            "dataset": document.dataset,
-            "config": document.config,
-            "split": document.split,
-            "id": document.document_id,
-            "text": document.text,
-            "url": document.url,
-            "date": document.date,
-        }
-        stored_at = self.cache.put(
-            base_url=self.base_url,
-            operation=HF_CACHE_OPERATION,
-            request=self._cache_request(document.document_id),
-            response=payload,
-        )
-        return HuggingFaceDocument(
-            dataset=document.dataset,
-            config=document.config,
-            split=document.split,
-            document_id=document.document_id,
-            text=document.text,
-            url=document.url,
-            date=document.date,
-            local_cache_hit=False,
-            cache_stored_at=stored_at,
-        )
-
-    def _parse_cached_document(
-        self, entry: CacheEntry, *, expected_document_id: str
-    ) -> HuggingFaceDocument:
-        return self._parse_cached_payload(
-            entry.payload,
-            expected_document_id=expected_document_id,
-            stored_at=entry.stored_at,
-        )
-
     def _parse_cached_payload(
         self,
         payload: Mapping[str, Any],
@@ -560,11 +502,24 @@ class HuggingFaceCorpus:
         found: dict[str, HuggingFaceDocument] = {}
         missing: list[str] = []
         for document_id in ordered_ids:
-            cached = self._cache_get(document_id, refresh=refresh)
-            if cached is None:
+            cached_entry = None
+            if self.cache is not None and not refresh:
+                cached_entry = self.cache.get(
+                    base_url=self.base_url,
+                    operation=HF_CACHE_OPERATION,
+                    request=self._cache_request(document_id),
+                    ttl_seconds=self.cache_ttl_seconds,
+                    validator=lambda payload, expected_document_id=document_id: self._parse_cached_payload(
+                        payload, expected_document_id=expected_document_id
+                    ),
+                )
+            if cached_entry is None:
                 missing.append(document_id)
             else:
-                found[document_id] = cached
+                found[document_id] = replace(
+                    cached_entry.value,
+                    cache_stored_at=cached_entry.stored_at,
+                )
 
         failures: list[HydrationFailure] = []
         stop_for_rate_limit = False
@@ -587,7 +542,24 @@ class HuggingFaceCorpus:
                     continue
 
                 for document in documents:
-                    stored_document = self._cache_put(document)
+                    stored_at = None
+                    if self.cache is not None:
+                        payload: dict[str, Any] = {
+                            "dataset": document.dataset,
+                            "config": document.config,
+                            "split": document.split,
+                            "id": document.document_id,
+                            "text": document.text,
+                            "url": document.url,
+                            "date": document.date,
+                        }
+                        stored_at = self.cache.put(
+                            base_url=self.base_url,
+                            operation=HF_CACHE_OPERATION,
+                            request=self._cache_request(document.document_id),
+                            response=payload,
+                        )
+                    stored_document = replace(document, cache_stored_at=stored_at)
                     found[document.document_id] = stored_document
                 unresolved = [
                     document_id

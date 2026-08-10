@@ -30,7 +30,9 @@ class MemoryArtifactStore:
         self.write_calls: list[tuple[str, bytes]] = []
         self.repaired_local_candidates = 0
         self.read_error: BaseException | None = None
+        self.read_result = True
         self.write_error: BaseException | None = None
+        self.write_result = True
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], Any]
@@ -38,6 +40,8 @@ class MemoryArtifactStore:
         self.read_calls.append(object_key)
         if self.read_error is not None:
             raise self.read_error
+        if not self.read_result:
+            return None
         payload = self.local.get(object_key)
         if payload is not None:
             try:
@@ -52,12 +56,15 @@ class MemoryArtifactStore:
         self.local[object_key] = payload
         return value
 
-    def write(self, object_key: str, payload: bytes) -> None:
+    def write(self, object_key: str, payload: bytes) -> bool:
         if self.write_error is not None:
             raise self.write_error
         self.write_calls.append((object_key, payload))
+        if not self.write_result:
+            return False
         self.local[object_key] = payload
         self.remote[object_key] = payload
+        return True
 
 
 class FakeResponse:
@@ -291,19 +298,23 @@ class RagtimeClientTests(unittest.TestCase):
                     self.make_client(session, cache=cache, retries=0).search("query")
                 self.assertEqual(store.write_calls, [])
 
-    def test_write_failure_is_fatal(self) -> None:
+    def test_write_failure_keeps_fully_validated_live_result(self) -> None:
         cache, store = make_cache()
-        store.write_error = OSError("disk full")
-        with self.assertRaises(OSError):
-            self.make_client(
-                RecordingSession(FakeResponse(pipeline_payload())), cache=cache
-            ).search("query")
+        store.write_result = False
+        result = self.make_client(
+            RecordingSession(FakeResponse(pipeline_payload())), cache=cache
+        ).search("query")
+        self.assertFalse(result.local_cache_hit)
+        self.assertIsNone(result.cache_stored_at)
+        self.assertEqual(len(store.write_calls), 1)
 
-    def test_read_failure_is_fatal(self) -> None:
+    def test_read_failure_is_a_miss_and_live_request_still_runs(self) -> None:
         cache, store = make_cache()
-        store.read_error = OSError("cache unavailable")
-        with self.assertRaises(OSError):
-            self.make_client(RecordingSession(), cache=cache).search("query")
+        store.read_result = False
+        session = RecordingSession(FakeResponse(pipeline_payload()))
+        result = self.make_client(session, cache=cache).search("query")
+        self.assertFalse(result.local_cache_hit)
+        self.assertEqual(len(session.calls), 1)
 
     def test_malformed_l1_repairs_once_before_one_upstream_request(self) -> None:
         cache, store = make_cache()

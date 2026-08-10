@@ -16,12 +16,7 @@ from requests_ratelimiter import LimiterMixin
 from urllib3.util.retry import Retry
 
 from .artifact_store import ArtifactStore, ArtifactStoreLike, _legacy_cache_setting_name
-from .cache import (
-    DEFAULT_CACHE_NAMESPACE,
-    CacheEntry,
-    ResponseCache,
-    sanitized_cache_configuration,
-)
+from .cache import DEFAULT_CACHE_NAMESPACE, ResponseCache, sanitized_cache_configuration
 from .models import Document, PipelineResult, SearchHit
 
 DEFAULT_PIPELINE = "ragtime2"
@@ -295,41 +290,6 @@ class RagtimeClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _cache_get(
-        self,
-        *,
-        operation: str,
-        request: Mapping[str, Any],
-        ttl_seconds: float | None,
-        refresh: bool,
-        validator: Callable[[Mapping[str, Any]], T],
-    ) -> CacheEntry | None:
-        if self.cache is None or refresh:
-            return None
-        return self.cache.get(
-            base_url=self.base_url,
-            operation=operation,
-            request=request,
-            ttl_seconds=ttl_seconds,
-            validator=validator,
-        )
-
-    def _cache_put(
-        self,
-        *,
-        operation: str,
-        request: Mapping[str, Any],
-        response: Mapping[str, Any],
-    ) -> float | None:
-        if self.cache is None:
-            return None
-        return self.cache.put(
-            base_url=self.base_url,
-            operation=operation,
-            request=request,
-            response=response,
-        )
-
     def _post(self, endpoint: str, request: Mapping[str, Any]) -> dict[str, Any]:
         response: requests.Response | Any | None = None
         error: requests.RequestException | None = None
@@ -403,22 +363,28 @@ class RagtimeClient:
         refresh: bool,
         validator: Callable[[Mapping[str, Any]], T],
     ) -> tuple[T, bool, float | None]:
-        entry = self._cache_get(
-            operation=operation,
-            request=request,
-            ttl_seconds=ttl_seconds,
-            refresh=refresh,
-            validator=validator,
-        )
-        if entry is not None:
-            return validator(entry.payload), True, entry.stored_at
+        if self.cache is not None and not refresh:
+            entry = self.cache.get(
+                base_url=self.base_url,
+                operation=operation,
+                request=request,
+                ttl_seconds=ttl_seconds,
+                validator=validator,
+            )
+            if entry is not None:
+                return entry.value, True, entry.stored_at
 
         payload = self._post(endpoint, request)
         validated = validator(payload)
-        stored_at = self._cache_put(
-            operation=operation,
-            request=request,
-            response=payload,
+        stored_at = (
+            self.cache.put(
+                base_url=self.base_url,
+                operation=operation,
+                request=request,
+                response=payload,
+            )
+            if self.cache is not None
+            else None
         )
         return validated, False, stored_at
 
@@ -547,17 +513,6 @@ class RagtimeClient:
             cache_stored_at=cache_stored_at,
             extra=extra,
         )
-
-    def pipeline(
-        self,
-        query: str,
-        *,
-        pipeline: str = DEFAULT_PIPELINE,
-        refresh: bool = False,
-    ) -> PipelineResult:
-        """Alias for :meth:`search` matching the HTTP endpoint name."""
-
-        return self.search(query, pipeline=pipeline, refresh=refresh)
 
     def get_content(
         self,

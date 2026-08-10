@@ -40,6 +40,7 @@ class MemoryArtifactStore:
         self.remote: dict[str, bytes] = {}
         self.read_validated_calls: list[str] = []
         self.write_calls: list[tuple[str, bytes]] = []
+        self.write_result = True
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], Any]
@@ -58,10 +59,13 @@ class MemoryArtifactStore:
         self.local[object_key] = payload
         return value
 
-    def write(self, object_key: str, payload: bytes) -> None:
+    def write(self, object_key: str, payload: bytes) -> bool:
         self.write_calls.append((object_key, payload))
+        if not self.write_result:
+            return False
         self.local[object_key] = payload
         self.remote[object_key] = payload
+        return True
 
 
 def independent_request_bytes(
@@ -103,6 +107,46 @@ class ResponseCacheTestCase(unittest.TestCase):
 
     def object_key(self) -> str:
         return EXPECTED_OBJECT_KEY
+
+    def test_get_returns_validator_value_and_validates_a_hit_once(self) -> None:
+        self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            response=self.response,
+            stored_at=100.0,
+        )
+        calls: list[dict[str, Any]] = []
+
+        def validator(payload: dict[str, Any]) -> tuple[str, float]:
+            calls.append(payload)
+            return (payload["query"], payload["scores"]["doc-1"])
+
+        entry = self.cache.get(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            ttl_seconds=None,
+            validator=validator,
+        )
+
+        self.assertEqual(entry, CacheEntry(value=("hello", 0.9), stored_at=100.0))
+        self.assertEqual(calls, [self.response])
+
+    def test_put_returns_none_when_store_reports_unsuccessful_write(self) -> None:
+        self.store.write_result = False
+
+        stored_at = self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            response=self.response,
+            stored_at=100.0,
+        )
+
+        self.assertIsNone(stored_at)
+        self.assertEqual(len(self.store.write_calls), 1)
+        self.assertEqual(self.store.local, {})
 
     def test_request_key_is_stable_for_recursively_reordered_mappings(self) -> None:
         reordered = {
@@ -532,7 +576,7 @@ class ResponseCacheTestCase(unittest.TestCase):
             ttl_seconds=None,
             validator=self.valid_response,
         )
-        self.assertEqual(entry, CacheEntry(payload=self.response, stored_at=100.0))
+        self.assertEqual(entry, CacheEntry(value=self.response, stored_at=100.0))
         self.assertEqual(self.store.read_validated_calls, [key])
         self.assertEqual(self.store.local[key], self.store.remote[key])
 
@@ -647,7 +691,7 @@ class ResponseCacheTestCase(unittest.TestCase):
                 ttl_seconds=None,
                 validator=self.valid_response,
             ),
-            CacheEntry(payload=newer, stored_at=101.0),
+            CacheEntry(value=newer, stored_at=101.0),
         )
 
     def test_object_key_helper_uses_exact_layout(self) -> None:

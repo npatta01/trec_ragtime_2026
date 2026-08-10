@@ -14,7 +14,7 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Generic, TypeVar
 from urllib.parse import urlsplit
 
 import msgspec
@@ -45,10 +45,10 @@ class ResponseEnvelope(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
 
 @dataclass(frozen=True, slots=True)
-class CacheEntry:
-    """A decoded cached response and the time it was stored."""
+class CacheEntry(Generic[T]):
+    """A validated cached response and the time it was stored."""
 
-    payload: dict[str, Any]
+    value: T
     stored_at: float
 
 # These names are never part of a result-bearing request.  Rejecting them at
@@ -418,8 +418,8 @@ class ResponseCache:
         expected_request_digest: bytes,
         operation: str,
         validator: Callable[[Mapping[str, Any]], T],
-    ) -> Callable[[bytes], CacheEntry]:
-        def decode(payload: bytes) -> CacheEntry:
+    ) -> Callable[[bytes], CacheEntry[T]]:
+        def decode(payload: bytes) -> CacheEntry[T]:
             try:
                 envelope = msgspec.msgpack.decode(payload, type=ResponseEnvelope)
             except (msgspec.DecodeError, msgspec.ValidationError, TypeError, ValueError):
@@ -450,13 +450,13 @@ class ResponseCache:
                 )
                 if msgspec.msgpack.encode(canonical_envelope) != payload:
                     raise ValueError("cached response wire encoding is not canonical")
-                validator(canonical_payload)
+                value = validator(canonical_payload)
             except Exception:
                 # Domain validators deliberately have no cache-specific
                 # dependency.  Convert every rejection into the one error
                 # ArtifactStore uses to repair an invalid L1 candidate.
                 raise self._decode_error("cached response payload is invalid") from None
-            return CacheEntry(payload=canonical_payload, stored_at=stored_at)
+            return CacheEntry(value=value, stored_at=stored_at)
 
         return decode
 
@@ -468,7 +468,7 @@ class ResponseCache:
         request: Mapping[str, Any],
         ttl_seconds: float | None,
         validator: Callable[[Mapping[str, Any]], T],
-    ) -> CacheEntry | None:
+    ) -> CacheEntry[T] | None:
         """Read, strictly validate, and then apply TTL to one response."""
 
         if ttl_seconds is not None:
@@ -511,8 +511,8 @@ class ResponseCache:
         request: Mapping[str, Any],
         response: Mapping[str, Any],
         stored_at: float | None = None,
-    ) -> float:
-        """Encode and write one response exactly once, without rereading it."""
+    ) -> float | None:
+        """Encode and best-effort write one response without rereading it."""
 
         expected_base_url_digest, expected_request_digest = self._identity(
             base_url=base_url,
@@ -538,8 +538,11 @@ class ResponseCache:
             payload=canonical_response,
         )
         encoded = msgspec.msgpack.encode(envelope)
-        self.store.write(response_object_key(normalized_operation, expected_request_digest), encoded)
-        return timestamp
+        stored = self.store.write(
+            response_object_key(normalized_operation, expected_request_digest),
+            encoded,
+        )
+        return timestamp if stored else None
 
     def evict_local(
         self,
