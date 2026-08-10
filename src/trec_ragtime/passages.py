@@ -4,66 +4,41 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
-import re
 import warnings
-from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, cast
-
-import msgspec
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, Mapping, Sequence, cast
 
 
 Representation = Literal["canonical", "report_text"]
-Boundary = Literal["paragraph_packed", "sentence_packed", "oversized_sentence_fallback"]
+Boundary = Literal["sentence", "oversized_sentence"]
 
 _REPRESENTATIONS = frozenset(("canonical", "report_text"))
-_BOUNDARIES = frozenset(
-    ("paragraph_packed", "sentence_packed", "oversized_sentence_fallback")
-)
+_BOUNDARIES = frozenset(("sentence", "oversized_sentence"))
 _PIPELINES_BY_LANGUAGE: Mapping[str, str] = {
     "eng": "en_core_web_sm",
     "spa": "es_core_news_sm",
     "rus": "ru_core_news_sm",
     "zho": "zh_core_web_sm",
 }
-_DEFAULT_LENGTH_FUNCTION_FINGERPRINT = "builtin:len"
-_LANGCHAIN_SPLITTERS_DISTRIBUTION = "langchain-text-splitters"
-_SPACY_DISTRIBUTION = "spacy"
-_PINNED_PIPELINE_MAPPING_ID = ";".join(
-    f"{language}={pipeline}" for language, pipeline in _PIPELINES_BY_LANGUAGE.items()
+_PINNED_PIPELINE_MAPPING = ";".join(
+    f"{language}={pipeline}"
+    for language, pipeline in _PIPELINES_BY_LANGUAGE.items()
 )
-_FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
 
 
-def _load_splitters() -> tuple[type[Any], type[Any], type[Any]]:
-    """Load LangChain splitters only when passage chunking is actually used."""
-
-    if "CharacterTextSplitter" not in globals():
-        from langchain_text_splitters.character import (
-            CharacterTextSplitter,
-            RecursiveCharacterTextSplitter,
-        )
+def _load_splitters() -> tuple[type[Any], type[Any]]:
+    try:
+        from langchain_text_splitters.character import RecursiveCharacterTextSplitter
         from langchain_text_splitters.spacy import SpacyTextSplitter
-
-        globals().update(
-            {
-                "CharacterTextSplitter": CharacterTextSplitter,
-                "RecursiveCharacterTextSplitter": RecursiveCharacterTextSplitter,
-                "SpacyTextSplitter": SpacyTextSplitter,
-            }
-        )
-    return (
-        cast(type[Any], globals()["CharacterTextSplitter"]),
-        cast(type[Any], globals()["RecursiveCharacterTextSplitter"]),
-        cast(type[Any], globals()["SpacyTextSplitter"]),
-    )
+    except (ImportError, OSError) as error:
+        raise PassageChunkingError(
+            "langchain-text-splitters and spaCy are required for passage chunking"
+        ) from error
+    return SpacyTextSplitter, RecursiveCharacterTextSplitter
 
 
 class PassageChunkingError(ValueError):
-    """Raised when maintained splitters cannot produce exact source spans."""
-
-
-class PassageValidationError(ValueError):
-    """Raised when passage lineage or source reconstruction is invalid."""
+    """Raised when passage structure or exact chunking is invalid."""
 
 
 def sha256_bytes(value: str | bytes) -> bytes:
@@ -76,128 +51,35 @@ def sha256_bytes(value: str | bytes) -> bytes:
     return hashlib.sha256(value).digest()
 
 
-def _validate_hash(value: object, field_name: str) -> None:
-    if not isinstance(value, bytes) or len(value) != hashlib.sha256().digest_size:
-        raise PassageValidationError(f"{field_name} must be exactly 32 bytes")
-
-
-def _validate_id(value: object, field_name: str) -> None:
-    if value is not None and (
-        not isinstance(value, bytes) or len(value) != hashlib.sha256().digest_size
-    ):
-        raise PassageValidationError(f"{field_name} must be None or exactly 32 bytes")
-
-
-def _validate_fingerprint(value: object) -> None:
-    if not isinstance(value, str) or not _FINGERPRINT_RE.fullmatch(value):
-        raise PassageValidationError("chunker_fingerprint is malformed")
-
-
-def _packing_policy(
-    length_function: Callable[[str], int], chunk_size: int
-) -> tuple[Callable[[str], int], int, str]:
-    passage_length_function = getattr(length_function, "passage_length_function", None)
-    max_passage_length = getattr(length_function, "max_passage_length", None)
-    if passage_length_function is None and max_passage_length is None:
-        return length_function, chunk_size, "authoritative-length-function"
-    if not callable(passage_length_function):
-        raise PassageValidationError(
-            "length_function.passage_length_function must be callable"
-        )
-    if (
-        isinstance(max_passage_length, bool)
-        or not isinstance(max_passage_length, int)
-        or max_passage_length <= 0
-    ):
-        raise PassageValidationError(
-            "length_function.max_passage_length must be a positive integer"
-        )
-    if max_passage_length > chunk_size:
-        raise PassageValidationError(
-            "length_function.max_passage_length must not exceed chunk_size"
-        )
-
-    passage_fingerprint = getattr(passage_length_function, "fingerprint", None)
-    if passage_length_function is len:
-        passage_fingerprint = _DEFAULT_LENGTH_FUNCTION_FINGERPRINT
-    elif not isinstance(passage_fingerprint, str) or not passage_fingerprint.strip():
-        passage_fingerprint = (
-            f"derived-from-{getattr(length_function, 'fingerprint', 'length-function')}"
-        )
-    _validate_fingerprint(passage_fingerprint)
-    return (
-        cast(Callable[[str], int], passage_length_function),
-        max_passage_length,
-        f"passage-length={passage_fingerprint};budget={max_passage_length}",
-    )
-
-
-def _passage_id(
-    *,
-    document_id: str,
-    representation: Representation,
-    representation_hash: bytes,
-    start_char: int,
-    end_char: int,
-    chunk_index: int,
-    chunker_fingerprint: str,
-) -> bytes:
-    lineage = (
-        document_id,
-        representation,
-        representation_hash,
-        start_char,
-        end_char,
-        chunk_index,
-        chunker_fingerprint,
-    )
-    return sha256_bytes(msgspec.msgpack.encode(lineage))
-
-
 @dataclass(frozen=True, slots=True)
 class Passage:
-    """One exact, auditable passage and its document-coordinate lineage."""
-
     document_id: str
-    source_content_hash: bytes
     representation: Representation
-    representation_hash: bytes
     language: str
-    chunk_index: int
-    passage_id: bytes
     text: str
     start_char: int
     end_char: int
-    boundary: Boundary
-    previous_passage_id: bytes | None
-    next_passage_id: bytes | None
     content_hash: bytes
-    chunker_fingerprint: str
-    overlap_chars: int = 0
-    overlap_tokens: int = 0
+    boundary: Boundary
 
     def __post_init__(self) -> None:
         if not isinstance(self.document_id, str) or not self.document_id.strip():
-            raise PassageValidationError("document_id must not be blank")
-        _validate_hash(self.source_content_hash, "source_content_hash")
-        if self.representation not in _REPRESENTATIONS:
-            raise PassageValidationError(
+            raise PassageChunkingError("document_id must not be blank")
+        if (
+            not isinstance(self.representation, str)
+            or self.representation not in _REPRESENTATIONS
+        ):
+            raise PassageChunkingError(
                 "representation must be canonical or report_text"
             )
-        _validate_hash(self.representation_hash, "representation_hash")
         if not isinstance(self.language, str) or not self.language.strip():
-            raise PassageValidationError("language must not be blank")
+            raise PassageChunkingError("language must not be blank")
         if self.representation == "report_text" and self.language != "eng":
-            raise PassageValidationError(
+            raise PassageChunkingError(
                 "report_text representation requires language='eng'"
             )
-        if isinstance(self.chunk_index, bool) or not isinstance(self.chunk_index, int):
-            raise PassageValidationError("chunk_index must be an integer")
-        if self.chunk_index < 0:
-            raise PassageValidationError("chunk_index must be nonnegative")
-        _validate_hash(self.passage_id, "passage_id")
         if not isinstance(self.text, str) or not self.text:
-            raise PassageValidationError("text must not be empty")
+            raise PassageChunkingError("text must not be empty")
         if (
             isinstance(self.start_char, bool)
             or not isinstance(self.start_char, int)
@@ -207,299 +89,49 @@ class Passage:
             or self.end_char <= self.start_char
             or self.end_char - self.start_char != len(self.text)
         ):
-            raise PassageValidationError("passage offsets must exactly cover text")
-        if self.boundary not in _BOUNDARIES:
-            raise PassageValidationError("boundary is unknown")
-        _validate_id(self.previous_passage_id, "previous_passage_id")
-        _validate_id(self.next_passage_id, "next_passage_id")
-        _validate_hash(self.content_hash, "content_hash")
-        if self.content_hash != sha256_bytes(self.text):
-            raise PassageValidationError("content_hash does not match text")
-        _validate_fingerprint(self.chunker_fingerprint)
-        for field_name, value in (
-            ("overlap_chars", self.overlap_chars),
-            ("overlap_tokens", self.overlap_tokens),
+            raise PassageChunkingError("passage offsets must exactly cover text")
+        if (
+            not isinstance(self.content_hash, bytes)
+            or len(self.content_hash) != len(sha256_bytes(b""))
+            or self.content_hash != sha256_bytes(self.text)
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise PassageValidationError(
-                    f"{field_name} must be a nonnegative integer"
-                )
-            if value != 0:
-                raise PassageValidationError("schema version 1 requires zero overlap")
-
-    @property
-    def boundary_path(self) -> str:
-        """Compatibility name for the boundary decision recorded on the passage."""
-
-        return self.boundary
+            raise PassageChunkingError("content_hash does not match text")
+        if not isinstance(self.boundary, str) or self.boundary not in _BOUNDARIES:
+            raise PassageChunkingError("boundary must be sentence or oversized_sentence")
 
 
 def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
-    """Validate exact reconstruction, hashes, indexes, IDs, and neighbors."""
+    """Validate exact source slices and gap-free interval-union coverage."""
 
     if not isinstance(selected_text, str) or not selected_text:
-        raise PassageValidationError("selected_text must not be empty")
+        raise PassageChunkingError("selected_text must not be empty")
+    if not isinstance(passages, Sequence) or isinstance(passages, (str, bytes)):
+        raise PassageChunkingError("passages must be a sequence of Passage objects")
     if not passages:
-        raise PassageValidationError("at least one passage is required")
+        raise PassageChunkingError("at least one passage is required")
 
-    first = passages[0]
-    if not isinstance(first, Passage):
-        raise PassageValidationError("passages must contain Passage objects")
-    expected_representation_hash = sha256_bytes(selected_text)
-    if first.representation_hash != expected_representation_hash:
-        raise PassageValidationError("representation_hash does not match selected_text")
-
-    cursor = 0
-    passage_ids: set[bytes] = set()
-    chunks: list[str] = []
-    for index, passage in enumerate(passages):
+    previous_start = -1
+    previous_end = -1
+    covered_end = 0
+    for passage in passages:
         if not isinstance(passage, Passage):
-            raise PassageValidationError("passages must contain Passage objects")
-        if passage.chunk_index != index:
-            raise PassageValidationError("chunk indexes must be contiguous and ordered")
-        if passage.representation_hash != expected_representation_hash:
-            raise PassageValidationError(
-                "all representation hashes must match selected_text"
-            )
-        for field_name in (
-            "document_id",
-            "source_content_hash",
-            "representation",
-            "language",
-            "chunker_fingerprint",
-            "overlap_chars",
-            "overlap_tokens",
-        ):
-            if getattr(passage, field_name) != getattr(first, field_name):
-                raise PassageValidationError(f"inconsistent {field_name}")
-        if passage.passage_id in passage_ids:
-            raise PassageValidationError("passage IDs must be unique")
-        passage_ids.add(passage.passage_id)
-        if passage.start_char != cursor:
-            raise PassageValidationError(
-                "passage spans must be monotonic, adjacent, and gap-free"
-            )
+            raise PassageChunkingError("passages must contain Passage objects")
+        if passage.start_char <= previous_start or passage.end_char <= previous_end:
+            raise PassageChunkingError("passage positions must be strictly increasing")
         if passage.end_char > len(selected_text):
-            raise PassageValidationError("passage end offset exceeds selected_text")
+            raise PassageChunkingError("passage end offset exceeds selected_text")
         if selected_text[passage.start_char : passage.end_char] != passage.text:
-            raise PassageValidationError("passage text does not match its source slice")
+            raise PassageChunkingError("passage text does not match its source slice")
         if passage.content_hash != sha256_bytes(passage.text):
-            raise PassageValidationError("passage content hash does not match its text")
-        expected_id = _passage_id(
-            document_id=passage.document_id,
-            representation=cast(Representation, passage.representation),
-            representation_hash=passage.representation_hash,
-            start_char=passage.start_char,
-            end_char=passage.end_char,
-            chunk_index=passage.chunk_index,
-            chunker_fingerprint=passage.chunker_fingerprint,
-        )
-        if passage.passage_id != expected_id:
-            raise PassageValidationError("passage_id does not match canonical lineage")
-        expected_previous = None if index == 0 else passages[index - 1].passage_id
-        expected_next = (
-            None if index == len(passages) - 1 else passages[index + 1].passage_id
-        )
-        if passage.previous_passage_id != expected_previous:
-            raise PassageValidationError("previous_passage_id is inconsistent")
-        if passage.next_passage_id != expected_next:
-            raise PassageValidationError("next_passage_id is inconsistent")
-        cursor = passage.end_char
-        chunks.append(passage.text)
+            raise PassageChunkingError("passage content hash does not match passage text")
+        if passage.start_char > covered_end:
+            raise PassageChunkingError("passage intervals contain a gap")
+        covered_end = max(covered_end, passage.end_char)
+        previous_start = passage.start_char
+        previous_end = passage.end_char
 
-    if cursor != len(selected_text) or "".join(chunks) != selected_text:
-        raise PassageValidationError("passages do not fully reconstruct selected_text")
-
-
-def _pipeline_distribution_name(pipeline_name: str) -> str:
-    return pipeline_name.replace("_", "-")
-
-
-def _required_distribution_names(pipeline_name: str | None) -> tuple[str, ...]:
-    selected_pipelines = (
-        (pipeline_name,)
-        if pipeline_name is not None
-        else tuple(_PIPELINES_BY_LANGUAGE.values())
-    )
-    return (
-        _LANGCHAIN_SPLITTERS_DISTRIBUTION,
-        _SPACY_DISTRIBUTION,
-        *tuple(_pipeline_distribution_name(name) for name in selected_pipelines),
-    )
-
-
-def _runtime_distribution_versions(pipeline_name: str | None) -> tuple[str, ...]:
-    versions: list[str] = []
-    for distribution_name in _required_distribution_names(pipeline_name):
-        try:
-            version = importlib.metadata.version(distribution_name)
-        except importlib.metadata.PackageNotFoundError as error:
-            raise PassageValidationError(
-                f"required runtime distribution {distribution_name!r} is unavailable; "
-                "cannot create a safe passage chunker fingerprint"
-            ) from error
-        if not isinstance(version, str) or not version.strip():
-            raise PassageValidationError(
-                f"required runtime distribution {distribution_name!r} has no stable version"
-            )
-        versions.append(f"{distribution_name}={version}")
-    return tuple(versions)
-
-
-def _default_fingerprint(config: "ChunkerConfig") -> str:
-    material = "|".join(
-        (
-            "passages-v2",
-            f"chunk_size={config.chunk_size}",
-            f"length_function={config.resolved_length_function_fingerprint}",
-            f"packing_policy={config.packing_policy_fingerprint}",
-            f"pipeline={config.pipeline_name or 'language-map'}",
-            f"pinned_mapping={_PINNED_PIPELINE_MAPPING_ID}",
-            f"runtime_distributions={';'.join(_runtime_distribution_versions(config.pipeline_name))}",
-            f"max_length={config.max_length}",
-            f"chunk_overlap={config.chunk_overlap}",
-            f"overlap_chars={config.overlap_chars}",
-            f"overlap_tokens={config.overlap_tokens}",
-        )
-    )
-    return "langchain-spacy-v2/" + hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
-def _compose_fingerprint(base: str, caller_fingerprint: str | None) -> str:
-    if caller_fingerprint is None:
-        return base
-    composed = f"{base}/caller/{caller_fingerprint}"
-    if len(composed) > 256:
-        composed = f"{base}/caller/{hashlib.sha256(caller_fingerprint.encode('utf-8')).hexdigest()}"
-    _validate_fingerprint(composed)
-    return composed
-
-
-@dataclass(frozen=True, slots=True)
-class ChunkerConfig:
-    """Immutable chunking settings shared by all maintained splitter stages."""
-
-    chunk_size: int = 512
-    length_function: Callable[[str], int] | None = None
-    length_function_fingerprint: str | None = None
-    pipeline_name: str | None = None
-    fingerprint: str | None = None
-    chunk_overlap: int = 0
-    overlap_chars: int = 0
-    overlap_tokens: int = 0
-    max_length: int = 1_000_000
-    _resolved_length_function_fingerprint: str = field(init=False, repr=False)
-    _packing_length_function: Callable[[str], int] = field(init=False, repr=False)
-    _packing_chunk_size: int = field(init=False, repr=False)
-    _packing_policy_fingerprint: str = field(init=False, repr=False)
-    _resolved_fingerprint: str = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        if isinstance(self.chunk_size, bool) or not isinstance(self.chunk_size, int):
-            raise PassageValidationError("chunk_size must be an integer")
-        if self.chunk_size <= 0:
-            raise PassageValidationError("chunk_size must be positive")
-        if self.length_function is None:
-            raise PassageValidationError(
-                "length_function is required; pass len explicitly for boundary-only chunking"
-            )
-        if not callable(self.length_function):
-            raise PassageValidationError("length_function must be callable")
-        packing_length_function, packing_chunk_size, packing_fingerprint = (
-            _packing_policy(self.length_function, self.chunk_size)
-        )
-        object.__setattr__(self, "_packing_length_function", packing_length_function)
-        object.__setattr__(self, "_packing_chunk_size", packing_chunk_size)
-        object.__setattr__(self, "_packing_policy_fingerprint", packing_fingerprint)
-        if self.length_function_fingerprint is not None:
-            _validate_fingerprint(self.length_function_fingerprint)
-        else:
-            callable_fingerprint = getattr(self.length_function, "fingerprint", None)
-            if isinstance(callable_fingerprint, str) and callable_fingerprint.strip():
-                _validate_fingerprint(callable_fingerprint)
-                object.__setattr__(
-                    self,
-                    "_resolved_length_function_fingerprint",
-                    callable_fingerprint,
-                )
-            elif self.length_function is len:
-                object.__setattr__(
-                    self,
-                    "_resolved_length_function_fingerprint",
-                    _DEFAULT_LENGTH_FUNCTION_FINGERPRINT,
-                )
-            else:
-                raise PassageValidationError(
-                    "custom length_function requires length_function_fingerprint or a "
-                    "stable nonblank .fingerprint"
-                )
-        if self.length_function_fingerprint is not None:
-            object.__setattr__(
-                self,
-                "_resolved_length_function_fingerprint",
-                self.length_function_fingerprint,
-            )
-        if self.pipeline_name is not None and (
-            not isinstance(self.pipeline_name, str) or not self.pipeline_name.strip()
-        ):
-            raise PassageValidationError("pipeline_name must not be blank")
-        if self.fingerprint is not None:
-            _validate_fingerprint(self.fingerprint)
-        for field_name, value in (
-            ("chunk_overlap", self.chunk_overlap),
-            ("overlap_chars", self.overlap_chars),
-            ("overlap_tokens", self.overlap_tokens),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise PassageValidationError(
-                    f"{field_name} must be a nonnegative integer"
-                )
-            if value != 0:
-                raise PassageValidationError("schema version 1 requires zero overlap")
-        if isinstance(self.max_length, bool) or not isinstance(self.max_length, int):
-            raise PassageValidationError("max_length must be an integer")
-        if self.max_length <= 0:
-            raise PassageValidationError("max_length must be positive")
-        object.__setattr__(
-            self,
-            "_resolved_fingerprint",
-            _compose_fingerprint(_default_fingerprint(self), self.fingerprint),
-        )
-
-    @property
-    def resolved_length_function_fingerprint(self) -> str:
-        return self._resolved_length_function_fingerprint
-
-    @property
-    def resolved_fingerprint(self) -> str:
-        return self._resolved_fingerprint
-
-    @property
-    def packing_length_function(self) -> Callable[[str], int]:
-        return self._packing_length_function
-
-    @property
-    def packing_chunk_size(self) -> int:
-        return self._packing_chunk_size
-
-    @property
-    def packing_policy_fingerprint(self) -> str:
-        return self._packing_policy_fingerprint
-
-
-class PassageChunker(Protocol):
-    @property
-    def fingerprint(self) -> str: ...
-
-    def chunk(
-        self,
-        *,
-        document_id: str,
-        canonical_text: str,
-        selected_text: str,
-        representation: Representation,
-        language: str,
-    ) -> tuple[Passage, ...]: ...
+    if covered_end != len(selected_text):
+        raise PassageChunkingError("passage intervals do not cover selected_text")
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,48 +141,101 @@ class _Span:
     end_char: int
 
 
-class LangChainPassageChunker:
-    """Compose exact paragraph, sentence, and exceptional sentence fallback stages."""
+def _runtime_version(distribution: str) -> str:
+    try:
+        version = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError as error:
+        raise PassageChunkingError(
+            f"required runtime distribution {distribution!r} is unavailable"
+        ) from error
+    if not isinstance(version, str) or not version.strip():
+        raise PassageChunkingError(
+            f"required runtime distribution {distribution!r} has no version"
+        )
+    return version
+
+
+def _positive_integer(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PassageChunkingError(f"{field_name} must be a positive integer")
+    return value
+
+
+class PassageChunker:
+    """Chunk one selected representation into exact sentence-based passages."""
+
+    __slots__ = (
+        "_pair_length",
+        "_overlap_tokens",
+        "_fingerprint",
+        "_sentence_splitters",
+    )
 
     def __init__(
         self,
-        config: ChunkerConfig | None = None,
+        pair_length: object,
         *,
-        chunk_size: int | None = None,
-        length_function: Callable[[str], int] | None = None,
-        length_function_fingerprint: str | None = None,
-        pipeline_name: str | None = None,
-        fingerprint: str | None = None,
+        overlap_tokens: int = 64,
     ) -> None:
-        if config is not None and any(
-            value is not None
-            for value in (
-                chunk_size,
-                length_function,
-                length_function_fingerprint,
-                pipeline_name,
-                fingerprint,
+        if not callable(pair_length):
+            raise PassageChunkingError("pair_length must be callable")
+        pair_fingerprint = getattr(pair_length, "fingerprint", None)
+        if not isinstance(pair_fingerprint, str) or not pair_fingerprint.strip():
+            raise PassageChunkingError("pair_length.fingerprint must be nonblank")
+        max_length = _positive_integer(
+            getattr(pair_length, "max_length", None), "pair_length.max_length"
+        )
+        max_passage_length = _positive_integer(
+            getattr(pair_length, "max_passage_length", None),
+            "pair_length.max_passage_length",
+        )
+        if max_passage_length > max_length:
+            raise PassageChunkingError(
+                "pair_length.max_passage_length must not exceed max_length"
             )
+        passage_length_function = getattr(pair_length, "passage_length_function", None)
+        if not callable(passage_length_function):
+            raise PassageChunkingError(
+                "pair_length.passage_length_function must be callable"
+            )
+        if (
+            isinstance(overlap_tokens, bool)
+            or not isinstance(overlap_tokens, int)
+            or overlap_tokens < 0
         ):
-            raise TypeError("pass either config or keyword chunker settings, not both")
-        if config is None:
-            config = ChunkerConfig(
-                chunk_size=512 if chunk_size is None else chunk_size,
-                length_function=length_function,
-                length_function_fingerprint=length_function_fingerprint,
-                pipeline_name=pipeline_name,
-                fingerprint=fingerprint,
+            raise PassageChunkingError("overlap_tokens must be a nonnegative integer")
+        if overlap_tokens >= max_passage_length:
+            raise PassageChunkingError(
+                "overlap_tokens must be smaller than max_passage_length"
             )
-        self.config = config
+
+        versions = (
+            f"langchain-text-splitters={_runtime_version('langchain-text-splitters')}",
+            f"spacy={_runtime_version('spacy')}",
+        )
+        fingerprint_material = "|".join(
+            (
+                "passage-chunker-v1",
+                f"pair-length={pair_fingerprint}",
+                f"max-length={max_length}",
+                f"max-passage-length={max_passage_length}",
+                f"overlap-tokens={overlap_tokens}",
+                f"runtime={';'.join(versions)}",
+                f"pipelines={_PINNED_PIPELINE_MAPPING}",
+            )
+        )
+        self._pair_length = pair_length
+        self._overlap_tokens = overlap_tokens
+        self._fingerprint = "langchain-spacy-v1/" + sha256_bytes(
+            fingerprint_material
+        ).hex()
         self._sentence_splitters: dict[str, object] = {}
 
     @property
     def fingerprint(self) -> str:
-        return self.config.resolved_fingerprint
+        return self._fingerprint
 
     def _pipeline_for_language(self, language: str) -> str:
-        if self.config.pipeline_name is not None:
-            return self.config.pipeline_name
         try:
             return _PIPELINES_BY_LANGUAGE[language]
         except KeyError as error:
@@ -558,112 +243,216 @@ class LangChainPassageChunker:
                 f"no pinned spaCy pipeline is configured for language {language!r}"
             ) from error
 
-    def _paragraph_splitter(self) -> object:
-        character_splitter, _, _ = _load_splitters()
-        return character_splitter(
-            separator=r"(?:\r?\n){2,}",
-            is_separator_regex=True,
-            keep_separator="end",
-            strip_whitespace=False,
-            chunk_overlap=0,
-            add_start_index=True,
-            chunk_size=self.config.packing_chunk_size,
-            length_function=self.config.packing_length_function,
-        )
-
-    def _sentence_splitter(self, pipeline_name: str) -> object:
-        splitter = self._sentence_splitters.get(pipeline_name)
+    def _sentence_splitter(self, pipeline: str) -> object:
+        splitter = self._sentence_splitters.get(pipeline)
         if splitter is not None:
             return splitter
-        _, _, spacy_splitter = _load_splitters()
+        spacy_splitter, _ = _load_splitters()
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"\[W108\].*")
                 splitter = spacy_splitter(
                     separator="",
-                    pipeline=pipeline_name,
-                    max_length=self.config.max_length,
+                    pipeline=pipeline,
+                    chunk_size=self._pair_length.max_passage_length,
+                    chunk_overlap=self._overlap_tokens,
+                    length_function=self._pair_length.passage_length_function,
                     strip_whitespace=False,
-                    chunk_overlap=0,
                     add_start_index=True,
-                    chunk_size=self.config.packing_chunk_size,
-                    length_function=self.config.packing_length_function,
                 )
-        except (OSError, ImportError, ValueError) as error:
+        except PassageChunkingError:
+            raise
+        except Exception as error:
             raise PassageChunkingError(
-                f"required spaCy pipeline {pipeline_name!r} is unavailable"
+                f"required spaCy pipeline {pipeline!r} is unavailable"
             ) from error
-        self._sentence_splitters[pipeline_name] = splitter
+        self._sentence_splitters[pipeline] = splitter
         return splitter
 
     def _recursive_splitter(self) -> object:
-        _, recursive_splitter, _ = _load_splitters()
-        return recursive_splitter(
-            separators=[" ", ""],
-            keep_separator="end",
-            strip_whitespace=False,
-            chunk_overlap=0,
-            add_start_index=True,
-            chunk_size=self.config.packing_chunk_size,
-            length_function=self.config.packing_length_function,
-        )
+        _, recursive_splitter = _load_splitters()
+        try:
+            return recursive_splitter(
+                separators=[" ", ""],
+                chunk_size=self._pair_length.max_passage_length,
+                chunk_overlap=0,
+                length_function=self._pair_length.passage_length_function,
+                strip_whitespace=False,
+                add_start_index=True,
+            )
+        except Exception as error:
+            raise PassageChunkingError("recursive sentence splitter is unavailable") from error
 
     @staticmethod
-    def _spans_from_documents(
+    def _spacy_sentence_units(splitter: object, parent_text: str) -> tuple[_Span, ...]:
+        tokenizer = getattr(splitter, "_tokenizer", None)
+        if not callable(tokenizer):
+            return ()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r"\[W108\].*")
+                document = tokenizer(parent_text)
+            sentence_iter = document.sents
+        except Exception:
+            return ()
+        units: list[_Span] = []
+        for sentence in sentence_iter:
+            start = getattr(sentence, "start_char", None)
+            text_with_ws = getattr(sentence, "text_with_ws", None)
+            if (
+                isinstance(start, bool)
+                or not isinstance(start, int)
+                or start < 0
+                or not isinstance(text_with_ws, str)
+                or not text_with_ws
+            ):
+                return ()
+            end = start + len(text_with_ws)
+            if end > len(parent_text) or parent_text[start:end] != text_with_ws:
+                return ()
+            units.append(_Span(text_with_ws, start, end))
+        return tuple(units)
+
+    @staticmethod
+    def _adapt_offset_from_sentence_units(
+        parent_text: str,
+        content: str,
+        sentence_units: Sequence[_Span],
+        *,
+        previous_start: int,
+        previous_end: int,
+    ) -> _Span | None:
+        for start_index, first in enumerate(sentence_units):
+            if first.start_char <= previous_start:
+                continue
+            end = first.end_char
+            if (
+                end > previous_end
+                and parent_text[first.start_char:end] == content
+            ):
+                return _Span(content, first.start_char, end)
+            for later in sentence_units[start_index + 1 :]:
+                end = later.end_char
+                if end <= previous_end:
+                    continue
+                if parent_text[first.start_char:end] == content:
+                    return _Span(content, first.start_char, end)
+        return None
+
+    def _documents_to_spans(
+        self,
         parent_text: str,
         documents: Sequence[object],
         *,
         parent_name: str,
+        splitter: object,
     ) -> tuple[_Span, ...]:
-        spans: list[_Span] = []
-        cursor = 0
+        if not documents:
+            raise PassageChunkingError(f"{parent_name} splitter returned no documents")
+        raw_spans: list[_Span] = []
+        previous_start = -1
+        previous_end = -1
+        sentence_units: tuple[_Span, ...] | None = None
         for document in documents:
             content = getattr(document, "page_content", None)
             metadata = getattr(document, "metadata", None)
             if not isinstance(content, str) or not content:
-                raise PassageChunkingError(
-                    f"{parent_name} splitter returned empty text"
-                )
+                raise PassageChunkingError(f"{parent_name} splitter returned empty text")
             if not isinstance(metadata, dict) or "start_index" not in metadata:
                 raise PassageChunkingError(
                     f"{parent_name} splitter did not return start_index metadata"
                 )
             start = metadata["start_index"]
-            if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            if isinstance(start, bool) or not isinstance(start, int):
                 raise PassageChunkingError(
                     f"{parent_name} splitter returned invalid start_index"
                 )
-            end = start + len(content)
-            if start != cursor:
-                raise PassageChunkingError(
-                    f"{parent_name} splitter returned a gap or overlap at {start}"
+            if start < 0:
+                if sentence_units is None:
+                    sentence_units = self._spacy_sentence_units(splitter, parent_text)
+                adapted = self._adapt_offset_from_sentence_units(
+                    parent_text,
+                    content,
+                    sentence_units,
+                    previous_start=previous_start,
+                    previous_end=previous_end,
                 )
+                if adapted is None:
+                    raise PassageChunkingError(
+                        f"{parent_name} splitter returned invalid start_index"
+                    )
+                start = adapted.start_char
+            end = start + len(content)
             if end > len(parent_text) or parent_text[start:end] != content:
                 raise PassageChunkingError(
                     f"{parent_name} splitter returned a non-source slice"
                 )
-            spans.append(_Span(content, start, end))
-            cursor = end
-        if (
-            cursor != len(parent_text)
-            or "".join(span.text for span in spans) != parent_text
-        ):
-            raise PassageChunkingError(
-                f"{parent_name} splitter did not fully reconstruct its parent text"
+            if start <= previous_start or end <= previous_end:
+                raise PassageChunkingError(
+                    f"{parent_name} splitter returned non-increasing offsets"
+                )
+            raw_spans.append(_Span(content, start, end))
+            previous_start = start
+            previous_end = end
+
+        spans = list(raw_spans)
+        if spans[0].start_char > 0:
+            if not parent_text[: spans[0].start_char].isspace():
+                raise PassageChunkingError(
+                    f"{parent_name} splitter left an uncovered prefix"
+                )
+            spans[0] = _Span(
+                parent_text[: spans[0].end_char],
+                0,
+                spans[0].end_char,
+            )
+        for index in range(1, len(spans)):
+            previous = spans[index - 1]
+            current = spans[index]
+            if current.start_char > previous.end_char:
+                gap = parent_text[previous.end_char : current.start_char]
+                if not gap.isspace():
+                    raise PassageChunkingError(
+                        f"{parent_name} splitter left an uncovered gap"
+                    )
+                spans[index - 1] = _Span(
+                    parent_text[previous.start_char : current.start_char],
+                    previous.start_char,
+                    current.start_char,
+                )
+        last = spans[-1]
+        if last.end_char < len(parent_text):
+            if not parent_text[last.end_char :].isspace():
+                raise PassageChunkingError(
+                    f"{parent_name} splitter left an uncovered suffix"
+                )
+            spans[-1] = _Span(
+                parent_text[last.start_char :],
+                last.start_char,
+                len(parent_text),
             )
         return tuple(spans)
 
     def _split_exact(
-        self, splitter: object, parent_text: str, *, parent_name: str
+        self,
+        splitter: object,
+        parent_text: str,
+        *,
+        parent_name: str,
     ) -> tuple[_Span, ...]:
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"\[W108\].*")
                 documents = splitter.create_documents([parent_text])
-        except (OSError, ImportError, ValueError) as error:
+        except PassageChunkingError:
+            raise
+        except Exception as error:
             raise PassageChunkingError(f"{parent_name} splitter failed") from error
-        return self._spans_from_documents(
-            parent_text, documents, parent_name=parent_name
+        return self._documents_to_spans(
+            parent_text,
+            documents,
+            parent_name=parent_name,
+            splitter=splitter,
         )
 
     def chunk(
@@ -681,7 +470,7 @@ class LangChainPassageChunker:
             raise PassageChunkingError("canonical_text must not be empty")
         if not isinstance(selected_text, str) or not selected_text:
             raise PassageChunkingError("selected_text must not be empty")
-        if representation not in _REPRESENTATIONS:
+        if not isinstance(representation, str) or representation not in _REPRESENTATIONS:
             raise PassageChunkingError(
                 "representation must be canonical or report_text"
             )
@@ -692,144 +481,83 @@ class LangChainPassageChunker:
                 "report_text representation requires language='eng'"
             )
 
-        pipeline_name = self._pipeline_for_language(language)
-        paragraph_documents = self._split_exact(
-            self._paragraph_splitter(), selected_text, parent_name="paragraph"
+        pipeline = self._pipeline_for_language(language)
+        sentence_spans = self._split_exact(
+            self._sentence_splitter(pipeline),
+            selected_text,
+            parent_name="sentence",
         )
         final_spans: list[tuple[_Span, Boundary]] = []
-        for paragraph in paragraph_documents:
-            if self.config.length_function(paragraph.text) <= self.config.chunk_size:
-                final_spans.append((paragraph, "paragraph_packed"))
+        for sentence_span in sentence_spans:
+            if self._pair_length(sentence_span.text) <= self._pair_length.max_length:
+                final_spans.append((sentence_span, "sentence"))
                 continue
 
-            sentence_documents = self._split_exact(
-                self._sentence_splitter(pipeline_name),
-                paragraph.text,
-                parent_name="sentence",
+            confirmed = self._split_exact(
+                self._sentence_splitter(pipeline),
+                sentence_span.text,
+                parent_name="sentence confirmation",
             )
-            for sentence in sentence_documents:
-                if self.config.length_function(sentence.text) <= self.config.chunk_size:
-                    final_spans.append(
-                        (
-                            _Span(
-                                sentence.text,
-                                paragraph.start_char + sentence.start_char,
-                                paragraph.start_char + sentence.end_char,
-                            ),
-                            "sentence_packed",
-                        )
-                    )
-                    continue
-                recursive_documents = self._split_exact(
-                    self._recursive_splitter(),
-                    sentence.text,
-                    parent_name="recursive sentence",
+            if len(confirmed) != 1:
+                raise PassageChunkingError(
+                    "a multi-sentence chunk exceeded the full-pair ceiling"
                 )
-                for recursive in recursive_documents:
-                    if (
-                        self.config.length_function(recursive.text)
-                        > self.config.chunk_size
-                    ):
-                        raise PassageChunkingError(
-                            "recursive sentence fallback exceeded the configured ceiling"
-                        )
-                    final_spans.append(
-                        (
-                            _Span(
-                                recursive.text,
-                                paragraph.start_char
-                                + sentence.start_char
-                                + recursive.start_char,
-                                paragraph.start_char
-                                + sentence.start_char
-                                + recursive.end_char,
-                            ),
-                            "oversized_sentence_fallback",
-                        )
+            recursive_spans = self._split_exact(
+                self._recursive_splitter(),
+                sentence_span.text,
+                parent_name="recursive sentence",
+            )
+            for recursive_span in recursive_spans:
+                start = sentence_span.start_char + recursive_span.start_char
+                end = sentence_span.start_char + recursive_span.end_char
+                mapped = _Span(selected_text[start:end], start, end)
+                if self._pair_length(mapped.text) > self._pair_length.max_length:
+                    raise PassageChunkingError(
+                        "recursive sentence fallback exceeded the full-pair ceiling"
                     )
+                final_spans.append((mapped, "oversized_sentence"))
 
         if not final_spans:
             raise PassageChunkingError("no passages were produced")
-        self._validate_final_spans(selected_text, final_spans)
 
-        source_hash = sha256_bytes(canonical_text)
-        representation_hash = sha256_bytes(selected_text)
         passages = tuple(
             Passage(
                 document_id=document_id,
-                source_content_hash=source_hash,
-                representation=representation,
-                representation_hash=representation_hash,
+                representation=cast(Representation, representation),
                 language=language,
-                chunk_index=index,
-                passage_id=_passage_id(
-                    document_id=document_id,
-                    representation=representation,
-                    representation_hash=representation_hash,
-                    start_char=span.start_char,
-                    end_char=span.end_char,
-                    chunk_index=index,
-                    chunker_fingerprint=self.fingerprint,
-                ),
                 text=span.text,
                 start_char=span.start_char,
                 end_char=span.end_char,
-                boundary=boundary,
-                previous_passage_id=None,
-                next_passage_id=None,
                 content_hash=sha256_bytes(span.text),
-                chunker_fingerprint=self.fingerprint,
-                overlap_chars=0,
-                overlap_tokens=0,
+                boundary=boundary,
             )
-            for index, (span, boundary) in enumerate(final_spans)
+            for span, boundary in final_spans
         )
-        with_neighbors = tuple(
-            replace(
-                passage,
-                previous_passage_id=None
-                if index == 0
-                else passages[index - 1].passage_id,
-                next_passage_id=None
-                if index == len(passages) - 1
-                else passages[index + 1].passage_id,
-            )
-            for index, passage in enumerate(passages)
-        )
-        validate_passages(selected_text, with_neighbors)
-        return with_neighbors
+        validate_passages(selected_text, passages)
+        for passage in passages:
+            if self._pair_length(passage.text) > self._pair_length.max_length:
+                raise PassageChunkingError(
+                    "final passage exceeded the full-pair ceiling"
+                )
+        return passages
 
-    def _validate_final_spans(
-        self, selected_text: str, final_spans: Sequence[tuple[_Span, Boundary]]
-    ) -> None:
-        cursor = 0
-        chunks: list[str] = []
-        for span, boundary in final_spans:
-            if boundary not in _BOUNDARIES:
-                raise PassageChunkingError("unknown final boundary")
-            if self.config.length_function(span.text) > self.config.chunk_size:
-                raise PassageChunkingError(
-                    "final passage exceeded the configured ceiling"
-                )
-            if span.start_char != cursor:
-                raise PassageChunkingError("final spans are not adjacent")
-            if selected_text[span.start_char : span.end_char] != span.text:
-                raise PassageChunkingError(
-                    "final span is not an exact selected-text slice"
-                )
-            cursor = span.end_char
-            chunks.append(span.text)
-        if cursor != len(selected_text) or "".join(chunks) != selected_text:
-            raise PassageChunkingError("final spans do not reconstruct selected_text")
+
+def __getattr__(name: str) -> object:
+    """Keep stale package exports importable until later slices update them."""
+
+    if name == "PassageValidationError":
+        return PassageChunkingError
+    if name in {"ChunkerConfig", "LangChainPassageChunker"}:
+        return PassageChunker
+    raise AttributeError(name)
 
 
 __all__ = [
-    "ChunkerConfig",
-    "LangChainPassageChunker",
+    "Boundary",
     "Passage",
     "PassageChunker",
     "PassageChunkingError",
-    "PassageValidationError",
+    "Representation",
     "sha256_bytes",
     "validate_passages",
 ]
