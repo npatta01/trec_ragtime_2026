@@ -59,14 +59,14 @@ exact requests. `refresh` is control metadata and is not part of the identity.
 Transport-only OpenAI options such as timeout, extra headers, and extra query
 parameters are passed to the live call but excluded from the response identity.
 
-API keys, authorization headers, bearer tokens, and other credential fields
-must never enter the identity, artifact payload, warning, or exception text.
-The existing recursive credential-field rejection remains active for request
-and response payloads. Extend it only with an exact allowlist for the OpenAI
-SDK's numeric usage-counter fields (`prompt_tokens`, `completion_tokens`,
-`total_tokens`, `cached_tokens`, `audio_tokens`, `reasoning_tokens`,
-`accepted_prediction_tokens`, and `rejected_prediction_tokens`). Do not allow
-arbitrary `*_token` or `*_tokens` names.
+Client API keys, authorization headers, bearer tokens, and other transport
+credentials must never enter the identity, artifact payload, warning, or
+exception text.
+Request identity retains the existing recursive credential-field rejection.
+The complete validated `ChatCompletion.model_dump(mode="json")` response is
+cached without response-field-name filtering so usage data and provider
+extensions are preserved. The wrapper never merges client configuration,
+request headers, or transport credentials into that response payload.
 
 Responses have no TTL. Manual `refresh=True` skips the read, performs one live
 call, and replaces the same exact entry after successful validation.
@@ -131,9 +131,9 @@ temporary artifact-store test seams. They prove:
 - provider errors and streams are never cached;
 - malformed cached responses become safe misses;
 - artifact read/write failures preserve the valid live-call path;
-- request or response credential fields are rejected without leaking values;
-- known numeric OpenAI usage counters remain cacheable while unrecognized
-  token-bearing fields remain rejected;
+- request credential fields are rejected without leaking values;
+- the complete typed provider response, including usage counters and provider
+  extensions, survives a cache round trip;
 - API keys and authorization headers do not appear in object keys or stored
   payloads;
 - an L1 cache hit makes zero provider and zero HF network calls.
