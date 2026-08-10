@@ -1,6 +1,5 @@
 """Reusable client for the TREC RAGTIME retrieval service."""
 
-from .cache import SQLiteResponseCache, default_cache_path
 from .client import (
     DEFAULT_CONTENT_COLLECTION,
     DEFAULT_PIPELINE,
@@ -46,17 +45,11 @@ from .models import (
     RetrievedDocument,
     SearchHit,
 )
-from .paths import (
-    PROJECT_CACHE_DIR_ENV,
-    default_project_cache_dir,
-    ensure_private_cache_dir,
-)
 from .retriever import (
     DEFAULT_MAX_CONTENT_FALLBACKS,
     DocumentCorpus,
     RagtimeRetriever,
 )
-
 __all__ = [
     "DEFAULT_CONTENT_COLLECTION",
     "DEFAULT_HF_BASE_URL",
@@ -87,7 +80,6 @@ __all__ = [
     "LocalCorpusReadError",
     "LocalCorpusValidationError",
     "PipelineResult",
-    "PROJECT_CACHE_DIR_ENV",
     "RagtimeApiError",
     "RagtimeClient",
     "RagtimeConfigurationError",
@@ -96,11 +88,7 @@ __all__ = [
     "RagtimeRetriever",
     "RetrievalResult",
     "RetrievedDocument",
-    "SQLiteResponseCache",
     "SearchHit",
     "build_from_parquet",
-    "default_cache_path",
     "default_local_corpus_path",
-    "default_project_cache_dir",
-    "ensure_private_cache_dir",
 ]

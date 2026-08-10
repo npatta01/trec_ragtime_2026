@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from trec_ragtime.client import RagtimeApiError
@@ -19,6 +21,10 @@ from trec_ragtime.models import (
     RetrievedDocument,
     SearchHit,
 )
+from trec_ragtime.retrieval_cache import (
+    RetrievalArtifactReference,
+    retrieval_object_key,
+)
 from trec_ragtime.query_baselines import (
     PIPELINE,
     _atomic_write,
@@ -26,6 +32,7 @@ from trec_ragtime.query_baselines import (
     default_query_plan_path,
     fuse_ranked_hits,
     load_query_plans,
+    _load_cached_query_result,
     run_query_baseline,
 )
 
@@ -46,8 +53,15 @@ def _search_result(query: str, document_ids: list[str]) -> PipelineResult:
     )
 
 
-def _retrieval_result(query: str, document_ids: list[str]) -> RetrievalResult:
+def _retrieval_result(
+    query: str,
+    document_ids: list[str],
+    *,
+    missing_translation_ids: tuple[str, ...] = (),
+) -> RetrievalResult:
     search = _search_result(query, document_ids)
+    request_digest = hashlib.sha256(query.encode("utf-8")).digest()
+    fingerprint = hashlib.sha256(b"baseline-test-retriever").digest()
     return RetrievalResult(
         search_result=search,
         documents=tuple(
@@ -64,6 +78,14 @@ def _retrieval_result(query: str, document_ids: list[str]) -> RetrievalResult:
             )
             for hit in search.hits
         ),
+        missing_translation_ids=missing_translation_ids,
+        retrieval_artifact=RetrievalArtifactReference(
+            object_key=retrieval_object_key(fingerprint, request_digest),
+            request_digest=request_digest,
+            retriever_fingerprint=fingerprint,
+            stored_at=123.0,
+            cache_hit=False,
+        ),
     )
 
 
@@ -74,11 +96,16 @@ class FakeRetriever:
         *,
         corpus_revision: str = "test-revision",
         hydration_error: Exception | None = None,
+        identity_error: Exception | None = None,
     ) -> None:
         self.responses = responses
         self.corpus_revision = corpus_revision
         self.hydration_error = hydration_error
+        self.identity_error = identity_error
         self.calls: list[tuple[str, str, int | None, int | None, bool]] = []
+        self.cached_calls: list[tuple[str, str, int | None, int | None, bool]] = []
+        self.identity_calls: list[str] = []
+        self.contexts: list[dict[str, object] | None] = []
 
     @property
     def corpus_identity(self) -> dict[str, object]:
@@ -93,6 +120,31 @@ class FakeRetriever:
             "translation_count": 5,
         }
 
+    @property
+    def retrieval_corpus_identity(self) -> dict[str, object]:
+        return self.corpus_identity
+
+    def build_retrieval_identity(
+        self,
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+        query_context: dict[str, object] | None = None,
+    ) -> SimpleNamespace:
+        self.identity_calls.append(query)
+        if self.identity_error is not None:
+            raise self.identity_error
+        request_digest = hashlib.sha256(query.encode("utf-8")).digest()
+        fingerprint = hashlib.sha256(b"baseline-test-retriever").digest()
+        return SimpleNamespace(
+            object_key=retrieval_object_key(fingerprint, request_digest),
+            request_digest=request_digest,
+            retriever_fingerprint=fingerprint,
+        )
+
     def retrieve(
         self,
         query: str,
@@ -101,6 +153,7 @@ class FakeRetriever:
         top_k: int | None,
         max_content_fallbacks: int | None,
         fallback_on_hf_error: bool,
+        query_context: dict[str, object] | None = None,
     ) -> RetrievalResult:
         self.calls.append(
             (
@@ -111,10 +164,35 @@ class FakeRetriever:
                 fallback_on_hf_error,
             )
         )
+        self.contexts.append(query_context)
         response = self.responses[query]
         if isinstance(response, Exception):
             raise response
         return response
+
+    def get_cached_retrieval(
+        self,
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+        query_context: dict[str, object] | None = None,
+    ) -> RetrievalResult | None:
+        self.cached_calls.append(
+            (
+                query,
+                pipeline,
+                top_k,
+                max_content_fallbacks,
+                fallback_on_hf_error,
+            )
+        )
+        response = self.responses.get(query)
+        if isinstance(response, RetrievalResult):
+            return response
+        return None
 
     def enrich_documents(self, document_ids: list[str]) -> HydrationResult:
         if self.hydration_error is not None:
@@ -166,6 +244,7 @@ class ConcurrentFakeRetriever(FakeRetriever):
         top_k: int | None,
         max_content_fallbacks: int | None,
         fallback_on_hf_error: bool,
+        query_context: dict[str, object] | None = None,
     ) -> RetrievalResult:
         lock = self.tracker["lock"]
         assert isinstance(lock, type(threading.Lock()))
@@ -190,6 +269,7 @@ class ConcurrentFakeRetriever(FakeRetriever):
                 top_k=top_k,
                 max_content_fallbacks=max_content_fallbacks,
                 fallback_on_hf_error=fallback_on_hf_error,
+                query_context=query_context,
             )
         finally:
             completed = self.completed.get(query)
@@ -203,6 +283,51 @@ class ConcurrentFakeRetriever(FakeRetriever):
         if self.hydration_blocker is not None:
             self.hydration_blocker.wait(timeout=5)
         return super().enrich_documents(document_ids)
+
+
+class CacheOnlyFakeRetriever(FakeRetriever):
+    """A warm-run fake that can only serve exact retrieval artifacts."""
+
+    def retrieve(self, *args: object, **kwargs: object) -> RetrievalResult:
+        raise AssertionError("warm topic assembly must not call retrieve")
+
+    def enrich_documents(self, document_ids: list[str]) -> HydrationResult:
+        raise AssertionError("warm topic assembly must not call enrich_documents")
+
+
+class MetadataRaisingCacheOnlyRetriever(CacheOnlyFakeRetriever):
+    @property
+    def corpus_identity(self) -> dict[str, object]:
+        raise AssertionError("warm resume must not reopen corpus metadata")
+
+    @property
+    def retrieval_corpus_identity(self) -> dict[str, object]:
+        return {
+            "backend": "local",
+            "path": "/tmp/test-corpus.duckdb",
+            "schema_version": 2,
+            "dataset": "trec-ragtime/ragtime2",
+            "config": "default",
+            "revision": self.corpus_revision,
+            "document_count": 10,
+            "translation_count": 5,
+        }
+
+
+class CacheProbeMissRetriever(FakeRetriever):
+    """A resume retriever whose durable artifact lookup misses."""
+
+    def get_cached_retrieval(self, query: str, **kwargs: object) -> RetrievalResult | None:
+        self.cached_calls.append(
+            (
+                query,
+                str(kwargs["pipeline"]),
+                kwargs["top_k"],
+                kwargs["max_content_fallbacks"],
+                bool(kwargs["fallback_on_hf_error"]),
+            )
+        )
+        return None
 
 
 class QueryBaselineTests(unittest.TestCase):
@@ -319,7 +444,10 @@ class QueryBaselineTests(unittest.TestCase):
         self.assertEqual(first_topics["2001"]["status"], "error")
 
         second_retriever = FakeRetriever(
-            {"single one": _retrieval_result("single one", ["doc-c"])}
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a", "doc-b"]),
+                "single one": _retrieval_result("single one", ["doc-c"]),
+            }
         )
         idle_retriever = FakeRetriever({})
         run_query_baseline(
@@ -349,6 +477,187 @@ class QueryBaselineTests(unittest.TestCase):
         self.assertEqual(manifest["concurrency"], 2)
         self.assertEqual(manifest["counts"]["successful_topics"], 2)
         self.assertEqual(manifest["counts"]["failed_queries"], 0)
+        self.assertEqual(
+            first_retriever.contexts,
+            [
+                {
+                    "kind": "baseline_b",
+                    "query_construction": "problem_background_single_query_v1",
+                    "query_plan_sha256": hashlib.sha256(
+                        self.plans_path.read_bytes()
+                    ).hexdigest(),
+                    "query_index": 1,
+                },
+                {
+                    "kind": "baseline_b",
+                    "query_construction": "problem_background_single_query_v1",
+                    "query_plan_sha256": hashlib.sha256(
+                        self.plans_path.read_bytes()
+                    ).hexdigest(),
+                    "query_index": 1,
+                },
+            ],
+        )
+
+    def test_baseline_b_keeps_complete_uncached_result_in_memory(self) -> None:
+        responses = {
+            "single zero": _retrieval_result("single zero", ["doc-a"]),
+            "single one": _retrieval_result("single one", ["doc-b"]),
+        }
+        for query in responses:
+            result = responses[query]
+            responses[query] = RetrievalResult(
+                search_result=result.search_result,
+                documents=result.documents,
+                missing_translation_ids=result.missing_translation_ids,
+            )
+        retriever = FakeRetriever(
+            responses,
+            identity_error=ValueError("fresh retrieval must not build identity"),
+        )
+
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=retriever,
+            output_root=self.root / "runs",
+            run_id="uncached-in-memory",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        topics = {
+            row["topic_id"]: row
+            for row in map(json.loads, (run_dir / "topics.jsonl").read_text().splitlines())
+        }
+        self.assertEqual([topics[topic]["status"] for topic in self.expected_topic_ids], ["success", "success"])
+        self.assertEqual([topics[topic]["candidate_count"] for topic in self.expected_topic_ids], [1, 1])
+        self.assertEqual(retriever.cached_calls, [])
+        self.assertEqual(retriever.identity_calls, [])
+        queries = [
+            json.loads(line)
+            for line in (run_dir / "queries.jsonl").read_text().splitlines()
+        ]
+        self.assertTrue(all("retrieval_artifact" not in row for row in queries))
+
+    def test_resume_recomputes_successful_checkpoint_without_reference(self) -> None:
+        uncached = {
+            query: RetrievalResult(
+                search_result=result.search_result,
+                documents=result.documents,
+                missing_translation_ids=result.missing_translation_ids,
+            )
+            for query, result in {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }.items()
+        }
+        first = FakeRetriever(uncached)
+        first_run = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=first,
+            output_root=self.root / "runs",
+            run_id="recompute-no-reference",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        first_topics = [
+            json.loads(line)
+            for line in (first_run / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            [topic["status"] for topic in first_topics], ["success", "success"]
+        )
+
+        second = FakeRetriever(uncached)
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=second,
+            output_root=self.root / "runs",
+            run_id="recompute-no-reference",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        self.assertEqual([call[0] for call in second.calls], ["single zero", "single one"])
+        self.assertEqual(second.cached_calls, [])
+
+    def test_resume_recomputes_when_checkpoint_reference_is_missing_from_cache(self) -> None:
+        cold = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=cold,
+            output_root=self.root / "runs",
+            run_id="recompute-missing-artifact",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        resumed = CacheProbeMissRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=resumed,
+            output_root=self.root / "runs",
+            run_id="recompute-missing-artifact",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        self.assertEqual([call[0] for call in resumed.cached_calls], ["single zero", "single one"])
+        self.assertEqual([call[0] for call in resumed.calls], ["single zero", "single one"])
+        topics = [
+            json.loads(line)
+            for line in (self.root / "runs" / "recompute-missing-artifact" / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
+
+    def test_baseline_c_keeps_complete_uncached_facets_in_memory(self) -> None:
+        responses = {
+            query: RetrievalResult(
+                search_result=result.search_result,
+                documents=result.documents,
+                missing_translation_ids=result.missing_translation_ids,
+            )
+            for query, result in {
+                "facet zero a": _retrieval_result("facet zero a", ["doc-a"]),
+                "facet zero b": _retrieval_result("facet zero b", ["doc-b"]),
+                "facet one a": _retrieval_result("facet one a", ["doc-c"]),
+                "facet one b": _retrieval_result("facet one b", ["doc-d"]),
+            }.items()
+        }
+        retriever = FakeRetriever(responses)
+
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="c",
+            retriever=retriever,
+            output_root=self.root / "runs",
+            run_id="uncached-facets",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        topics = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
+        self.assertEqual([topic["candidate_count"] for topic in topics], [2, 2])
+        self.assertEqual(retriever.cached_calls, [])
 
     def test_baseline_c_labels_partial_and_error_topics(self) -> None:
         retriever = FakeRetriever(
@@ -479,14 +788,12 @@ class QueryBaselineTests(unittest.TestCase):
             json.loads(line)
             for line in (run_dir / "topics.jsonl").read_text().splitlines()
         ]
-        self.assertEqual([topic["status"] for topic in topics], ["error", "error"])
-        self.assertEqual(
-            topics[0]["hydration"]["error_type"], "LocalCorpusReadError"
-        )
-        self.assertEqual(topics[0]["candidate_count"], 0)
+        self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
+        self.assertEqual(topics[0]["hydration"]["failure_count"], 0)
+        self.assertEqual(topics[0]["candidate_count"], 1)
         manifest = json.loads((run_dir / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "complete")
-        self.assertEqual(manifest["counts"]["failed_topics"], 2)
+        self.assertEqual(manifest["counts"]["failed_topics"], 0)
 
     def test_corpus_identity_change_rejects_resume_without_calls(self) -> None:
         first = FakeRetriever(
@@ -798,7 +1105,12 @@ class QueryBaselineTests(unittest.TestCase):
             "".join(json.dumps(topic) + "\n" for topic in topics),
             encoding="utf-8",
         )
-        resumed = FakeRetriever({})
+        resumed = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
 
         run_query_baseline(
             self.plans_path,
@@ -818,6 +1130,301 @@ class QueryBaselineTests(unittest.TestCase):
         self.assertEqual(rebuilt[0]["status"], "success")
         self.assertEqual(rebuilt[0]["candidate_count"], 1)
         self.assertEqual(resumed.calls, [])
+
+    def test_warm_topic_reconstruction_is_cache_only(self) -> None:
+        cold = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=cold,
+            output_root=self.root / "runs",
+            run_id="warm-cache-only",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        warm = CacheOnlyFakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=warm,
+            output_root=self.root / "runs",
+            run_id="warm-cache-only",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        self.assertEqual(warm.calls, [])
+        self.assertEqual(
+            [call[0] for call in warm.cached_calls], ["single zero", "single one"]
+        )
+        topics = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
+        self.assertTrue(all("retrieval_artifact" in row for row in topics[0]["query_results"]))
+
+    def test_warm_reference_mismatch_is_rejected_before_topic_assembly(self) -> None:
+        cold = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=cold,
+            output_root=self.root / "runs",
+            run_id="warm-reference-mismatch",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        rows = [
+            json.loads(line)
+            for line in (run_dir / "queries.jsonl").read_text().splitlines()
+        ]
+        expected = next(row for row in rows if row["query"] == "single zero")
+        mismatched = {**expected, "retrieval_artifact": {
+            **expected["retrieval_artifact"],
+            "stored_at": 456.0,
+        }}
+        warm = CacheOnlyFakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "reference mismatch"):
+            _load_cached_query_result(
+                mismatched,
+                baseline="b",
+                plan_sha256=hashlib.sha256(self.plans_path.read_bytes()).hexdigest(),
+                retriever=warm,
+                top_k=100,
+                expected_query_index=1,
+            )
+        self.assertEqual(warm.calls, [])
+        self.assertEqual([call[0] for call in warm.cached_calls], ["single zero"])
+
+        matching = _load_cached_query_result(
+            expected,
+            baseline="b",
+            plan_sha256=hashlib.sha256(self.plans_path.read_bytes()).hexdigest(),
+            retriever=warm,
+            top_k=100,
+            expected_query_index=1,
+        )
+        self.assertEqual(matching.query, "single zero")
+        self.assertEqual(warm.calls, [])
+
+    def test_warm_resume_uses_captured_identity_without_corpus_metadata(self) -> None:
+        cold = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=cold,
+            output_root=self.root / "runs",
+            run_id="warm-no-metadata",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        warm = MetadataRaisingCacheOnlyRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=warm,
+            output_root=self.root / "runs",
+            run_id="warm-no-metadata",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        topics = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
+        self.assertEqual(warm.calls, [])
+
+    def test_wrong_but_self_consistent_reference_is_rejected_before_checkpoint(self) -> None:
+        wrong = _retrieval_result("different query", ["doc-a"])
+        retriever = FakeRetriever(
+            {
+                "single zero": wrong,
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=retriever,
+            output_root=self.root / "runs",
+            run_id="wrong-checkpoint-reference",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        queries = [
+            json.loads(line)
+            for line in (run_dir / "queries.jsonl").read_text().splitlines()
+        ]
+        first = next(row for row in queries if row["topic_id"] == "2000")
+        self.assertEqual(first["status"], "error")
+        self.assertNotIn("retrieval_artifact", first)
+
+    def test_checkpoint_query_index_must_match_plan_position(self) -> None:
+        retriever = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=retriever,
+            output_root=self.root / "runs",
+            run_id="bad-query-index",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        queries = [
+            json.loads(line)
+            for line in (run_dir / "queries.jsonl").read_text().splitlines()
+        ]
+        queries[0]["query_index"] = 0
+        (run_dir / "queries.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in queries),
+            encoding="utf-8",
+        )
+
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=FakeRetriever(
+                {
+                    "single zero": _retrieval_result("single zero", ["doc-a"]),
+                    "single one": _retrieval_result("single one", ["doc-b"]),
+                }
+            ),
+            output_root=self.root / "runs",
+            run_id="bad-query-index",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        topics = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(topics[0]["status"], "error")
+        self.assertIn("query_index", topics[0]["hydration"]["error_detail"])
+
+    def test_c_missing_translation_order_is_first_seen(self) -> None:
+        responses: dict[str, RetrievalResult | Exception] = {
+            "facet zero a": _retrieval_result(
+                "facet zero a", ["doc-b"], missing_translation_ids=("doc-b",)
+            ),
+            "facet zero b": _retrieval_result(
+                "facet zero b", ["doc-a"], missing_translation_ids=("doc-a",)
+            ),
+            "facet one a": RagtimeApiError("failure"),
+            "facet one b": RagtimeApiError("failure"),
+        }
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="c",
+            retriever=FakeRetriever(responses),
+            output_root=self.root / "runs",
+            run_id="translation-order",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        topics = {
+            row["topic_id"]: row
+            for row in map(json.loads, (run_dir / "topics.jsonl").read_text().splitlines())
+        }
+        self.assertEqual(
+            topics["2000"]["hydration"]["missing_translation_ids"],
+            ["doc-b", "doc-a"],
+        )
+
+    def test_c_same_id_text_disagreement_is_explicit(self) -> None:
+        first = _retrieval_result("facet zero a", ["shared"])
+        second_document = RetrievedDocument(
+            rank=1,
+            document_id="shared",
+            score=1.0,
+            text="a different canonical text",
+            url="https://example.test/shared",
+            date="2026-01-01",
+            language="eng",
+            content_source="local_corpus",
+            content_local_cache_hit=True,
+        )
+        # Give the independently-built second result a valid lightweight ref.
+        digest = hashlib.sha256(b"facet zero b").digest()
+        fingerprint = hashlib.sha256(b"baseline-test-retriever").digest()
+        second = RetrievalResult(
+            search_result=_search_result("facet zero b", ["shared"]),
+            documents=(second_document,),
+            retrieval_artifact=RetrievalArtifactReference(
+                object_key=retrieval_object_key(fingerprint, digest),
+                request_digest=digest,
+                retriever_fingerprint=fingerprint,
+                stored_at=123.0,
+                cache_hit=False,
+            ),
+        )
+        retriever = FakeRetriever(
+            {
+                "facet zero a": first,
+                "facet zero b": second,
+                "facet one a": _retrieval_result("facet one a", ["doc-c"]),
+                "facet one b": _retrieval_result("facet one b", ["doc-d"]),
+            }
+        )
+
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="c",
+            retriever=retriever,
+            output_root=self.root / "runs",
+            run_id="c-text-disagreement",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        topics = {
+            row["topic_id"]: row
+            for row in map(json.loads, (run_dir / "topics.jsonl").read_text().splitlines())
+        }
+        self.assertEqual(topics["2000"]["status"], "error")
+        self.assertIn("text disagreement", topics["2000"]["hydration"]["error_detail"])
 
     def test_concurrent_failure_stops_scheduling_new_queries(self) -> None:
         plans = [

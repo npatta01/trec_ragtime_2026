@@ -106,10 +106,34 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
 - Treat the participant API as immutable. `/pipeline` and `/content` cache
   entries do not expire by default; retain explicit refresh and namespace
   rotation only as manual invalidation controls.
-- `HuggingFaceCorpus` stores validated documents individually in that same
-  SQLite database. Its default TTL is 30 days and can be overridden with
-  `RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`; `none`, `off`, or `disabled` means no
-  expiry. Keep search and document refresh controls independent.
+- Private pipeline/content responses and Dataset Viewer documents use the
+  private Hugging Face Bucket as durable L2 storage, read through the
+  disposable owner-only `fsspec.simplecache` L1. Configure it with
+  `RAGTIME_HF_BUCKET_ID`, optional `RAGTIME_ARTIFACT_PREFIX`, and optional
+  `RAGTIME_ARTIFACT_CACHE_DIR`; `HF_TOKEN` is the optional Hugging Face token.
+  L1 cache, transport, permission, and malformed L2 failures are fatal; a
+  malformed L1 object may be repaired once from L2. `HuggingFaceCorpus` (the
+  deprecated Dataset Viewer backend) uses a 30-day document TTL, configurable
+  with `RAGTIME_HF_DOCUMENT_CACHE_TTL_SECONDS`; `none`, `off`, or `disabled`
+  means no expiry. Keep search and document refresh controls independent.
+- The explicit `ragtime-cache-import` command is the only SQLite reader. It
+  opens the legacy source read-only, validates canonical rows, preserves
+  `stored_at`, independently verifies every destination artifact, and writes a
+  sanitized owner-only manifest. It never deletes or modifies the source.
+- The explicit `ragtime-retrieval-import` command is the only importer for
+  existing Control-A/B/C retrieval run directories. It accepts only
+  `control_a_v1` and `query_baseline_v1`, validates immutable run/source hashes
+  and the pinned local corpus identity, and hydrates exact hit IDs only through
+  `LocalCorpusIndex.enrich_documents`. It must not construct a participant
+  client, call `/content`, or use Dataset Viewer. Complete queries are written
+  through `RetrievalArtifactCache`, then their L1 candidate is evicted and the
+  typed object is independently reread from L2. Failed/partial records are
+  skipped rather than upgraded to success. The output manifest is explicit,
+  atomic, owner-only, and sanitized: source hashes, counts, corpus provenance,
+  and object keys are allowed; query/body payloads, credentials, and local
+  cache secrets are not. The mutable JSONL run remains an audit/checkpoint
+  input; the `retrieval/v1/<fingerprint>/<prefix>/<request>.mpk` object is the
+  durable shared query cache reused by warm runners.
 - The Dataset Viewer fallback cache is TTL/namespace based and does not pin a
   Hub revision. Keep it only for environments without the complete local
   index. Do not build another FAISS/vector index for hydration; document IDs

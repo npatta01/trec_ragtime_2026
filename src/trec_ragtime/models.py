@@ -163,6 +163,10 @@ class RetrievalResult:
     documents: tuple[RetrievedDocument, ...]
     hydration_failures: tuple[HydrationFailure, ...] = ()
     missing_translation_ids: tuple[str, ...] = ()
+    # Filled by ``RetrievalArtifactCache`` after a successful read or write.
+    # ``Any`` avoids a runtime import cycle: the reference type lives in the
+    # cache adapter, while this model remains usable by the live retriever.
+    retrieval_artifact: Any | None = field(default=None, repr=False, compare=False)
 
     @property
     def query(self) -> str:
@@ -200,3 +204,15 @@ class RetrievalResult:
         return [
             document.as_record(include_text=include_text) for document in self.documents
         ]
+
+    @property
+    def artifact_reference(self) -> Any | None:
+        """Compatibility alias for the retrieval-artifact provenance."""
+
+        return self.retrieval_artifact
+
+    @property
+    def retrieval_artifact_reference(self) -> Any | None:
+        """Explicitly named alias used by checkpoint serializers."""
+
+        return self.retrieval_artifact
