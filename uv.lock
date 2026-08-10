@@ -2062,7 +2062,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "duckdb", specifier = ">=1.5.4,<2" },
-    { name = "fsspec", specifier = ">=2026.6.0,<2027" },
+    { name = "fsspec", specifier = ">=2026.6.0" },
     { name = "huggingface-hub", specifier = ">=1.5,<2" },
     { name = "ipykernel", specifier = ">=6.30.0" },
     { name = "ipython", specifier = ">=9.0.0" },

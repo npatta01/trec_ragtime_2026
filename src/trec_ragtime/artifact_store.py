@@ -2,23 +2,22 @@
 
 The store deliberately knows nothing about the bytes it stores.  Domain
 adapters provide a decoder to :meth:`ArtifactStore.read_validated`; an
-``ArtifactValidationError`` from that decoder is the one recoverable local
-failure.  All transport, permissions, and filesystem failures are fatal.
+``ArtifactValidationError`` from that decoder is the one recoverable artifact
+failure.  Remote cache failures are best effort: the instance disables remote
+access after the first operational failure while retaining usable L1 values.
 """
 
 from __future__ import annotations
 
 import hashlib
-import math
 import os
 import stat
-import time
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar, cast
 
 import fsspec
 from huggingface_hub import HfApi
-from huggingface_hub.errors import EntryNotFoundError
 
 from .paths import default_project_cache_dir, ensure_private_cache_dir
 
@@ -27,11 +26,6 @@ T = TypeVar("T")
 
 DEFAULT_ARTIFACT_CACHE_SUBDIRECTORY = "artifacts-v1"
 DEFAULT_CACHE_NAMESPACE = "ragtime2-2026-v1"
-DEFAULT_HYDRATION_RETRY_ATTEMPTS = 3
-DEFAULT_HYDRATION_RETRY_DELAY_SECONDS = 0.25
-MAX_HYDRATION_RETRY_ATTEMPTS = 5
-MAX_HYDRATION_RETRY_DELAY_SECONDS = 5.0
-REQUIRED_FSSPEC_VERSION = ">=2026.6.0,<2027"
 
 
 class ArtifactStoreError(Exception):
@@ -59,7 +53,7 @@ class ArtifactStoreLike(Protocol):
         self, object_key: str, decoder: Callable[[bytes], T]
     ) -> T | None: ...
 
-    def write(self, object_key: str, payload: bytes) -> None: ...
+    def write(self, object_key: str, payload: bytes) -> bool: ...
 
     def evict_local(self, object_key: str) -> None: ...
 
@@ -87,9 +81,8 @@ class ArtifactStore:
     ``api_factory`` and ``filesystem_factory`` are intentionally injectable so
     offline tests can exercise the complete L1/L2 protocol without making a
     network request.  They are both lazy: a valid L1 read never constructs an
-    HF client or filesystem.  Explicit refresh writes replace an existing
-    value atomically; successful writes are last-successful-write-wins for a
-    given identity-derived key.
+    HF client or filesystem.  The first remote operational failure disables
+    remote access for this instance; valid L1 reads remain available.
     """
 
     def __init__(
@@ -103,9 +96,6 @@ class ArtifactStore:
         endpoint: str | None = None,
         api_factory: ApiFactory | None = None,
         filesystem_factory: FilesystemFactory | None = None,
-        hydration_retry_attempts: int = DEFAULT_HYDRATION_RETRY_ATTEMPTS,
-        hydration_retry_delay: float = DEFAULT_HYDRATION_RETRY_DELAY_SECONDS,
-        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.bucket_id = self._validate_bucket_id(bucket_id)
         self.prefix = self._validate_prefix(prefix)
@@ -115,51 +105,13 @@ class ArtifactStore:
         self.namespace = namespace.strip()
         self.token = token
         self.endpoint = endpoint
-        if (
-            isinstance(hydration_retry_attempts, bool)
-            or not isinstance(hydration_retry_attempts, int)
-            or not 1 <= hydration_retry_attempts <= MAX_HYDRATION_RETRY_ATTEMPTS
-        ):
-            raise _configuration_error(
-                "hydration retry attempts must be an integer between 1 and 5"
-            )
-        try:
-            hydration_retry_delay_value = float(hydration_retry_delay)
-        except (OverflowError, TypeError, ValueError):
-            hydration_retry_delay_value = math.nan
-        if (
-            isinstance(hydration_retry_delay, bool)
-            or not isinstance(hydration_retry_delay, (int, float))
-            or not math.isfinite(hydration_retry_delay_value)
-            or not 0 <= hydration_retry_delay_value <= MAX_HYDRATION_RETRY_DELAY_SECONDS
-        ):
-            raise _configuration_error(
-                "hydration retry delay must be a finite number between 0 and 5 seconds"
-            )
-        if sleep is not None and not callable(sleep):
-            raise _configuration_error("hydration retry sleep must be callable")
-        self._hydration_retry_attempts = hydration_retry_attempts
-        self._hydration_retry_delay = hydration_retry_delay_value
-        self._sleep = sleep if sleep is not None else time.sleep
         self._api_factory = api_factory or HfApi
-        if filesystem_factory is None:
-            try:
-                simplecache_class = fsspec.get_filesystem_class("simplecache")
-                hydration_primitive = getattr(
-                    simplecache_class, "_get_cached_file_before_open", None
-                )
-            except Exception:
-                hydration_primitive = None
-            if not callable(hydration_primitive):
-                raise _configuration_error(
-                    "fsspec"
-                    f"{REQUIRED_FSSPEC_VERSION} is required: "
-                    "SimpleCacheFileSystem._get_cached_file_before_open is unavailable"
-                )
         self._filesystem_factory = filesystem_factory or fsspec.filesystem
         self._api: Any | None = None
         self._filesystem: Any | None = None
         self._private_verified = False
+        self._remote_disabled = False
+        self._remote_warning_emitted = False
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "ArtifactStore":
@@ -330,6 +282,18 @@ class ArtifactStore:
             )
         self._private_verified = True
 
+    def _disable_remote(self) -> None:
+        """Disable remote operations and emit one credential-safe warning."""
+
+        self._remote_disabled = True
+        if not self._remote_warning_emitted:
+            warnings.warn(
+                "remote artifact cache access disabled after an operational failure",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            self._remote_warning_emitted = True
+
     def _read_local(self, candidate: Path) -> tuple[bool, bytes | None]:
         try:
             file_status = candidate.lstat()
@@ -393,96 +357,46 @@ class ArtifactStore:
         if not stat.S_ISREG(file_status.st_mode):
             raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
 
-    def _get_paths_info(self, full_key: str) -> list[object]:
-        try:
-            return list(self._get_api().get_bucket_paths_info(self.bucket_id, [full_key]))
-        except Exception:
-            raise ArtifactStoreRemoteError(
-                "failed to inspect the Hugging Face artifact path"
-            ) from None
+    def _best_effort_remove_candidate(self, candidate: Path) -> None:
+        """Remove a failed remote candidate without masking the remote miss."""
 
-    @staticmethod
-    def _is_listing_visibility_miss(error: BaseException) -> bool:
-        response = getattr(error, "response", None)
-        status = getattr(response, "status_code", None)
-        if status is None:
-            status = getattr(error, "status_code", None)
-        if status is not None:
-            return status == 404
-        return isinstance(error, (EntryNotFoundError, FileNotFoundError))
-
-    @staticmethod
-    def _invalidate_target_cache(filesystem: Any, path: str) -> None:
-        target = getattr(filesystem, "fs", None)
-        invalidate = getattr(target, "invalidate_cache", None)
-        if not callable(invalidate):
-            raise ArtifactStoreRemoteError(
-                "artifact target cache invalidation is unavailable"
-            )
         try:
-            invalidate(path)
-        except Exception:
-            raise ArtifactStoreRemoteError(
-                "failed to invalidate the artifact target cache"
-            ) from None
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            return
 
     def _read_remote(self, object_key: str) -> bytes | None:
-        full_key = self._full_object_key(object_key)
-        self._verify_private_bucket()
-        paths_info = self._get_paths_info(full_key)
-        if not paths_info:
+        if self._remote_disabled:
+            return None
+        try:
+            self._verify_private_bucket()
+        except Exception:
+            self._disable_remote()
             return None
 
         candidate = self.local_candidate(object_key)
         try:
-            filesystem = self._get_filesystem()
-            hydrate = getattr(filesystem, "_get_cached_file_before_open", None)
-            if callable(hydrate):
-                # Stock simplecache._open() calls target.exists(), which is an
-                # unsafe miss classifier for HF Buckets.  Paths-info already
-                # proved the object exists, so invoke simplecache's hydration
-                # primitive directly and read its exact mapped candidate.
-                stripped_path = filesystem._strip_protocol(self._remote_path(object_key))
-                for attempt in range(self._hydration_retry_attempts):
-                    try:
-                        hydrate(stripped_path)
-                    except Exception as error:
-                        self._remove_candidate(candidate)
-                        retryable = self._is_listing_visibility_miss(error)
-                        exhausted = attempt + 1 >= self._hydration_retry_attempts
-                        if not retryable or exhausted:
-                            raise
-                        self._invalidate_target_cache(filesystem, stripped_path)
-                        if not self._get_paths_info(full_key):
-                            raise ArtifactStoreRemoteError(
-                                "artifact path disappeared during hydration retry"
-                            )
-                        self._sleep(self._hydration_retry_delay)
-                        continue
-                    found, payload = self._read_local(candidate)
-                    if not found:
-                        raise ArtifactStoreRemoteError(
-                            "artifact filesystem did not retain the local candidate"
-                        )
-                    break
-            else:
-                # Do not fall back to SimpleCacheFileSystem.open(): its stock
-                # read path probes target.exists(), which is not a permitted
-                # miss classifier after paths-info proved this object exists.
-                raise ArtifactStoreRemoteError(
-                    "required artifact hydration primitive is unavailable"
-                )
-            if not isinstance(payload, (bytes, bytearray)):
-                raise ArtifactStoreRemoteError("Hugging Face artifact did not contain bytes")
-            self._secure_candidate(candidate)
-            return bytes(payload)
+            with self._get_filesystem().open(self._remote_path(object_key), "rb") as handle:
+                payload = handle.read()
+        except FileNotFoundError:
+            # Ordinary simplecache absence is a quiet miss.  In particular,
+            # do not trip the breaker on the target's normal not-found path.
+            return None
         except Exception:
-            # A failed hydration can leave a partial candidate behind.  Remove
-            # only this exact mapped path before exposing a sanitized failure.
-            self._remove_candidate(candidate)
-            raise ArtifactStoreRemoteError(
-                "failed to download the Hugging Face artifact"
-            ) from None
+            self._best_effort_remove_candidate(candidate)
+            self._disable_remote()
+            return None
+        if not isinstance(payload, (bytes, bytearray)):
+            self._best_effort_remove_candidate(candidate)
+            self._disable_remote()
+            return None
+        try:
+            self._secure_candidate(candidate)
+        except Exception:
+            self._best_effort_remove_candidate(candidate)
+            self._disable_remote()
+            return None
+        return bytes(payload)
 
     def read(self, object_key: str) -> bytes | None:
         """Read raw bytes, using L1 before the private HF Bucket."""
@@ -527,32 +441,35 @@ class ArtifactStore:
         payload = self._read_remote(object_key)
         if payload is None:
             return None
-        # A corrupt L2 object is a fatal validation error.  It must not be
-        # evicted or overwritten by this read path.
-        return decoder(payload)
+        try:
+            return decoder(payload)
+        except ArtifactValidationError:
+            # The remote response is now also an L1 candidate.  Evict only
+            # this exact object so a corrupt artifact becomes a miss without
+            # disturbing neighboring cache entries.
+            self._best_effort_remove_candidate(candidate)
+            return None
 
-    def write(self, object_key: str, payload: bytes) -> None:
-        """Atomically upload bytes, allowing explicit refresh replacement.
-
-        Artifact keys are identity-derived, while writes are intentionally
-        last-successful-write-wins for refreshes of the same key.
-        """
+    def write(self, object_key: str, payload: bytes) -> bool:
+        """Upload bytes when remote access is healthy, returning success."""
 
         object_key = self._validate_object_key(object_key)
         if not isinstance(payload, bytes):
             raise _configuration_error("artifact payload must be bytes")
-        self._verify_private_bucket()
         candidate = self.local_candidate(object_key)
         self._check_candidate_before_write(candidate)
+        if self._remote_disabled:
+            return False
         try:
+            self._verify_private_bucket()
             with self._get_filesystem().open(self._remote_path(object_key), "wb") as handle:
                 handle.write(payload)
             self._secure_candidate(candidate)
         except Exception:
-            self._remove_candidate(candidate)
-            raise ArtifactStoreRemoteError(
-                "failed to upload the Hugging Face artifact"
-            ) from None
+            self._best_effort_remove_candidate(candidate)
+            self._disable_remote()
+            return False
+        return True
 
     def configuration(self) -> Mapping[str, object]:
         """Return storage metadata with credentials omitted."""
