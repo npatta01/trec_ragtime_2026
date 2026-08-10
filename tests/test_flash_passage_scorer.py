@@ -9,10 +9,12 @@ import json
 import logging
 import math
 import sys
+import textwrap
 import threading
 import types
 import unittest
 import warnings
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
@@ -467,6 +469,58 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
         self.assertFalse(loop_thread.is_alive())
 
+    def test_outer_timeout_quiesces_siblings_before_score_returns(self) -> None:
+        class OuterTimeoutRunner:
+            def __init__(self) -> None:
+                self.dispatches = 0
+                self.active = 0
+                self.events: list[str] = []
+
+            async def run_batch(self, payload: bytes) -> bytes:
+                self.dispatches += 1
+                dispatch = self.dispatches
+                self.events.append(f"dispatch-{dispatch}")
+                self.active += 1
+                try:
+                    await asyncio.sleep(60.0)
+                except asyncio.CancelledError:
+                    self.active -= 1
+                    self.events.append(f"cancel-{dispatch}")
+                    while True:
+                        self.events.append(f"drain-{dispatch}")
+                        await asyncio.sleep(0)
+
+        passages = tuple(_passage(f"text-{index}", document_id=str(index)) for index in range(4))
+        runner = OuterTimeoutRunner()
+        scorer = RunpodFlashPassageScorer(
+            RunpodFlashConfig(
+                endpoint_id="fake",
+                batch_size=1,
+                concurrency=2,
+                request_timeout=0.001,
+            ),
+            runner,
+        )
+        loop_thread = scorer._bridge._thread  # type: ignore[attr-defined]
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaises(FlashScoringError):
+                scorer.score("query", passages)
+            events_at_return = tuple(runner.events)
+            self.assertEqual(runner.active, 0)
+            self.assertFalse(loop_thread.is_alive())
+            self.assertTrue(scorer._bridge.closed)  # type: ignore[attr-defined]
+            gc.collect()
+
+        self.assertFalse(any(item.category is RuntimeWarning for item in caught))
+        self.assertLessEqual(runner.dispatches, 2)
+        import time
+
+        time.sleep(0.05)
+        self.assertEqual(tuple(runner.events), events_at_return)
+        scorer.close()
+
     def test_stdout_and_stderr_never_contain_query_text_hash_or_credentials(self) -> None:
         query = "secret query"
         text_value = "secret passage"
@@ -484,27 +538,92 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         for secret in (query, text_value, token, passage.content_hash.hex()):
             self.assertNotIn(secret, combined)
 
-    def test_local_and_remote_fake_models_have_exact_score_parity(self) -> None:
+    def test_local_and_remote_fake_models_have_exact_score_parity_through_wire(self) -> None:
+        policy = LocalCrossEncoderConfig(
+            device="cuda",
+            precision="float16",
+            batch_size=1,
+            max_length=20,
+            query_format="Q: {query}",
+            query_policy="q-policy-v2",
+        )
         passages = (_passage("a", document_id="a"), _passage("longer", document_id="b"))
+        local_calls: dict[str, list[Any]] = {"tokenizer": [], "predict": []}
+        worker_calls: dict[str, list[Any]] = {"tokenizer": [], "predict": []}
 
         class Tokenizer:
+            def __init__(self, calls: dict[str, list[Any]]) -> None:
+                self.calls = calls
+
             def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
-                return {"input_ids": [[1] * (len(query) + len(text))]}
+                self.calls["tokenizer"].append((query, text, kwargs))
+                length = 100 if text == "overflow" else len(query) + len(text)
+                return {"input_ids": [[1] * length]}
 
         class Model:
+            def __init__(self, calls: dict[str, list[Any]]) -> None:
+                self.calls = calls
+
             def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
-                return [float(len(text)) for _, text in pairs]
+                self.calls["predict"].append((pairs, kwargs))
+                return [float(len(text) * 2 + 0.5) for _, text in pairs]
 
-        local = LocalCrossEncoderScorer(
-            LocalCrossEncoderConfig(max_length=100),
-            loader=lambda config: (Model(), Tokenizer()),
-        )
+        def loader_for(calls: dict[str, list[Any]]) -> Callable[[LocalCrossEncoderConfig], object]:
+            return lambda config: (Model(calls), Tokenizer(calls))
+
+        local = LocalCrossEncoderScorer(policy, loader=loader_for(local_calls))
+        worker_class = build_flash_worker(policy, loader=loader_for(worker_calls))
+        worker = worker_class()
+        observed: dict[str, object] = {}
+
+        class InMemoryWireRunner:
+            async def run_batch(self, payload: bytes) -> bytes:
+                request = decode_flash_request(payload)
+                observed["request"] = request
+                worker_response = worker.score(**request)
+                encoded = encode_flash_response(
+                    worker_response["scores"],
+                    schema_version=worker_response["schema_version"],
+                    scorer_fingerprint=worker_response["scorer_fingerprint"],
+                )
+                decoded = decode_flash_response(encoded)
+                observed["response"] = decoded
+                return encode_flash_response(
+                    decoded["scores"],
+                    schema_version=decoded["schema_version"],
+                    scorer_fingerprint=decoded["scorer_fingerprint"],
+                )
+
         remote = RunpodFlashPassageScorer(
-            RunpodFlashConfig(endpoint_id="fake", model_config=LocalCrossEncoderConfig(max_length=100)),
-            FakeAsyncRunner(),
+            RunpodFlashConfig(endpoint_id="fake", model_config=policy),
+            InMemoryWireRunner(),
         )
 
-        self.assertEqual(local.score("query", passages), remote.score("query", passages))
+        local_scores = local.score("query", passages)
+        remote_scores = remote.score("query", passages)
+
+        self.assertEqual(local_scores, remote_scores)
+        request = observed["request"]
+        self.assertEqual(request["schema_version"], WIRE_SCHEMA_VERSION)
+        self.assertEqual(request["scorer_fingerprint"], policy.fingerprint)
+        self.assertEqual(observed["response"]["scorer_fingerprint"], policy.fingerprint)
+        for calls in (local_calls, worker_calls):
+            self.assertEqual([entry[:2] for entry in calls["tokenizer"]], [
+                ("Q: query", "a"),
+                ("Q: query", "longer"),
+            ])
+            self.assertTrue(all(entry[2]["truncation"] is False for entry in calls["tokenizer"]))
+            self.assertTrue(all(entry[2]["max_length"] == 20 for entry in calls["tokenizer"]))
+            self.assertEqual([entry[0] for entry in calls["predict"]], [[("Q: query", "a")], [("Q: query", "longer")]])
+            self.assertTrue(all(entry[1]["apply_softmax"] is False for entry in calls["predict"]))
+            self.assertTrue(all(entry[1]["convert_to_numpy"] is True for entry in calls["predict"]))
+            self.assertTrue(all(entry[1]["convert_to_tensor"] is False for entry in calls["predict"]))
+
+        overflowing = _passage("overflow", document_id="overflow")
+        with self.assertRaises(PassageScoringError):
+            local.score("query", (overflowing,))
+        with self.assertRaises(FlashScoringError):
+            remote.score("query", (overflowing,))
 
 
 class EndpointRunnerTests(unittest.TestCase):
@@ -741,6 +860,52 @@ class FlashWorkerTests(unittest.TestCase):
         self.assertEqual(response["schema_version"], WIRE_SCHEMA_VERSION)
         self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
         self.assertEqual(response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 10.5}])
+
+    def test_extracted_worker_source_preserves_non_default_model_policy(self) -> None:
+        policy = LocalCrossEncoderConfig(
+            model_name="fake/model",
+            revision="revision-v2",
+            sentence_transformers_version="5.7.0",
+            device="cuda",
+            precision="float16",
+            batch_size=3,
+            max_length=77,
+            query_format="Q: {query}",
+            query_policy="q-policy-v2",
+        )
+        loader_configs: list[LocalCrossEncoderConfig] = []
+
+        class Tokenizer:
+            def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+                return {"input_ids": [[1] * (len(query) + len(text))]}
+
+        class Model:
+            def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+                return [3.5 for _ in pairs]
+
+        def loader(config: LocalCrossEncoderConfig) -> object:
+            loader_configs.append(config)
+            return Model(), Tokenizer()
+
+        Worker = build_flash_worker(policy)
+        source = textwrap.dedent(inspect.getsource(Worker))
+        self.assertIn("_MODEL_CONFIG", source)
+        class_source = source[source.index("class FlashPassageWorker:") :]
+        namespace: dict[str, object] = {}
+        exec(compile(class_source, "<extracted-flash-worker>", "exec"), namespace)
+        ExtractedWorker = namespace["FlashPassageWorker"]
+        extracted = ExtractedWorker(loader=loader)
+
+        response = extracted.score(
+            query="query",
+            rows=[{"hash": sha256_bytes("text").hex(), "text": "text"}],
+            schema_version=WIRE_SCHEMA_VERSION,
+            scorer_fingerprint=policy.fingerprint,
+        )
+
+        self.assertEqual(loader_configs, [policy])
+        self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
+        self.assertEqual(response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 3.5}])
 
     def test_worker_rejects_schema_or_fingerprint_mismatch(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=100)

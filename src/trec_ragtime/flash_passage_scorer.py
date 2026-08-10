@@ -27,6 +27,7 @@ DEFAULT_FLASH_BATCH_SIZE = 32
 DEFAULT_FLASH_CONCURRENCY = 4
 DEFAULT_FLASH_REQUEST_TIMEOUT = 60.0
 DEFAULT_FLASH_IDLE_TIMEOUT = 300.0
+_BRIDGE_CLEANUP_GRACE_SECONDS = 0.5
 
 
 class FlashScoringError(PassageScoringError):
@@ -462,11 +463,25 @@ class _EventLoopBridge:
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
             raise FlashScoringError("Flash event-loop bridge is closed")
-        future = asyncio.run_coroutine_threadsafe(_as_coroutine(awaitable), self._loop)
+        completed = threading.Event()
+        future = asyncio.run_coroutine_threadsafe(
+            _run_with_completion(awaitable, completed),
+            self._loop,
+        )
         try:
             return future.result(timeout=timeout)
         except TimeoutError:
             future.cancel()
+            # Cancellation of a concurrent future only schedules cancellation
+            # on the private loop.  Wait for the wrapped coroutine's finally
+            # block so sibling cancellation and endpoint job cleanup finish
+            # before returning.  Closing in either case keeps this timed-out
+            # bridge from ever returning with local work or a live thread.
+            completed.wait(_BRIDGE_CLEANUP_GRACE_SECONDS)
+            try:
+                self.close()
+            except BaseException:
+                pass
             raise
 
     def close(self) -> None:
@@ -495,8 +510,14 @@ class _EventLoopBridge:
             pass
 
 
-async def _as_coroutine(awaitable: Awaitable[Any]) -> Any:
-    return await awaitable
+async def _run_with_completion(
+    awaitable: Awaitable[Any],
+    completed: threading.Event,
+) -> Any:
+    try:
+        return await awaitable
+    finally:
+        completed.set()
 
 
 def _runner_awaitable(runner: object, payload: bytes) -> Awaitable[object]:
