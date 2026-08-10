@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -23,7 +24,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .artifact_store import ArtifactStore
-from .cache import DEFAULT_CACHE_NAMESPACE, ResponseCache, canonicalize_json
+from .cache import (
+    DEFAULT_CACHE_NAMESPACE,
+    ResponseCache,
+    _is_credential_field,
+    canonicalize_json,
+)
 from .client import RagtimeClient
 from .huggingface import (
     DEFAULT_HF_CONFIG,
@@ -50,6 +56,29 @@ _OPERATION_TTLS: dict[str, float | None] = {
     "content": None,
     HF_CACHE_OPERATION: DEFAULT_HF_DOCUMENT_CACHE_TTL_SECONDS,
 }
+_SAFE_BUCKET_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_SAFE_PREFIX_PART = re.compile(r"[A-Za-z0-9_~%+-][A-Za-z0-9._~%+-]*\Z")
+_SENSITIVE_METADATA_PARTS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "authentication",
+        "bearer",
+        "body",
+        "credential",
+        "credentials",
+        "key",
+        "password",
+        "passwd",
+        "query",
+        "request",
+        "response",
+        "secret",
+        "text",
+        "token",
+        "url",
+    }
+)
 
 
 class CacheImportError(RuntimeError):
@@ -251,22 +280,46 @@ def _validate_row(
 
 
 def _safe_destination(cache: ResponseCache) -> dict[str, str]:
+    def safe_value(field: str, value: Any) -> str:
+        if not isinstance(value, str):
+            raise CacheImportError("destination metadata is not safe to record")
+        if field == "prefix" and value == "":
+            return value
+        if not value or any(
+            character.isspace() or ord(character) < 32 for character in value
+        ):
+            raise CacheImportError("destination metadata is not safe to record")
+        if any(character in value for character in "?#\\=@{}[]<>\"';&:"):
+            raise CacheImportError("destination metadata is not safe to record")
+        if "://" in value:
+            raise CacheImportError("destination metadata is not safe to record")
+        if _is_credential_field(value):
+            raise CacheImportError("destination metadata is not safe to record")
+        normalized = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").casefold()
+        if any(part in _SENSITIVE_METADATA_PARTS for part in normalized.split("_")):
+            raise CacheImportError("destination metadata is not safe to record")
+        if field == "bucket_id":
+            parts = value.split("/")
+            if len(parts) != 2 or any(
+                not _SAFE_BUCKET_PART.fullmatch(part) for part in parts
+            ):
+                raise CacheImportError("destination metadata is not safe to record")
+        else:
+            parts = value.split("/")
+            if any(
+                not part or part in {".", ".."} or not _SAFE_PREFIX_PART.fullmatch(part)
+                for part in parts
+            ):
+                raise CacheImportError("destination metadata is not safe to record")
+        return value
+
     destination: dict[str, str] = {"namespace": cache.namespace}
     store = getattr(cache, "store", None)
     for field in ("bucket_id", "prefix"):
         value = getattr(store, field, None)
         if value is None:
             continue
-        if not isinstance(value, str) or not value or any(
-            ord(character) < 32 for character in value
-        ):
-            raise CacheImportError("destination metadata is not safe to record")
-        if any(
-            marker in value.casefold()
-            for marker in ("token", "secret", "password", "authorization", "bearer")
-        ):
-            raise CacheImportError("destination metadata is not safe to record")
-        destination[field] = value
+        destination[field] = safe_value(field, value)
     return destination
 
 
@@ -323,10 +376,12 @@ def import_sqlite_cache(
         raise TypeError("cache must be a ResponseCache")
     if not isinstance(canonical_namespace, str) or not canonical_namespace.strip():
         raise ValueError("canonical namespace must not be empty")
-    canonical_namespace = canonical_namespace.strip()
+    if canonical_namespace != DEFAULT_CACHE_NAMESPACE:
+        raise ValueError("canonical namespace must be the project default")
     if cache.namespace != canonical_namespace:
         raise ValueError("cache namespace does not match canonical namespace")
     source = Path(source).expanduser()
+    destination = _safe_destination(cache)
     before, source_sha256, source_size = _source_bytes(source)
     imported = Counter({operation: 0 for operation in SUPPORTED_OPERATIONS})
     skipped = Counter({operation: 0 for operation in SUPPORTED_OPERATIONS})
@@ -435,7 +490,7 @@ def import_sqlite_cache(
     manifest = {
         "schema_version": 1,
         "source": {"sha256": summary.source_sha256, "size": summary.source_size},
-        "destination": _safe_destination(cache),
+        "destination": destination,
         "counts": summary.counts,
         "skipped_reasons": summary.skipped_reasons,
     }

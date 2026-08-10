@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from trec_ragtime.cache import ResponseCache
-from trec_ragtime.cache_import import import_sqlite_cache
+from trec_ragtime.cache_import import CacheImportError, import_sqlite_cache
 
 
 class MemoryArtifactStore:
@@ -262,6 +262,67 @@ class CacheImportTestCase(unittest.TestCase):
         before = self.source.read_bytes()
         import_sqlite_cache(self.source, self._cache()[0], self.manifest)
         self.assertEqual(self.source.read_bytes(), before)
+
+    def test_noncanonical_namespace_override_is_rejected_without_writes_or_source_mutation(self) -> None:
+        self.source.unlink()
+        self._create_source([pipeline_row(namespace="codex-private")])
+        store = MemoryArtifactStore()
+        cache = ResponseCache(store, namespace="codex-private", clock=time.time)
+        before = self.source.read_bytes()
+
+        with self.assertRaises(ValueError):
+            import_sqlite_cache(
+                self.source,
+                cache,
+                self.manifest,
+                canonical_namespace="codex-private",
+            )
+
+        self.assertEqual(store.objects, {})
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertFalse(self.manifest.exists())
+
+    def test_unsafe_destination_metadata_is_rejected_without_leaking_values(self) -> None:
+        bad_metadata = (
+            "owner/api_key=sensitive",
+            "owner/credential=sensitive",
+            "owner/private?query=sensitive",
+            "owner/private#fragment",
+            "https://owner/private?token=secret",
+        )
+        for bad_value in bad_metadata:
+            with self.subTest(bad_value=bad_value):
+                cache, store = self._cache()
+                store.bucket_id = bad_value
+                before = self.source.read_bytes()
+
+                with self.assertRaises(CacheImportError) as raised:
+                    import_sqlite_cache(self.source, cache, self.manifest)
+
+                self.assertNotIn(bad_value, str(raised.exception))
+                self.assertEqual(store.objects, {})
+                self.assertEqual(self.source.read_bytes(), before)
+                self.assertFalse(self.manifest.exists())
+
+        for bad_value in (
+            "api_key=sensitive",
+            "credential=sensitive",
+            "query=sensitive",
+            '{"body":"private body"}',
+            "https://private/path?token=secret",
+        ):
+            with self.subTest(bad_value=bad_value):
+                cache, store = self._cache()
+                store.prefix = bad_value
+                before = self.source.read_bytes()
+
+                with self.assertRaises(CacheImportError) as raised:
+                    import_sqlite_cache(self.source, cache, self.manifest)
+
+                self.assertNotIn(bad_value, str(raised.exception))
+                self.assertEqual(store.objects, {})
+                self.assertEqual(self.source.read_bytes(), before)
+                self.assertFalse(self.manifest.exists())
 
 
 if __name__ == "__main__":
