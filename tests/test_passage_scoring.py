@@ -3,9 +3,11 @@ from __future__ import annotations
 import math
 import subprocess
 import sys
+import types
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass, replace
 from typing import Any
+from unittest.mock import patch
 
 from trec_ragtime.passages import Passage, sha256_bytes
 from trec_ragtime.passage_scoring import (
@@ -151,6 +153,18 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
         self.assertEqual(len({variant.fingerprint for variant in variants}), len(variants))
         self.assertTrue(all(variant.fingerprint != base.fingerprint for variant in variants))
 
+    def test_fingerprint_encoding_separates_delimiter_containing_values(self) -> None:
+        left = LocalCrossEncoderConfig(
+            query_format="{query}\x1fquery_policy=y",
+            query_policy="z",
+        )
+        right = LocalCrossEncoderConfig(
+            query_format="{query}",
+            query_policy="y\x1fquery_policy=z",
+        )
+
+        self.assertNotEqual(left.fingerprint, right.fingerprint)
+
     def test_malformed_config_is_rejected_without_any_model_loader(self) -> None:
         for kwargs in (
             {"batch_size": 0},
@@ -194,6 +208,104 @@ assert 'torch' not in sys.modules
 
         self.assertEqual(load_calls, [])
         self.assertEqual(model.predict_calls, [])
+
+    def test_config_is_read_only_before_and_after_model_loading(self) -> None:
+        passage = _passage("passage")
+        original_config = LocalCrossEncoderConfig(batch_size=1)
+        replacement = LocalCrossEncoderConfig(batch_size=7)
+        model = RecordingModel({"passage": 1.0})
+        tokenizer = RecordingTokenizer()
+        scorer = LocalCrossEncoderScorer(
+            original_config,
+            loader=lambda config: (model, tokenizer),
+        )
+
+        with self.assertRaises(AttributeError):
+            scorer.config = replacement  # type: ignore[misc]
+
+        scorer.score("query", (passage,))
+
+        with self.assertRaises(AttributeError):
+            scorer.config = replacement  # type: ignore[misc]
+        self.assertIs(scorer.config, original_config)
+        self.assertEqual(scorer.fingerprint, original_config.fingerprint)
+        self.assertEqual(model.predict_calls[0][1]["batch_size"], 1)
+
+    def test_default_loader_and_predict_path_uses_pinned_runtime_seam(self) -> None:
+        passage = _passage("passage")
+        constructor_calls: list[tuple[str, dict[str, Any]]] = []
+        tokenizer_calls: list[tuple[str, str, dict[str, Any]]] = []
+        predict_calls: list[tuple[list[tuple[str, str]], dict[str, Any]]] = []
+        dtype = object()
+
+        class FakeTokenizer:
+            def __call__(
+                self,
+                query: str,
+                text: str,
+                **kwargs: Any,
+            ) -> dict[str, list[list[int]]]:
+                tokenizer_calls.append((query, text, kwargs))
+                return {"input_ids": [[1, 2, 3]]}
+
+        class FakeIdentity:
+            pass
+
+        class FakeCrossEncoder:
+            def __init__(self, model_name: str, **kwargs: Any) -> None:
+                constructor_calls.append((model_name, kwargs))
+                self.tokenizer = FakeTokenizer()
+
+            def predict(self, inputs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+                predict_calls.append((list(inputs), kwargs))
+                return [4.75]
+
+        fake_sentence_transformers = types.ModuleType("sentence_transformers")
+        fake_sentence_transformers.CrossEncoder = FakeCrossEncoder  # type: ignore[attr-defined]
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float32 = dtype  # type: ignore[attr-defined]
+        fake_torch.float16 = object()  # type: ignore[attr-defined]
+        fake_torch.bfloat16 = object()  # type: ignore[attr-defined]
+        fake_torch.nn = types.SimpleNamespace(Identity=FakeIdentity)  # type: ignore[attr-defined]
+
+        config = LocalCrossEncoderConfig(
+            device="rocm",
+            precision="float32",
+            batch_size=4,
+            max_length=17,
+            query_format="Q: {query}",
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "sentence_transformers": fake_sentence_transformers,
+                "torch": fake_torch,
+            },
+        ):
+            scorer = LocalCrossEncoderScorer(config)
+            scores = scorer.score("query", (passage,))
+
+        self.assertEqual(scores, {passage.content_hash: 4.75})
+        self.assertEqual(len(constructor_calls), 1)
+        model_name, constructor_kwargs = constructor_calls[0]
+        self.assertEqual(model_name, DEFAULT_MODEL_NAME)
+        self.assertEqual(constructor_kwargs["revision"], DEFAULT_MODEL_REVISION)
+        self.assertEqual(constructor_kwargs["device"], "cuda")
+        self.assertEqual(constructor_kwargs["max_length"], 17)
+        self.assertEqual(constructor_kwargs["model_kwargs"], {"torch_dtype": dtype})
+        self.assertEqual(len(tokenizer_calls), 1)
+        self.assertEqual(tokenizer_calls[0][0:2], ("Q: query", "passage"))
+        self.assertIs(tokenizer_calls[0][2]["truncation"], False)
+        self.assertEqual(tokenizer_calls[0][2]["max_length"], 17)
+        self.assertEqual(len(predict_calls), 1)
+        self.assertEqual(predict_calls[0][0], [("Q: query", "passage")])
+        predict_kwargs = predict_calls[0][1]
+        self.assertEqual(predict_kwargs["batch_size"], 4)
+        self.assertEqual(predict_kwargs["device"], "cuda")
+        self.assertIsInstance(predict_kwargs["activation_fn"], FakeIdentity)
+        self.assertFalse(predict_kwargs["apply_softmax"])
+        self.assertTrue(predict_kwargs["convert_to_numpy"])
+        self.assertFalse(predict_kwargs["convert_to_tensor"])
 
     def test_lazy_loader_is_called_once_and_scores_deduplicate_in_deterministic_batches(self) -> None:
         first = _passage("first", document_id="first")

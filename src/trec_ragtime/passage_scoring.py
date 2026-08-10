@@ -12,6 +12,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast, runtime_checkable
 
+import msgspec
+
 from .passages import Passage, sha256_bytes
 
 
@@ -94,21 +96,22 @@ def _query_format_fields(query_format: str) -> tuple[str, ...]:
 
 
 def _fingerprint_for_config(config: "LocalCrossEncoderConfig") -> str:
-    material = "\x1f".join(
+    material = msgspec.msgpack.encode(
         (
-            f"schema_version={config.schema_version}",
-            f"model_name={config.model_name}",
-            f"revision={config.revision}",
-            f"sentence_transformers={config.sentence_transformers_version}",
-            f"device={config.effective_device}",
-            f"precision={config.effective_precision}",
-            f"batch_size={config.batch_size}",
-            f"max_length={config.max_length}",
-            f"query_format={config.query_format}",
-            f"query_policy={config.query_policy}",
+            "local-cross-encoder-fingerprint-v1",
+            config.schema_version,
+            config.model_name,
+            config.revision,
+            config.sentence_transformers_version,
+            config.effective_device,
+            config.effective_precision,
+            config.batch_size,
+            config.max_length,
+            config.query_format,
+            config.query_policy,
         )
     )
-    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(material).hexdigest()
     return _FINGERPRINT_PREFIX + digest
 
 
@@ -396,6 +399,8 @@ def _identity_activation() -> Any:
 class LocalCrossEncoderScorer:
     """Lazily loaded, deterministic local scorer using raw CrossEncoder logits."""
 
+    __slots__ = ("_config", "_loader", "_load_lock", "_model", "_tokenizer")
+
     def __init__(
         self,
         config: LocalCrossEncoderConfig | None = None,
@@ -408,15 +413,21 @@ class LocalCrossEncoderScorer:
             raise TypeError("config must be a LocalCrossEncoderConfig")
         if loader is not None and not callable(loader):
             raise TypeError("loader must be callable")
-        self.config = config
+        self._config = config
         self._loader = loader or _default_loader
         self._load_lock = threading.Lock()
         self._model: Any | None = None
         self._tokenizer: Any | None = None
 
     @property
+    def config(self) -> LocalCrossEncoderConfig:
+        """Return the immutable scorer configuration."""
+
+        return self._config
+
+    @property
     def fingerprint(self) -> str:
-        return self.config.fingerprint
+        return self._config.fingerprint
 
     def _ensure_loaded(self) -> tuple[Any, Any]:
         if self._model is not None and self._tokenizer is not None:
@@ -424,7 +435,7 @@ class LocalCrossEncoderScorer:
         with self._load_lock:
             if self._model is None or self._tokenizer is None:
                 try:
-                    result = self._loader(self.config)
+                    result = self._loader(self._config)
                     model, tokenizer = _unpack_loader_result(result)
                 except PassageScoringError:
                     raise
@@ -441,14 +452,14 @@ class LocalCrossEncoderScorer:
                     query,
                     passage,
                     truncation=False,
-                    max_length=self.config.max_length,
+                    max_length=self._config.max_length,
                     return_length=True,
                 )
             except PassageScoringError:
                 raise
             except Exception as error:
                 raise PassageScoringError("tokenizer failed while validating a passage pair") from error
-            if _token_length(encoded) > self.config.max_length:
+            if _token_length(encoded) > self._config.max_length:
                 raise PassageScoringError("tokenizer pair overflowed max_length")
 
     def score(
@@ -462,28 +473,28 @@ class LocalCrossEncoderScorer:
         if not unique:
             return {}
 
-        formatted_query = self.config.query_format.format(query=query)
+        formatted_query = self._config.query_format.format(query=query)
         pairs = tuple((formatted_query, text) for _, text in unique)
         model, tokenizer = self._ensure_loaded()
         self._tokenize_pairs(tokenizer, pairs)
 
         raw_scores: list[object] = []
-        for start in range(0, len(pairs), self.config.batch_size):
-            batch = list(pairs[start : start + self.config.batch_size])
+        for start in range(0, len(pairs), self._config.batch_size):
+            batch = list(pairs[start : start + self._config.batch_size])
             try:
                 prediction = model.predict(
                     batch,
-                    batch_size=self.config.batch_size,
+                    batch_size=self._config.batch_size,
                     show_progress_bar=False,
                     activation_fn=_identity_activation(),
                     apply_softmax=False,
                     convert_to_numpy=True,
                     convert_to_tensor=False,
-                    device=self.config.effective_device,
+                    device=self._config.effective_device,
                     processing_kwargs={
                         "text": {
                             "truncation": False,
-                            "max_length": self.config.max_length,
+                            "max_length": self._config.max_length,
                         }
                     },
                 )
