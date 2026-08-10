@@ -166,7 +166,7 @@ class FakeRetriever:
             raise response
         return response
 
-    def retrieve_cached(
+    def get_cached_retrieval(
         self,
         query: str,
         *,

@@ -12,12 +12,11 @@ from types import SimpleNamespace
 from trec_ragtime import (
     PipelineResult,
     RagtimeApiError,
-    RetrievalArtifactReference,
     RetrievalResult,
     RetrievedDocument,
     SearchHit,
-    retrieval_object_key,
 )
+from trec_ragtime.retrieval_cache import RetrievalArtifactReference, retrieval_object_key
 from trec_ragtime.topic_candidates import (
     Topic,
     build_topic_query,

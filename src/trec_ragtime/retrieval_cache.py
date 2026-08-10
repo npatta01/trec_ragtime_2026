@@ -39,13 +39,6 @@ HYDRATION_BEHAVIOR_VERSION = "hydration-v1"
 FALLBACK_BEHAVIOR_VERSION = "fallback-v1"
 TRANSLATION_BEHAVIOR_VERSION = "translation-v1"
 
-# Descriptive aliases make the versions easy to discover without coupling
-# callers to one particular naming convention.
-RETRIEVAL_CLIENT_BEHAVIOR_VERSION = CLIENT_BEHAVIOR_VERSION
-RETRIEVAL_RETRIEVER_BEHAVIOR_VERSION = RETRIEVER_BEHAVIOR_VERSION
-RETRIEVAL_ENDPOINT_DEPTH_VERSION = ENDPOINT_DEPTH_BEHAVIOR_VERSION
-
-
 def _finite(value: Any, *, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
@@ -293,10 +286,6 @@ class RetrievalRequestIdentity:
         )
 
     @property
-    def fingerprint(self) -> bytes:
-        return self.retriever_fingerprint
-
-    @property
     def canonical_request_bytes(self) -> bytes:
         payload = {
             "schema_version": self.schema_version,
@@ -323,10 +312,6 @@ class RetrievalRequestIdentity:
     @property
     def base_url_digest(self) -> bytes:
         return hashlib.sha256(self.base_url.encode("utf-8")).digest()
-
-    @property
-    def request_hash(self) -> bytes:
-        return self.request_digest
 
     @property
     def request_digest_hex(self) -> str:
@@ -393,22 +378,6 @@ class RetrievalArtifactReference:
     def retriever_fingerprint_hex(self) -> str:
         return self.retriever_fingerprint.hex()
 
-    @property
-    def fingerprint(self) -> bytes:
-        return self.retriever_fingerprint
-
-    @property
-    def fingerprint_hex(self) -> str:
-        return self.retriever_fingerprint_hex
-
-    @property
-    def stored_timestamp(self) -> float:
-        return self.stored_at
-
-    @property
-    def cache_stored_at(self) -> float:
-        return self.stored_at
-
     def as_record(self) -> dict[str, object]:
         return {
             "object_key": self.object_key,
@@ -417,8 +386,6 @@ class RetrievalArtifactReference:
             "stored_at": float(self.stored_at),
             "cache_hit": self.cache_hit,
         }
-
-    to_record = as_record
 
 
 class RetrievalHitWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -464,35 +431,6 @@ class RetrievalResultWire(msgspec.Struct, frozen=True, forbid_unknown_fields=Tru
     missing_translation_ids: tuple[str, ...]
 
 
-class RetrievalRequestWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Canonical typed wire representation of one retrieval identity.
-
-    This request struct is an identity boundary for MessagePack encoding; it
-    is not the persisted result envelope stored by :class:`RetrievalArtifactCache`.
-    """
-
-    schema_version: int
-    base_url_digest: bytes
-    query_utf8: bytes
-    pipeline: str
-    top_k: int | None
-    endpoint_depth_version: str
-    max_content_fallbacks: int | None
-    fallback_on_hf_error: bool
-    content_collection: str
-    backend_policy: Any
-    query_context: dict[str, Any] | None
-    corpus_identity: dict[str, Any]
-    client_behavior_version: str
-    retriever_behavior_version: str
-    hydration_behavior_version: str
-    fallback_behavior_version: str
-    translation_behavior_version: str
-
-    def __post_init__(self) -> None:
-        _validate_schema_version(self.schema_version)
-
-
 class RetrievalEnvelope(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     schema_version: int
     retriever_fingerprint: bytes
@@ -502,11 +440,6 @@ class RetrievalEnvelope(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
 
     def __post_init__(self) -> None:
         _validate_schema_version(self.schema_version)
-
-
-# Stable descriptive aliases for callers that prefer endpoint-oriented names.
-RetrievalSearchHitWire = RetrievalHitWire
-RetrievalRetrievedDocumentWire = RetrievalDocumentWire
 
 
 _SUPPORTED_LANGUAGES = frozenset({"eng", "spa", "rus", "zho"})
@@ -816,7 +749,9 @@ class RetrievalArtifactCache:
             stored_at=stored_at,
             result=_to_wire(result),
         )
-        self.store.write(request.object_key, msgspec.msgpack.encode(envelope))
+        stored = self.store.write(request.object_key, msgspec.msgpack.encode(envelope))
+        if stored is not True:
+            return result
         reference = RetrievalArtifactReference(
             object_key=request.object_key,
             request_digest=request.request_digest,
@@ -838,10 +773,7 @@ __all__ = [
     "ENDPOINT_DEPTH_BEHAVIOR_VERSION",
     "FALLBACK_BEHAVIOR_VERSION",
     "HYDRATION_BEHAVIOR_VERSION",
-    "RETRIEVAL_CLIENT_BEHAVIOR_VERSION",
-    "RETRIEVAL_ENDPOINT_DEPTH_VERSION",
     "RETRIEVAL_OBJECT_KEY_PREFIX",
-    "RETRIEVAL_RETRIEVER_BEHAVIOR_VERSION",
     "RETRIEVAL_SCHEMA_VERSION",
     "RETRIEVER_BEHAVIOR_VERSION",
     "TRANSLATION_BEHAVIOR_VERSION",
@@ -853,10 +785,7 @@ __all__ = [
     "RetrievalHitWire",
     "RetrievalPipelineWire",
     "RetrievalRequestIdentity",
-    "RetrievalRequestWire",
-    "RetrievalRetrievedDocumentWire",
     "RetrievalResultWire",
-    "RetrievalSearchHitWire",
     "retrieval_object_key",
     "retriever_fingerprint",
 ]

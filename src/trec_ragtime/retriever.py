@@ -373,11 +373,6 @@ class RagtimeRetriever:
             corpus_identity=self._retrieval_corpus_identity(),
         )
 
-    # Descriptive aliases keep the pure seam discoverable to runner/importer
-    # callers without introducing a second identity implementation.
-    def retrieval_identity(self, *args: Any, **kwargs: Any) -> RetrievalRequestIdentity:
-        return self.build_retrieval_identity(*args, **kwargs)
-
     def get_cached_retrieval(
         self,
         query: str,
@@ -406,9 +401,6 @@ class RagtimeRetriever:
         # return a hit observed across that publication boundary.
         self._assert_corpus_publication_unchanged()
         return cached
-
-    def retrieve_cached(self, *args: Any, **kwargs: Any) -> RetrievalResult | None:
-        return self.get_cached_retrieval(*args, **kwargs)
 
     def close(self) -> None:
         try:

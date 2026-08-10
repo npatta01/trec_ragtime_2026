@@ -77,7 +77,7 @@ class RetrieverLike(Protocol):
         query_context: Mapping[str, object] | None = None,
     ) -> RetrievalResult: ...
 
-    def retrieve_cached(
+    def get_cached_retrieval(
         self,
         query: str,
         *,
@@ -572,7 +572,7 @@ def _load_cached_query_result(
         or query_index != expected_query_index
     ):
         raise ValueError("baseline query checkpoint has an invalid query identity")
-    cached = retriever.retrieve_cached(
+    cached = retriever.get_cached_retrieval(
         query,
         pipeline=PIPELINE,
         top_k=top_k,
