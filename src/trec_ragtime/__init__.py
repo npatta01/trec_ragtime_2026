@@ -7,12 +7,9 @@ from .cache import (
     ResponseCache,
     ResponseEnvelope,
     base_url_digest,
-    canonical_request,
     canonical_request_bytes,
     canonicalize_json,
-    object_key_for_request,
     request_digest,
-    request_identity_digest,
     response_object_key,
 )
 from .client import (
@@ -117,14 +114,11 @@ __all__ = [
     "SearchHit",
     "base_url_digest",
     "build_from_parquet",
-    "canonical_request",
     "canonical_request_bytes",
     "canonicalize_json",
     "default_local_corpus_path",
     "default_project_cache_dir",
     "ensure_private_cache_dir",
-    "object_key_for_request",
     "request_digest",
-    "request_identity_digest",
     "response_object_key",
 ]

@@ -314,6 +314,22 @@ class MetadataRaisingCacheOnlyRetriever(CacheOnlyFakeRetriever):
         }
 
 
+class CacheProbeMissRetriever(FakeRetriever):
+    """A resume retriever whose durable artifact lookup misses."""
+
+    def get_cached_retrieval(self, query: str, **kwargs: object) -> RetrievalResult | None:
+        self.cached_calls.append(
+            (
+                query,
+                str(kwargs["pipeline"]),
+                kwargs["top_k"],
+                kwargs["max_content_fallbacks"],
+                bool(kwargs["fallback_on_hf_error"]),
+            )
+        )
+        return None
+
+
 class QueryBaselineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -567,6 +583,47 @@ class QueryBaselineTests(unittest.TestCase):
 
         self.assertEqual([call[0] for call in second.calls], ["single zero", "single one"])
         self.assertEqual(second.cached_calls, [])
+
+    def test_resume_recomputes_when_checkpoint_reference_is_missing_from_cache(self) -> None:
+        cold = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=cold,
+            output_root=self.root / "runs",
+            run_id="recompute-missing-artifact",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        resumed = CacheProbeMissRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=resumed,
+            output_root=self.root / "runs",
+            run_id="recompute-missing-artifact",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+
+        self.assertEqual([call[0] for call in resumed.cached_calls], ["single zero", "single one"])
+        self.assertEqual([call[0] for call in resumed.calls], ["single zero", "single one"])
+        topics = [
+            json.loads(line)
+            for line in (self.root / "runs" / "recompute-missing-artifact" / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
 
     def test_baseline_c_keeps_complete_uncached_facets_in_memory(self) -> None:
         responses = {

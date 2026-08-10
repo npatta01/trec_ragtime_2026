@@ -8,7 +8,7 @@ import unittest
 from typing import Any, Callable
 
 import msgspec
-from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.artifact_store import ArtifactStoreRemoteError, ArtifactValidationError
 from trec_ragtime.cache import ResponseCache, base_url_digest
 from trec_ragtime.models import (
     HydrationFailure,
@@ -356,10 +356,41 @@ class RetrievalCacheTestCase(unittest.TestCase):
 
         returned = cache.put(request_fixture(), original)
 
-        self.assertIs(returned, original)
+        self.assertIsNot(returned, original)
         self.assertIsNone(returned.retrieval_artifact)
         self.assertEqual(store.writes[0][0], request_fixture().object_key)
         self.assertNotIn(request_fixture().object_key, store.objects)
+
+    def test_failed_write_clears_a_stale_reference_on_a_copy(self) -> None:
+        store = MemoryArtifactStore()
+        store.write_result = False
+        cache = RetrievalArtifactCache(store, clock=lambda: 99.5)
+        original = dataclasses.replace(
+            result_fixture(), retrieval_artifact=object()
+        )
+
+        returned = cache.put(request_fixture(), original)
+
+        self.assertIsNot(returned, original)
+        self.assertIsNone(returned.retrieval_artifact)
+        self.assertEqual(returned.search_result, original.search_result)
+        self.assertEqual(returned.documents, original.documents)
+
+    def test_operational_retrieval_store_failures_are_best_effort(self) -> None:
+        store = MemoryArtifactStore()
+        cache = RetrievalArtifactCache(store)
+        store.read_validated = lambda object_key, decoder: (_ for _ in ()).throw(
+            ArtifactStoreRemoteError("remote unavailable")
+        )
+        self.assertIsNone(cache.get(request_fixture()))
+
+        store.write = lambda object_key, payload: (_ for _ in ()).throw(
+            OSError("disk unavailable")
+        )
+        original = dataclasses.replace(result_fixture(), retrieval_artifact=object())
+        returned = cache.put(request_fixture(), original)
+        self.assertIsNot(returned, original)
+        self.assertIsNone(returned.retrieval_artifact)
 
     def test_base_url_validation_matches_response_cache_identity(self) -> None:
         response_cache = ResponseCache(MemoryArtifactStore())

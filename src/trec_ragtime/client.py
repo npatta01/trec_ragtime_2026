@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import time
+import warnings
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
@@ -15,7 +16,13 @@ from requests.adapters import HTTPAdapter
 from requests_ratelimiter import LimiterMixin
 from urllib3.util.retry import Retry
 
-from .artifact_store import ArtifactStore, ArtifactStoreLike, _legacy_cache_setting_name
+from .artifact_store import (
+    ArtifactStore,
+    ArtifactStoreConfigurationError,
+    ArtifactStoreLike,
+    ArtifactStoreUnavailableError,
+    _legacy_cache_setting_name,
+)
 from .cache import DEFAULT_CACHE_NAMESPACE, ResponseCache, sanitized_cache_configuration
 from .models import Document, PipelineResult, SearchHit
 
@@ -103,6 +110,20 @@ def _validate_ttl(name: str, value: float | None) -> None:
         raise RagtimeConfigurationError(f"{name} must be a number or None")
     if not math.isfinite(float(value)) or value < 0:
         raise RagtimeConfigurationError(f"{name} must be finite and non-negative")
+
+
+def _optional_artifact_store(*, namespace: str) -> ArtifactStore | None:
+    """Build the optional runtime cache, warning once when it is absent."""
+
+    try:
+        return ArtifactStore.from_env(namespace=namespace)
+    except ArtifactStoreUnavailableError:
+        warnings.warn(
+            "artifact cache configuration is unavailable; caching is disabled",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return None
 
 
 class _RateLimitedSession(LimiterMixin, requests.Session):
@@ -211,14 +232,16 @@ class RagtimeClient:
             self.cache = ResponseCache(artifact_store, namespace=cache_namespace)
         else:
             try:
-                self.artifact_store = ArtifactStore.from_env(namespace=cache_namespace)
-                self.cache = ResponseCache(
-                    self.artifact_store, namespace=cache_namespace
-                )
-            except Exception as exc:
+                self.artifact_store = _optional_artifact_store(namespace=cache_namespace)
+            except ArtifactStoreConfigurationError as exc:
                 raise RagtimeConfigurationError(
                     f"unable to initialize the RAGTIME cache: {exc}"
                 ) from None
+            self.cache = (
+                None
+                if self.artifact_store is None
+                else ResponseCache(self.artifact_store, namespace=cache_namespace)
+            )
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "RagtimeClient":
@@ -255,13 +278,17 @@ class RagtimeClient:
             and options.get("artifact_store") is None
         ):
             try:
-                options["artifact_store"] = ArtifactStore.from_env(
+                artifact_store = _optional_artifact_store(
                     namespace=options["cache_namespace"]
                 )
-            except Exception as exc:
+            except ArtifactStoreConfigurationError as exc:
                 raise RagtimeConfigurationError(
                     f"unable to initialize the RAGTIME cache: {exc}"
                 ) from None
+            if artifact_store is None:
+                options["use_cache"] = False
+            else:
+                options["artifact_store"] = artifact_store
         return cls(base_url, bearer_token, **options)
 
     @property

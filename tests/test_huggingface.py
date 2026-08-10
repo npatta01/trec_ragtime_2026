@@ -773,20 +773,20 @@ class RagtimeRetrieverTests(unittest.TestCase):
         self.assertEqual(second_client.search_calls[0]["query"], "query")
         self.assertEqual(len(store.write_calls), 2)
 
-    def test_retrieval_artifact_store_failures_propagate(self) -> None:
+    def test_retrieval_artifact_store_failures_are_best_effort(self) -> None:
         store = MemoryArtifactStore()
         store.read_error = OSError("retrieval artifact read failed")
         retriever, client, corpus = self._cached_retriever(store)
-        with self.assertRaisesRegex(OSError, "retrieval artifact read failed"):
-            retriever.retrieve("query")
-        self.assertEqual(client.search_calls, [])
-        self.assertEqual(corpus.calls, [])
+        result = retriever.retrieve("query")
+        self.assertIsNotNone(result.retrieval_artifact)
+        self.assertEqual(len(client.search_calls), 1)
+        self.assertEqual(len(corpus.calls), 1)
 
         store = MemoryArtifactStore()
         store.write_error = OSError("retrieval artifact write failed")
         retriever, client, corpus = self._cached_retriever(store)
-        with self.assertRaisesRegex(OSError, "retrieval artifact write failed"):
-            retriever.retrieve("query")
+        result = retriever.retrieve("query")
+        self.assertIsNone(result.retrieval_artifact)
         self.assertEqual(len(client.search_calls), 1)
         self.assertEqual(len(corpus.calls), 1)
         self.assertEqual(store.write_calls, [])

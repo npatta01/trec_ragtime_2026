@@ -530,6 +530,35 @@ def _load_cached_query_result(
         or query_index != expected_query_index
     ):
         raise ValueError("baseline query checkpoint has an invalid query identity")
+    cached = _probe_cached_query_result(
+        query,
+        baseline=baseline,
+        plan_sha256=plan_sha256,
+        retriever=retriever,
+        top_k=top_k,
+        query_index=query_index,
+    )
+    if cached is None:
+        raise ValueError(
+            f"retrieval artifact is missing for topic={record.get('topic_id')} "
+            f"query_index={query_index}"
+        )
+    return _validate_cached_query_result(
+        record, cached, query_index=query_index, top_k=top_k
+    )
+
+
+def _probe_cached_query_result(
+    query: str,
+    *,
+    baseline: str,
+    plan_sha256: str,
+    retriever: RetrieverLike,
+    top_k: int,
+    query_index: int,
+) -> RetrievalResult | None:
+    """Probe one checkpoint artifact without organizer or hydration work."""
+
     cached = retriever.get_cached_retrieval(
         query,
         pipeline=PIPELINE,
@@ -543,10 +572,19 @@ def _load_cached_query_result(
         ),
     )
     if cached is None:
-        raise ValueError(
-            f"retrieval artifact is missing for topic={record.get('topic_id')} "
-            f"query_index={query_index}"
-        )
+        return None
+    return cached
+
+
+def _validate_cached_query_result(
+    record: Mapping[str, Any],
+    cached: RetrievalResult,
+    *,
+    query_index: int,
+    top_k: int,
+) -> RetrievalResult:
+    """Compare a cache hit against its checkpoint record."""
+
     reference = cached.retrieval_artifact
     if not isinstance(reference, RetrievalArtifactReference):
         raise ValueError("cache-only retrieval is missing its artifact reference")
@@ -1090,7 +1128,22 @@ def _run_query_baseline_locked(
                 and checkpoint.get("pipeline") == PIPELINE
                 and _checkpoint_has_reference(checkpoint)
             ):
-                continue
+                cached = _probe_cached_query_result(
+                    query,
+                    baseline=baseline,
+                    plan_sha256=plan_sha256,
+                    retriever=retriever,
+                    top_k=top_k,
+                    query_index=query_index,
+                )
+                if cached is not None:
+                    fresh_results[key] = _validate_cached_query_result(
+                        checkpoint,
+                        cached,
+                        query_index=query_index,
+                        top_k=top_k,
+                    )
+                    continue
             attempt = int(checkpoint.get("attempt", 0)) + 1 if checkpoint else 1
             tasks.append(
                 QueryTask(

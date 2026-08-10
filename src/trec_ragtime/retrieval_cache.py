@@ -16,7 +16,11 @@ from typing import Any, Callable
 
 import msgspec
 
-from .artifact_store import ArtifactStoreLike, ArtifactValidationError
+from .artifact_store import (
+    ArtifactStoreLike,
+    ArtifactStoreRemoteError,
+    ArtifactValidationError,
+)
 from .cache import _normalize_base_url, canonicalize_json
 from .models import (
     HydrationFailure,
@@ -717,7 +721,12 @@ class RetrievalArtifactCache:
     def get(self, request: RetrievalRequestIdentity) -> RetrievalResult | None:
         if not isinstance(request, RetrievalRequestIdentity):
             raise TypeError("request must be a RetrievalRequestIdentity")
-        decoded = self.store.read_validated(request.object_key, self._decoder(request))
+        try:
+            decoded = self.store.read_validated(
+                request.object_key, self._decoder(request)
+            )
+        except (OSError, ArtifactStoreRemoteError):
+            return None
         if decoded is None:
             return None
         if not isinstance(decoded, _DecodedArtifact):
@@ -749,9 +758,14 @@ class RetrievalArtifactCache:
             stored_at=stored_at,
             result=_to_wire(result),
         )
-        stored = self.store.write(request.object_key, msgspec.msgpack.encode(envelope))
+        try:
+            stored = self.store.write(
+                request.object_key, msgspec.msgpack.encode(envelope)
+            )
+        except (OSError, ArtifactStoreRemoteError):
+            return self._without_reference(result)
         if stored is not True:
-            return result
+            return self._without_reference(result)
         reference = RetrievalArtifactReference(
             object_key=request.object_key,
             request_digest=request.request_digest,
@@ -765,6 +779,18 @@ class RetrievalArtifactCache:
             hydration_failures=result.hydration_failures,
             missing_translation_ids=result.missing_translation_ids,
             retrieval_artifact=reference,
+        )
+
+    @staticmethod
+    def _without_reference(result: RetrievalResult) -> RetrievalResult:
+        """Return a complete result that does not claim durable persistence."""
+
+        return RetrievalResult(
+            search_result=result.search_result,
+            documents=result.documents,
+            hydration_failures=result.hydration_failures,
+            missing_translation_ids=result.missing_translation_ids,
+            retrieval_artifact=None,
         )
 
 

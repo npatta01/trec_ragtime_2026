@@ -341,13 +341,6 @@ def response_object_key(operation: str, digest: bytes | bytearray | str) -> str:
     return f"{_OBJECT_KEY_PREFIX}/{normalized_operation}/{digest_hex[:2]}/{digest_hex}.mpk"
 
 
-# Explicit aliases make the identity primitives convenient to use from
-# importers without exposing implementation details of ResponseCache.
-canonical_request = canonical_request_bytes
-request_identity_digest = request_digest
-object_key_for_request = response_object_key
-
-
 def _stored_at(value: float | int, *, source: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{source} must be a finite number")
@@ -608,12 +601,9 @@ __all__ = [
     "ResponseCache",
     "ResponseEnvelope",
     "base_url_digest",
-    "canonical_request",
     "canonical_request_bytes",
     "canonicalize_json",
-    "object_key_for_request",
     "request_digest",
-    "request_identity_digest",
     "response_object_key",
     "sanitized_cache_configuration",
 ]

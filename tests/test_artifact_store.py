@@ -103,6 +103,33 @@ class PartialMissingSimpleCache(FakeSimpleCache):
         return super().open(path, mode)
 
 
+class TamperingWriteFile(FakeWriteFile):
+    """A remote write that leaves a complete but mismatching L1 candidate."""
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        super().__exit__(exc_type, exc_value, traceback)
+        if exc_type is None:
+            self.candidate.write_bytes(b"tampered")
+
+
+class TamperingSimpleCache(FakeSimpleCache):
+    def open(self, path: str, mode: str):
+        if "w" not in mode:
+            return super().open(path, mode)
+        self.open_calls.append((path, mode))
+        key = self._strip_protocol(path).removeprefix("buckets/")
+        return TamperingWriteFile(self, self._candidate(path), key)
+
+
+class PartialOpenFailureSimpleCache(FakeSimpleCache):
+    def open(self, path: str, mode: str):
+        if "w" in mode:
+            self.open_calls.append((path, mode))
+            self._candidate(path).write_bytes(b"partial")
+            raise OSError("open failed after creating candidate")
+        return super().open(path, mode)
+
+
 class FakeHfApi:
     def __init__(
         self,
@@ -358,6 +385,41 @@ class ArtifactStoreTestCase(unittest.TestCase):
         candidate = store.local_candidate("object.mpk")
         self.assertEqual(candidate.read_bytes(), b"new-payload")
         self.assertEqual(self.remote["owner/bucket/foo/object.mpk"], b"new-payload")
+
+    def test_write_verifies_exact_l1_bytes_after_remote_close(self) -> None:
+        tampering_fs: TamperingSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal tampering_fs
+            tampering_fs = TamperingSimpleCache(self.local_dir, self.remote)
+            return tampering_fs
+
+        store = self.make_store(filesystem_factory_override=factory)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertFalse(store.write("object.mpk", b"payload"))
+        self.assert_one_sanitized_warning(caught)
+        self.assertFalse(store.local_candidate("object.mpk").exists())
+        assert tampering_fs is not None
+        self.assertEqual(
+            tampering_fs.open_calls,
+            [("hf://buckets/owner/bucket/foo/object.mpk", "wb")],
+        )
+
+    def test_write_cleans_partial_candidate_when_remote_open_fails(self) -> None:
+        partial_fs: PartialOpenFailureSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal partial_fs
+            partial_fs = PartialOpenFailureSimpleCache(self.local_dir, self.remote)
+            return partial_fs
+
+        store = self.make_store(filesystem_factory_override=factory)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertFalse(store.write("object.mpk", b"payload"))
+        self.assert_one_sanitized_warning(caught)
+        self.assertFalse(store.local_candidate("object.mpk").exists())
 
     def test_evict_local_removes_only_exact_candidate(self) -> None:
         store = self.make_store()

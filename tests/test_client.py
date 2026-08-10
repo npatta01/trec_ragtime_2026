@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+import warnings
 from collections import deque
 from typing import Any, Callable
 from unittest.mock import Mock, patch
@@ -434,6 +435,27 @@ class RagtimeClientTests(unittest.TestCase):
         ), patch("trec_ragtime.client.ArtifactStore.from_env") as from_env:
             RagtimeClient.from_env(use_cache=False, session=RecordingSession())
         from_env.assert_not_called()
+
+    def test_missing_artifact_cache_configuration_disables_cache_with_one_warning(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "RAGTIME_BASE_URL": "https://api.example",
+                "RAGTIME_BEARER_TOKEN": "secret",
+                "RAGTIME_HF_BUCKET_ID": "",
+                "RAGTIME_CACHE_PATH": "",
+                "RAGTIME_CACHE_DIR": "",
+            },
+            clear=True,
+        ), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client = RagtimeClient.from_env(session=RecordingSession())
+        self.assertIsNone(client.cache)
+        self.assertIsNone(client.artifact_store)
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, RuntimeWarning)
+        self.assertNotIn("secret", str(caught[0].message))
+        client.close()
 
     def test_public_client_exposes_artifact_store_and_sanitized_configuration(self) -> None:
         cache, store = make_cache()

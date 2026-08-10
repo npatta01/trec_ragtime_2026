@@ -35,6 +35,10 @@ class ArtifactStoreConfigurationError(ArtifactStoreError, ValueError):
     """The store configuration or an object key is invalid."""
 
 
+class ArtifactStoreUnavailableError(ArtifactStoreConfigurationError):
+    """The optional runtime artifact-cache configuration is absent."""
+
+
 class ArtifactStoreRemoteError(ArtifactStoreError):
     """A remote Hugging Face or local-cache operation failed."""
 
@@ -122,11 +126,16 @@ class ArtifactStore:
                 "use RAGTIME_ARTIFACT_CACHE_DIR"
             )
 
+        bucket_override = "bucket_id" in overrides
         bucket_id = overrides.pop(
             "bucket_id", os.getenv("RAGTIME_HF_BUCKET_ID", "").strip()
         )
         if not bucket_id:
-            raise _configuration_error("RAGTIME_HF_BUCKET_ID is required")
+            if bucket_override:
+                raise _configuration_error("RAGTIME_HF_BUCKET_ID is required")
+            raise ArtifactStoreUnavailableError(
+                "RAGTIME_HF_BUCKET_ID is not configured"
+            )
 
         prefix = overrides.pop("prefix", os.getenv("RAGTIME_ARTIFACT_PREFIX", ""))
         local_value = overrides.pop(
@@ -392,17 +401,23 @@ class ArtifactStore:
         if not isinstance(payload, bytes):
             raise _configuration_error("artifact payload must be bytes")
         candidate = self.local_candidate(object_key)
+        candidate_existed_before = candidate.exists()
         if self._remote_disabled:
             return False
         remote_open_attempted = False
         try:
             self._verify_private_bucket()
             filesystem = self._get_filesystem()
+            handle = filesystem.open(self._remote_path(object_key), "wb")
             remote_open_attempted = True
-            with filesystem.open(self._remote_path(object_key), "wb") as handle:
+            with handle:
                 handle.write(payload)
+            if candidate.read_bytes() != payload:
+                raise ArtifactStoreRemoteError(
+                    "local artifact candidate did not retain the written bytes"
+                )
         except Exception:
-            if remote_open_attempted:
+            if remote_open_attempted or not candidate_existed_before:
                 self._best_effort_remove_candidate(candidate)
             self._disable_remote()
             return False
@@ -425,6 +440,7 @@ __all__ = [
     "ArtifactStoreLike",
     "ArtifactStoreError",
     "ArtifactStoreConfigurationError",
+    "ArtifactStoreUnavailableError",
     "ArtifactStoreRemoteError",
     "ArtifactValidationError",
 ]
