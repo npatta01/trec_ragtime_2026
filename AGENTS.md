@@ -140,6 +140,11 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   are exact lookup keys after hosted retrieval.
 - Cache keys must include the endpoint, operation, namespace, and exact request,
   but never the bearer token. Cache only validated successful responses.
+- The OpenAI-compatible chat-completion cache stores the complete validated
+  provider response payload, including usage and provider extension fields.
+  Client API keys and transport headers/options remain outside the identity and
+  stored artifact; top-level credential-shaped request fields are rejected,
+  while nested tool schemas and provider bodies retain their exact properties.
 - The public Hugging Face dataset does not require the private RAGTIME token.
   Never send the RAGTIME authorization header to Hugging Face or include it in
   document-cache keys, payloads, errors, or logs.

@@ -43,6 +43,7 @@ from .huggingface import (
     HuggingFaceHydrationError,
     HuggingFaceProtocolError,
 )
+from .llm_cache import CachedChatCompletions
 from .local_corpus import (
     LocalCorpusBuildError,
     LocalCorpusConfigurationError,
@@ -114,6 +115,7 @@ from .retriever import (
 )
 
 __all__ = [
+    "CachedChatCompletions",
     "DEFAULT_CONTENT_COLLECTION",
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_FLASH_BATCH_SIZE",

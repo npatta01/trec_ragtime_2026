@@ -463,6 +463,76 @@ The durable Hugging Face Bucket must remain private. The complete local corpus
 remains a separate revision-pinned DuckDB database and does not use
 per-document response caching.
 
+### Cache OpenAI-Compatible Chat Completions
+
+`CachedChatCompletions` wraps an already configured OpenAI-compatible client and
+stores validated `ChatCompletion` responses in the same private artifact store.
+The shared setup is:
+
+```python
+from openai import OpenAI
+
+from trec_ragtime import CachedChatCompletions
+from trec_ragtime.artifact_store import ArtifactStore
+
+client = OpenAI(api_key=provider_key, base_url=provider_url, max_retries=0)
+cached = CachedChatCompletions(client, ArtifactStore.from_env())
+response = cached.create(model=model, messages=messages)
+```
+
+When `namespace` is omitted, the wrapper inherits a store's validated
+`namespace` metadata; stores without namespace metadata use the default
+`ragtime2-2026-v1`. Pass `namespace=` explicitly to override the store.
+
+For OpenRouter, use `provider_url = "https://openrouter.ai/api/v1"` and keep
+the provider key in the environment or another private configuration source.
+For a LiteLLM deployment, set `provider_url` to that deployment's configured
+OpenAI-compatible `/v1` proxy URL; the proxy address is deployment-specific and
+the wrapper does not assume one.
+
+The decrypt-first workflow replaces the project `.env`, so provider-specific
+values are intentionally not listed in `.env.example`. Export them in the shell
+after decrypting `.env`, or inject them through another private runtime secret
+source.
+
+```python
+import os
+
+# OpenRouter
+provider_url = "https://openrouter.ai/api/v1"
+provider_key = os.environ["OPENROUTER_API_KEY"]
+
+# LiteLLM proxy (the configured value must be its OpenAI-compatible /v1 URL)
+provider_url = os.environ["LITELLM_PROXY_BASE_URL"]
+provider_key = os.environ["LITELLM_PROXY_API_KEY"]
+```
+
+The cache identity includes the base URL, operation, namespace, and the exact
+JSON request. Mapping key order is canonicalized recursively, while list order
+(including message order) remains significant. Output-affecting options such
+as the model, tools, response format, temperature, and provider request body
+therefore get distinct entries. Normal entries are immutable and do not expire;
+pass `refresh=True` to bypass the hit and replace that exact entry with a fresh
+provider response. Responses are round-tripped as fully typed
+`openai.types.chat.ChatCompletion` objects, including provider extension fields.
+Streaming requests (`stream=True`) always delegate directly and are not cached.
+Common OpenAI SDK request values, including omitted-value sentinels, Pydantic
+models, enums, dates, iterables, and tuples, are normalized to their JSON form;
+unordered collections are rejected because they cannot produce stable keys.
+
+Artifact caching is best effort: a cache read or write failure leaves the live
+provider response usable as an uncached result. If a refresh write fails, the
+fresh response is still returned but the previous durable entry may remain
+readable. The OpenAI client's API key is never part of a cache key or stored
+payload; transport-only options such as
+`timeout`, `extra_headers`, and `extra_query` are also excluded from identity.
+Clients sharing a provider base URL and request identity also share entries;
+use a distinct `namespace=` when accounts or routing policies must be isolated.
+Top-level credential-shaped request fields are rejected before a provider call
+so they cannot be persisted accidentally. Nested structured request data is
+canonicalized as supplied, allowing tool schemas and provider extensions to
+legitimately use property names such as `password` or `auth_token`.
+
 Private `/pipeline` and `/content` entries do not expire by default because the
 participant endpoint is treated as immutable. Numeric
 `RAGTIME_SEARCH_CACHE_TTL_SECONDS` and `RAGTIME_CONTENT_CACHE_TTL_SECONDS`
