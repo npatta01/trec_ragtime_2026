@@ -248,12 +248,13 @@ def _validate_operation(operation: str) -> str:
     return operation
 
 
-def canonicalize_json(value: Any) -> Any:
+def canonicalize_json(value: Any, *, filter_credentials: bool = True) -> Any:
     """Return recursively sorted JSON-like data suitable for MessagePack.
 
     Mapping keys must be strings, mapping order is discarded recursively, list
     order is retained, and credential-bearing fields are rejected before an
-    identity or persisted artifact is produced.
+    identity or persisted artifact is produced unless response canonicalization
+    explicitly opts out of credential filtering.
     Unsupported values and non-finite floats are rejected before encoding.
     """
 
@@ -268,12 +269,17 @@ def canonicalize_json(value: Any) -> Any:
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise TypeError("cache mapping keys must be strings")
-            if _is_credential_field(key):
+            if filter_credentials and _is_credential_field(key):
                 raise ValueError("cache mappings must not contain credential fields")
-            normalized[key] = canonicalize_json(nested)
+            normalized[key] = canonicalize_json(
+                nested, filter_credentials=filter_credentials
+            )
         return {key: normalized[key] for key in sorted(normalized)}
     if isinstance(value, list):
-        return [canonicalize_json(item) for item in value]
+        return [
+            canonicalize_json(item, filter_credentials=filter_credentials)
+            for item in value
+        ]
     raise TypeError(
         "cache values must be JSON-like (null, boolean, number, string, list, or object)"
     )
@@ -359,10 +365,14 @@ class ResponseCache:
         *,
         namespace: str = DEFAULT_CACHE_NAMESPACE,
         clock: Callable[[], float] = time.time,
+        filter_response_credentials: bool = True,
     ) -> None:
+        if not isinstance(filter_response_credentials, bool):
+            raise TypeError("filter_response_credentials must be a boolean")
         self.store = store
         self.namespace = _validate_namespace(namespace)
         self._clock = clock
+        self.filter_response_credentials = filter_response_credentials
 
     def object_key(
         self,
@@ -429,7 +439,10 @@ class ResponseCache:
                 raise self._decode_error("cached response identity is invalid")
             try:
                 stored_at = _stored_at(envelope.stored_at, source="stored_at")
-                canonical_payload = canonicalize_json(envelope.payload)
+                canonical_payload = canonicalize_json(
+                    envelope.payload,
+                    filter_credentials=self.filter_response_credentials,
+                )
                 if not isinstance(canonical_payload, dict):
                     raise TypeError("cached payload must be an object")
                 canonical_envelope = ResponseEnvelope(
@@ -516,7 +529,10 @@ class ResponseCache:
             request=request,
         )
         normalized_operation = _validate_operation(operation)
-        canonical_response = canonicalize_json(response)
+        canonical_response = canonicalize_json(
+            response,
+            filter_credentials=self.filter_response_credentials,
+        )
         if not isinstance(canonical_response, dict):
             raise TypeError("cache response must be an object")
         timestamp = (

@@ -169,6 +169,54 @@ class ResponseCacheTestCase(unittest.TestCase):
         self.assertIsNone(stored_at)
         self.assertEqual(self.store.local, {})
 
+    def test_opted_in_cache_preserves_all_response_fields(self) -> None:
+        cache = ResponseCache(
+            self.store,
+            clock=lambda: self.now,
+            filter_response_credentials=False,
+        )
+        response = {
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            "provider_extension": {"token_label": "model-output"},
+        }
+        stored_at = cache.put(
+            base_url=self.base_url,
+            operation="llm-chat-completions-v1",
+            request={"model": "m", "messages": []},
+            response=response,
+        )
+        entry = cache.get(
+            base_url=self.base_url,
+            operation="llm-chat-completions-v1",
+            request={"model": "m", "messages": []},
+            ttl_seconds=None,
+            validator=dict,
+        )
+        self.assertEqual(stored_at, self.now)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.value, response)
+
+    def test_complete_response_mode_does_not_relax_request_identity(self) -> None:
+        cache = ResponseCache(self.store, filter_response_credentials=False)
+        with self.assertRaisesRegex(ValueError, "credential fields"):
+            cache.get(
+                base_url=self.base_url,
+                operation="llm-chat-completions-v1",
+                request={"api_key": "never-store-this"},
+                ttl_seconds=None,
+                validator=dict,
+            )
+        self.assertEqual(self.store.read_validated_calls, [])
+
+    def test_default_cache_still_rejects_sensitive_response_fields(self) -> None:
+        with self.assertRaisesRegex(ValueError, "credential fields"):
+            self.cache.put(
+                base_url=self.base_url,
+                operation=self.operation,
+                request=self.request,
+                response={"access_token": "never-store-this"},
+            )
+
     def test_artifact_store_remote_errors_degrade_to_cache_miss_or_write_failure(self) -> None:
         self.store.read_error = ArtifactStoreRemoteError("remote unavailable")
         self.assertIsNone(
