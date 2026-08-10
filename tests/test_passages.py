@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+from trec_ragtime import Boundary, Representation
 from trec_ragtime.passages import (
     Passage,
     PassageChunker,
