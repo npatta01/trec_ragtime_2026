@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextlib
 import gc
+import importlib.metadata
 import inspect
 import io
 import logging
@@ -1064,6 +1066,7 @@ class FlashWorkerTests(unittest.TestCase):
                         f"transformers=={policy.transformers_version}",
                         f"tokenizers=={policy.tokenizers_version}",
                         f"torch=={policy.torch_version}",
+                        f"msgspec=={importlib.metadata.version('msgspec')}",
                     ],
                 }
             ],
@@ -1242,6 +1245,128 @@ class FlashWorkerTests(unittest.TestCase):
         self.assertEqual(
             response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 3.5}]
         )
+
+    def test_extracted_worker_is_self_contained_with_declared_dependency_fakes(
+        self,
+    ) -> None:
+        import msgspec as installed_msgspec
+
+        policy = LocalCrossEncoderConfig(query_policy="isolated-transport")
+        test_case = self
+        Worker = build_flash_worker(policy)
+        source = textwrap.dedent(inspect.getsource(Worker))
+        class_source = source[source.index("class FlashPassageWorker:") :]
+
+        class FakeTokenizer:
+            def __call__(
+                self, query: str, text: str, **kwargs: Any
+            ) -> dict[str, object]:
+                return {
+                    "input_ids": [[1] * (len(query) + len(text))],
+                    "overflowing_tokens": [],
+                    "num_truncated_tokens": 0,
+                }
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.tokenizer: FakeTokenizer | None = None
+                self.predict_calls: list[dict[str, object]] = []
+
+            def predict(
+                self, pairs: list[tuple[str, str]], **kwargs: object
+            ) -> list[float]:
+                self.assert_tokenizer: FakeTokenizer | None = self.tokenizer
+                self.predict_calls.append({"pairs": pairs, "kwargs": kwargs})
+                return [4.25 for _ in pairs]
+
+        fake_tokenizer = FakeTokenizer()
+        fake_model = FakeModel()
+
+        class FakeTransformer:
+            def __init__(
+                self,
+                name: str,
+                *,
+                transformer_task: str,
+                tokenizer_name_or_path: str,
+                processor_kwargs: dict[str, object],
+                model_kwargs: dict[str, object],
+                config_kwargs: dict[str, object],
+            ) -> None:
+                test_case.assertEqual(name, policy.model_name)
+                test_case.assertEqual(transformer_task, "sequence-classification")
+                test_case.assertEqual(tokenizer_name_or_path, policy.tokenizer_name)
+                test_case.assertEqual(
+                    processor_kwargs,
+                    {
+                        "revision": policy.tokenizer_revision,
+                        "model_max_length": policy.max_length,
+                    },
+                )
+                test_case.assertEqual(model_kwargs["revision"], policy.revision)
+                test_case.assertEqual(config_kwargs, {"revision": policy.revision})
+                self.tokenizer = fake_tokenizer
+
+        class FakeCrossEncoder:
+            def __new__(
+                cls, *, modules: list[FakeTransformer], device: str
+            ) -> FakeModel:
+                test_case.assertEqual(len(modules), 1)
+                test_case.assertEqual(device, policy.effective_device)
+                test_case.assertIs(modules[0].tokenizer, fake_tokenizer)
+                fake_model.tokenizer = modules[0].tokenizer
+                return fake_model
+
+        fake_sentence_transformers = types.ModuleType("sentence_transformers")
+        fake_sentence_transformers.CrossEncoder = FakeCrossEncoder
+        fake_sentence_transformers.models = types.SimpleNamespace(
+            Transformer=FakeTransformer
+        )
+        fake_tokenizers = types.ModuleType("tokenizers")
+        fake_torch = types.ModuleType("torch")
+        fake_torch.bfloat16 = object()
+        fake_torch.float16 = object()
+        fake_torch.float32 = object()
+        fake_torch.nn = types.SimpleNamespace(Identity=lambda: object())
+        fake_msgspec = types.ModuleType("msgspec")
+        fake_msgspec.msgpack = installed_msgspec.msgpack
+
+        real_import = builtins.__import__
+
+        def isolated_import(name: str, *args: object, **kwargs: object) -> object:
+            if name == "trec_ragtime" or name.startswith("trec_ragtime."):
+                raise ModuleNotFoundError("trec_ragtime is not shipped to Flash")
+            return real_import(name, *args, **kwargs)
+
+        namespace: dict[str, object] = {}
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "msgspec": fake_msgspec,
+                    "sentence_transformers": fake_sentence_transformers,
+                    "tokenizers": fake_tokenizers,
+                    "torch": fake_torch,
+                },
+            ),
+            patch.object(builtins, "__import__", isolated_import),
+        ):
+            exec(compile(class_source, "<isolated-flash-worker>", "exec"), namespace)
+            ExtractedWorker = namespace["FlashPassageWorker"]
+            extracted = ExtractedWorker()
+            response = extracted.score(
+                query="query",
+                rows=[{"hash": sha256_bytes("text").hex(), "text": "text"}],
+                schema_version=WIRE_SCHEMA_VERSION,
+                scorer_fingerprint=policy.fingerprint,
+            )
+
+        self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
+        self.assertEqual(
+            response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 4.25}]
+        )
+        self.assertEqual(len(fake_model.predict_calls), 1)
+        self.assertIs(fake_model.assert_tokenizer, fake_tokenizer)
 
     def test_same_effective_policy_reuses_source_stable_picklable_class(self) -> None:
         policy = LocalCrossEncoderConfig(
