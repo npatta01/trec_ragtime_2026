@@ -9,6 +9,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 68]
       ]
@@ -22,6 +23,7 @@
       "language": "spa",
       "pipeline_name": "es_core_news_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 33]
       ]
@@ -35,6 +37,7 @@
       "language": "rus",
       "pipeline_name": "ru_core_news_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 39]
       ]
@@ -48,6 +51,7 @@
       "language": "zho",
       "pipeline_name": "zh_core_web_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 10]
       ]
@@ -61,6 +65,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 42]
       ]
@@ -74,6 +79,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 37]
       ]
@@ -87,6 +93,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 23]
       ]
@@ -100,6 +107,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 6]
       ]
@@ -113,11 +121,42 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 16,
+      "length_function_fingerprint": "chars-v1",
       "expected_spans": [
         [0, 14],
         [14, 28],
         [28, 40],
         [40, 56]
+      ]
+    },
+    {
+      "name": "forced_lf_paragraph_packing",
+      "document_id": "doc-lf-paragraphs-001",
+      "canonical_text": "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.",
+      "selected_text": "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 37,
+      "length_function_fingerprint": "chars-v1",
+      "expected_spans": [
+        [0, 37],
+        [37, 53]
+      ]
+    },
+    {
+      "name": "forced_crlf_paragraph_packing",
+      "document_id": "doc-crlf-paragraphs-001",
+      "canonical_text": "First CRLF paragraph.\r\n\r\nSecond CRLF paragraph.\r\n\r\nThird CRLF paragraph.",
+      "selected_text": "First CRLF paragraph.\r\n\r\nSecond CRLF paragraph.\r\n\r\nThird CRLF paragraph.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 51,
+      "length_function_fingerprint": "chars-v1",
+      "expected_spans": [
+        [0, 51],
+        [51, 72]
       ]
     }
   ]

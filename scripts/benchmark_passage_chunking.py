@@ -166,6 +166,7 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
                 ChunkerConfig(
                     chunk_size=case["chunk_size"],
                     length_function=char_length,
+                    length_function_fingerprint=case["length_function_fingerprint"],
                     pipeline_name=case["pipeline_name"],
                 )
             ),

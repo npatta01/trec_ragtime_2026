@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+import msgspec
 import trec_ragtime.passages as passages_module
 from trec_ragtime.passages import (
     ChunkerConfig,
@@ -48,44 +49,108 @@ assert 'transformers' not in sys.modules
             bytes.fromhex("850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e"),
         )
 
-    def test_validate_passages_rejects_whitespace_stripped_text_and_offsets(self) -> None:
-        passages = _make_passages(" Alpha\nBeta ")
-        stripped = passages[0].text.strip()
-        mutated = replace(
-            passages[0],
+    def test_zero_chunk_size_reaches_strict_config_validation(self) -> None:
+        with self.assertRaises(PassageValidationError):
+            LangChainPassageChunker(chunk_size=0)
+
+    def test_custom_length_function_requires_a_stable_identity(self) -> None:
+        with self.assertRaises(PassageValidationError):
+            ChunkerConfig(length_function=char_length)
+        with self.assertRaises(PassageValidationError):
+            LangChainPassageChunker(length_function=char_length)
+
+    def test_chunker_fingerprint_changes_for_result_affecting_identity_inputs(self) -> None:
+        base = ChunkerConfig(
+            chunk_size=32,
+            length_function=char_length,
+            length_function_fingerprint="chars-v1",
+        )
+
+        self.assertNotEqual(
+            base.resolved_fingerprint,
+            replace(base, chunk_size=33).resolved_fingerprint,
+        )
+        self.assertNotEqual(
+            base.resolved_fingerprint,
+            replace(base, pipeline_name="en_core_web_sm").resolved_fingerprint,
+        )
+        self.assertNotEqual(
+            base.resolved_fingerprint,
+            replace(base, pipeline_name="es_core_news_sm").resolved_fingerprint,
+        )
+        self.assertNotEqual(
+            base.resolved_fingerprint,
+            replace(base, length_function_fingerprint="chars-v2").resolved_fingerprint,
+        )
+
+    def test_validate_passages_rejects_whitespace_stripping_at_reconstruction(self) -> None:
+        selected_text, passages = _packed_passages()
+        first, second = passages
+        stripped = first.text.strip()
+        mutated_first = replace(
+            first,
             text=stripped,
-            start_char=1,
-            end_char=1 + len(stripped),
+            end_char=first.start_char + len(stripped),
+            passage_id=_lineage_id(
+                first,
+                end_char=first.start_char + len(stripped),
+            ),
             content_hash=sha256_bytes(stripped),
         )
+        mutated_second = replace(
+            second,
+            previous_passage_id=mutated_first.passage_id,
+        )
 
-        with self.assertRaises(PassageValidationError):
-            validate_passages("Alpha\nBeta", (mutated,))
+        with self.assertRaisesRegex(PassageValidationError, "monotonic"):
+            validate_passages(selected_text, (mutated_first, mutated_second))
 
     def test_validate_passages_rejects_reordered_or_overlapping_spans(self) -> None:
-        passages = _make_passages("Alpha Beta")
-        first = passages[0]
-        second = Passage(
-            document_id=first.document_id,
-            source_content_hash=first.source_content_hash,
-            representation=first.representation,
-            representation_hash=first.representation_hash,
-            language=first.language,
-            chunk_index=1,
-            passage_id=b"2" * 32,
-            text="Beta",
-            start_char=6,
-            end_char=10,
-            boundary="sentence_packed",
-            previous_passage_id=first.passage_id,
-            next_passage_id=None,
-            content_hash=sha256_bytes("Beta"),
-            chunker_fingerprint=first.chunker_fingerprint,
-            overlap_chars=0,
-            overlap_tokens=0,
+        selected_text, passages = _packed_passages()
+        first, second = passages
+
+        reordered_first = replace(
+            second,
+            chunk_index=0,
+            passage_id=_lineage_id(second, chunk_index=0),
+            previous_passage_id=None,
         )
-        with self.assertRaises(PassageValidationError):
-            validate_passages("Alpha Beta", (second, first))
+        reordered_second = replace(
+            first,
+            chunk_index=1,
+            passage_id=_lineage_id(first, chunk_index=1),
+            previous_passage_id=reordered_first.passage_id,
+            next_passage_id=None,
+        )
+        reordered_first = replace(
+            reordered_first,
+            next_passage_id=reordered_second.passage_id,
+        )
+        with self.assertRaisesRegex(PassageValidationError, "monotonic"):
+            validate_passages(selected_text, (reordered_first, reordered_second))
+
+        overlap_start = first.end_char - 1
+        overlap_end = second.end_char
+        overlap_text = selected_text[overlap_start:overlap_end]
+        overlapping_second = replace(
+            second,
+            text=overlap_text,
+            start_char=overlap_start,
+            end_char=overlap_end,
+            passage_id=_lineage_id(
+                second,
+                start_char=overlap_start,
+                end_char=overlap_end,
+            ),
+            content_hash=sha256_bytes(overlap_text),
+            previous_passage_id=first.passage_id,
+        )
+        overlapping_first = replace(
+            first,
+            next_passage_id=overlapping_second.passage_id,
+        )
+        with self.assertRaisesRegex(PassageValidationError, "monotonic"):
+            validate_passages(selected_text, (overlapping_first, overlapping_second))
 
     def test_passage_rejects_malformed_lineage_and_fingerprint(self) -> None:
         with self.assertRaises(PassageValidationError):
@@ -143,6 +208,7 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                     ChunkerConfig(
                         chunk_size=case["chunk_size"],
                         length_function=char_length,
+                        length_function_fingerprint=case["length_function_fingerprint"],
                         pipeline_name=case["pipeline_name"],
                     )
                 )
@@ -177,10 +243,74 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                 )
                 validate_passages(selected_text, passages)
 
+    def test_forced_paragraph_cases_preserve_blank_lines_and_never_use_rcts(self) -> None:
+        cases = [
+            case
+            for case in load_cases()
+            if case["name"]
+            in {"forced_lf_paragraph_packing", "forced_crlf_paragraph_packing"}
+        ]
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                chunker = LangChainPassageChunker(
+                    ChunkerConfig(
+                        chunk_size=case["chunk_size"],
+                        length_function=char_length,
+                        length_function_fingerprint=case["length_function_fingerprint"],
+                        pipeline_name=case["pipeline_name"],
+                    )
+                )
+                with patch.object(
+                    _recursive_splitter_class(),
+                    "create_documents",
+                    side_effect=AssertionError("RCTS is exceptional only"),
+                ):
+                    passages = chunker.chunk(
+                        document_id=case["document_id"],
+                        canonical_text=case["canonical_text"],
+                        selected_text=case["selected_text"],
+                        representation=case["representation"],
+                        language=case["language"],
+                    )
+
+                self.assertEqual(
+                    [(p.start_char, p.end_char) for p in passages],
+                    [tuple(span) for span in case["expected_spans"]],
+                )
+                self.assertEqual(
+                    [p.text for p in passages],
+                    [
+                        case["selected_text"][start:end]
+                        for start, end in case["expected_spans"]
+                    ],
+                )
+                self.assertTrue(all(p.boundary == "paragraph_packed" for p in passages))
+                self.assertEqual("".join(p.text for p in passages), case["selected_text"])
+
+    def test_report_text_requires_english_language(self) -> None:
+        chunker = LangChainPassageChunker(
+            chunk_size=100,
+            length_function=char_length,
+            length_function_fingerprint="chars-v1",
+        )
+
+        with self.assertRaises(PassageChunkingError):
+            chunker.chunk(
+                document_id="doc-report-language",
+                canonical_text="Texto fuente.",
+                selected_text="English report text.",
+                representation="report_text",
+                language="spa",
+            )
+
     def test_packed_sentences_keep_adjacent_whitespace_and_report_boundary(self) -> None:
         text = "First sentence. Second sentence. Third sentence."
         chunker = LangChainPassageChunker(
-            ChunkerConfig(chunk_size=34, length_function=char_length)
+            ChunkerConfig(
+                chunk_size=34,
+                length_function=char_length,
+                length_function_fingerprint="chars-v1",
+            )
         )
 
         passages = chunker.chunk(
@@ -201,7 +331,11 @@ class LangChainPassageChunkerTests(unittest.TestCase):
     def test_recursive_fallback_runs_once_only_for_an_individually_oversized_sentence(self) -> None:
         text = "One two three four five six seven eight nine ten eleven."
         chunker = LangChainPassageChunker(
-            ChunkerConfig(chunk_size=16, length_function=char_length)
+            ChunkerConfig(
+                chunk_size=16,
+                length_function=char_length,
+                length_function_fingerprint="chars-v1",
+            )
         )
         calls = 0
         recursive_splitter = _recursive_splitter_class()
@@ -229,7 +363,11 @@ class LangChainPassageChunkerTests(unittest.TestCase):
     def test_packed_multi_sentence_chunk_does_not_use_recursive_fallback(self) -> None:
         text = "One. Two. Three."
         chunker = LangChainPassageChunker(
-            ChunkerConfig(chunk_size=100, length_function=char_length)
+            ChunkerConfig(
+                chunk_size=100,
+                length_function=char_length,
+                length_function_fingerprint="chars-v1",
+            )
         )
 
         with patch.object(
@@ -253,6 +391,7 @@ class LangChainPassageChunkerTests(unittest.TestCase):
             ChunkerConfig(
                 chunk_size=3,
                 length_function=lambda value: len(value) * 4,
+                length_function_fingerprint="four-times-chars-v1",
             )
         )
 
@@ -285,6 +424,46 @@ def _make_passages(text: str) -> tuple[Passage, ...]:
         selected_text=text,
         representation="canonical",
         language="eng",
+    )
+
+
+def _packed_passages() -> tuple[str, tuple[Passage, ...]]:
+    text = "First sentence. Second sentence. Third sentence."
+    chunker = LangChainPassageChunker(
+        ChunkerConfig(
+            chunk_size=34,
+            length_function=char_length,
+            length_function_fingerprint="chars-v1",
+        )
+    )
+    return text, chunker.chunk(
+        document_id="validation-packed",
+        canonical_text=text,
+        selected_text=text,
+        representation="canonical",
+        language="eng",
+    )
+
+
+def _lineage_id(
+    passage: Passage,
+    *,
+    start_char: int | None = None,
+    end_char: int | None = None,
+    chunk_index: int | None = None,
+) -> bytes:
+    return sha256_bytes(
+        msgspec.msgpack.encode(
+            (
+                passage.document_id,
+                passage.representation,
+                passage.representation_hash,
+                passage.start_char if start_char is None else start_char,
+                passage.end_char if end_char is None else end_char,
+                passage.chunk_index if chunk_index is None else chunk_index,
+                passage.chunker_fingerprint,
+            )
+        )
     )
 
 

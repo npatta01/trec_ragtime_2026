@@ -26,6 +26,10 @@ _PIPELINES_BY_LANGUAGE: Mapping[str, str] = {
     "rus": "ru_core_news_sm",
     "zho": "zh_core_web_sm",
 }
+_DEFAULT_LENGTH_FUNCTION_FINGERPRINT = "builtin:len"
+_PINNED_PIPELINE_MAPPING_ID = ";".join(
+    f"{language}={pipeline}" for language, pipeline in _PIPELINES_BY_LANGUAGE.items()
+)
 _FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
 
 
@@ -141,6 +145,8 @@ class Passage:
         _validate_hash(self.representation_hash, "representation_hash")
         if not isinstance(self.language, str) or not self.language.strip():
             raise PassageValidationError("language must not be blank")
+        if self.representation == "report_text" and self.language != "eng":
+            raise PassageValidationError("report_text representation requires language='eng'")
         if isinstance(self.chunk_index, bool) or not isinstance(self.chunk_index, int):
             raise PassageValidationError("chunk_index must be an integer")
         if self.chunk_index < 0:
@@ -254,15 +260,17 @@ def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
 
 
 def _default_fingerprint(config: "ChunkerConfig") -> str:
-    length_function = config.length_function
-    module = getattr(length_function, "__module__", type(length_function).__module__)
-    qualname = getattr(length_function, "__qualname__", type(length_function).__qualname__)
     material = "|".join(
         (
             "passages-v1",
-            config.pipeline_name or "language-map",
-            str(config.chunk_size),
-            f"{module}.{qualname}",
+            f"chunk_size={config.chunk_size}",
+            f"length_function={config.resolved_length_function_fingerprint}",
+            f"pipeline={config.pipeline_name or 'language-map'}",
+            f"pinned_mapping={_PINNED_PIPELINE_MAPPING_ID}",
+            f"max_length={config.max_length}",
+            f"chunk_overlap={config.chunk_overlap}",
+            f"overlap_chars={config.overlap_chars}",
+            f"overlap_tokens={config.overlap_tokens}",
         )
     )
     return "langchain-spacy-v1/" + hashlib.sha256(material.encode("utf-8")).hexdigest()
@@ -274,12 +282,14 @@ class ChunkerConfig:
 
     chunk_size: int = 512
     length_function: Callable[[str], int] = len
+    length_function_fingerprint: str | None = None
     pipeline_name: str | None = None
     fingerprint: str | None = None
     chunk_overlap: int = 0
     overlap_chars: int = 0
     overlap_tokens: int = 0
     max_length: int = 1_000_000
+    _resolved_length_function_fingerprint: str = field(init=False, repr=False)
     _resolved_fingerprint: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -289,6 +299,24 @@ class ChunkerConfig:
             raise PassageValidationError("chunk_size must be positive")
         if not callable(self.length_function):
             raise PassageValidationError("length_function must be callable")
+        if self.length_function_fingerprint is not None:
+            _validate_fingerprint(self.length_function_fingerprint)
+        elif self.length_function is len:
+            object.__setattr__(
+                self,
+                "_resolved_length_function_fingerprint",
+                _DEFAULT_LENGTH_FUNCTION_FINGERPRINT,
+            )
+        else:
+            raise PassageValidationError(
+                "custom length_function requires length_function_fingerprint"
+            )
+        if self.length_function_fingerprint is not None:
+            object.__setattr__(
+                self,
+                "_resolved_length_function_fingerprint",
+                self.length_function_fingerprint,
+            )
         if self.pipeline_name is not None and (
             not isinstance(self.pipeline_name, str) or not self.pipeline_name.strip()
         ):
@@ -313,6 +341,10 @@ class ChunkerConfig:
             "_resolved_fingerprint",
             self.fingerprint or _default_fingerprint(self),
         )
+
+    @property
+    def resolved_length_function_fingerprint(self) -> str:
+        return self._resolved_length_function_fingerprint
 
     @property
     def resolved_fingerprint(self) -> str:
@@ -350,18 +382,26 @@ class LangChainPassageChunker:
         *,
         chunk_size: int | None = None,
         length_function: Callable[[str], int] | None = None,
+        length_function_fingerprint: str | None = None,
         pipeline_name: str | None = None,
         fingerprint: str | None = None,
     ) -> None:
         if config is not None and any(
             value is not None
-            for value in (chunk_size, length_function, pipeline_name, fingerprint)
+            for value in (
+                chunk_size,
+                length_function,
+                length_function_fingerprint,
+                pipeline_name,
+                fingerprint,
+            )
         ):
             raise TypeError("pass either config or keyword chunker settings, not both")
         if config is None:
             config = ChunkerConfig(
-                chunk_size=chunk_size or 512,
-                length_function=length_function or len,
+                chunk_size=512 if chunk_size is None else chunk_size,
+                length_function=len if length_function is None else length_function,
+                length_function_fingerprint=length_function_fingerprint,
                 pipeline_name=pipeline_name,
                 fingerprint=fingerprint,
             )
@@ -498,6 +538,8 @@ class LangChainPassageChunker:
             raise PassageChunkingError("representation must be canonical or report_text")
         if not isinstance(language, str) or not language.strip():
             raise PassageChunkingError("language must not be blank")
+        if representation == "report_text" and language != "eng":
+            raise PassageChunkingError("report_text representation requires language='eng'")
 
         pipeline_name = self._pipeline_for_language(language)
         paragraph_documents = self._split_exact(
