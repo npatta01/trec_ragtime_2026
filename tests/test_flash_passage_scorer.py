@@ -7,7 +7,9 @@ import inspect
 import io
 import json
 import logging
+import linecache
 import math
+import pickle
 import sys
 import textwrap
 import threading
@@ -38,6 +40,7 @@ from trec_ragtime.flash_passage_scorer import (
     encode_flash_request,
     encode_flash_response,
 )
+import trec_ragtime.flash_worker as flash_worker_module
 from trec_ragtime.flash_worker import build_flash_worker
 
 
@@ -572,8 +575,8 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             return lambda config: (Model(calls), Tokenizer(calls))
 
         local = LocalCrossEncoderScorer(policy, loader=loader_for(local_calls))
-        worker_class = build_flash_worker(policy, loader=loader_for(worker_calls))
-        worker = worker_class()
+        worker_class = build_flash_worker(policy)
+        worker = worker_class(loader=loader_for(worker_calls))
         observed: dict[str, object] = {}
 
         class InMemoryWireRunner:
@@ -833,11 +836,7 @@ class FlashWorkerTests(unittest.TestCase):
             def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
                 return [10.5 if text == "text" else -2.25 for _, text in pairs]
 
-        Worker = build_flash_worker(
-            policy,
-            loader=lambda config: (Model(), Tokenizer()),
-            endpoint_factory=endpoint_factory,
-        )
+        Worker = build_flash_worker(policy, endpoint_factory=endpoint_factory)
         self.assertIs(Worker, captured["class"])
         public_methods = [
             name
@@ -850,7 +849,7 @@ class FlashWorkerTests(unittest.TestCase):
             ["self", "query", "rows", "schema_version", "scorer_fingerprint"],
         )
 
-        worker = Worker()
+        worker = Worker(loader=lambda config: (Model(), Tokenizer()))
         response = worker.score(
             query="query",
             rows=[{"hash": sha256_bytes("text").hex(), "text": "text"}],
@@ -907,18 +906,88 @@ class FlashWorkerTests(unittest.TestCase):
         self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
         self.assertEqual(response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 3.5}])
 
+    def test_same_effective_policy_reuses_source_stable_picklable_class(self) -> None:
+        policy = LocalCrossEncoderConfig(
+            model_name="cache/model",
+            revision="cache-revision",
+            device="cuda",
+            precision="float16",
+            batch_size=3,
+            max_length=77,
+            query_format="Q: {query}",
+            query_policy="cache-policy",
+        )
+        first = build_flash_worker(policy)
+        first_source = inspect.getsource(first)
+        first_module = sys.modules[first.__module__]
+
+        second = build_flash_worker(
+            RunpodFlashConfig(endpoint_id="independent-transport", model_config=policy)
+        )
+
+        self.assertIs(first, second)
+        self.assertIs(sys.modules[first.__module__], first_module)
+        self.assertEqual(inspect.getsource(first), first_source)
+        self.assertEqual(linecache.getlines(first_module.__file__), first_source.splitlines(True))
+        self.assertIs(pickle.loads(pickle.dumps(first)), first)
+
+    def test_cached_worker_instances_keep_independent_loaders_and_warm_once(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100, query_policy="loader-isolation")
+        Worker = build_flash_worker(policy)
+        load_calls: list[list[LocalCrossEncoderConfig]] = [[], []]
+
+        class Tokenizer:
+            def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+                return {"input_ids": [[1] * 2]}
+
+        class Model:
+            def __init__(self, score: float) -> None:
+                self.score_value = score
+                self.predict_calls = 0
+
+            def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+                self.predict_calls += 1
+                return [self.score_value for _ in pairs]
+
+        models = [Model(1.0), Model(2.0)]
+
+        def loader_at(index: int) -> Callable[[LocalCrossEncoderConfig], object]:
+            def loader(config: LocalCrossEncoderConfig) -> object:
+                load_calls[index].append(config)
+                return models[index], Tokenizer()
+
+            return loader
+
+        first = Worker(loader=loader_at(0))
+        second = Worker(loader=loader_at(1))
+        request = {
+            "query": "query",
+            "rows": [{"hash": sha256_bytes("text").hex(), "text": "text"}],
+            "schema_version": WIRE_SCHEMA_VERSION,
+            "scorer_fingerprint": policy.fingerprint,
+        }
+
+        expected_first = [{"hash": sha256_bytes("text").hex(), "score": 1.0}]
+        expected_second = [{"hash": sha256_bytes("text").hex(), "score": 2.0}]
+        self.assertEqual(first.score(**request)["scores"], expected_first)
+        self.assertEqual(first.score(**request)["scores"], expected_first)
+        self.assertEqual(second.score(**request)["scores"], expected_second)
+        self.assertEqual(load_calls, [[policy], [policy]])
+        self.assertEqual(models[0].predict_calls, 2)
+        self.assertEqual(models[1].predict_calls, 1)
+
     def test_worker_rejects_schema_or_fingerprint_mismatch(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=100)
-        worker = build_flash_worker(
-            policy,
+        Worker = build_flash_worker(policy)
+        worker = Worker(
             loader=lambda config: (
                 types.SimpleNamespace(
                     tokenizer=lambda *args, **kwargs: {"input_ids": [[1, 2]]},
                     predict=lambda *args, **kwargs: [1.0],
                 ),
                 lambda *args, **kwargs: {"input_ids": [[1, 2]]},
-            ),
-        )()
+            )
+        )
         kwargs = {
             "query": "query",
             "rows": [{"hash": sha256_bytes("text").hex(), "text": "text"}],
@@ -960,11 +1029,8 @@ class FlashWorkerTests(unittest.TestCase):
         worker_tokenizer = RecordingTokenizer()
         worker_model = RecordingModel(worker_tokenizer)
         local = LocalCrossEncoderScorer(policy, loader=lambda config: (local_model, local_tokenizer))
-        Worker = build_flash_worker(
-            policy,
-            loader=lambda config: (worker_model, worker_tokenizer),
-        )
-        worker = Worker()
+        Worker = build_flash_worker(policy)
+        worker = Worker(loader=lambda config: (worker_model, worker_tokenizer))
         passage = _passage("text")
 
         local_scores = local.score("query", (passage,))
@@ -999,6 +1065,33 @@ class FlashWorkerTests(unittest.TestCase):
                 schema_version=WIRE_SCHEMA_VERSION,
                 scorer_fingerprint=policy.fingerprint,
             )
+
+    def test_z_worker_class_cache_refuses_growth_without_invalidating_prior_identity(self) -> None:
+        cache_size = len(flash_worker_module._WORKER_CLASS_CACHE)
+        stable_policy = LocalCrossEncoderConfig(query_policy=f"stable-cache-{cache_size}")
+        stable_class = build_flash_worker(stable_policy)
+        stable_source = inspect.getsource(stable_class)
+        stable_module = sys.modules[stable_class.__module__]
+        cache_limit = cache_size + 2
+
+        with patch.object(flash_worker_module, "_WORKER_CLASS_CACHE_MAX", cache_limit):
+            while len(flash_worker_module._WORKER_CLASS_CACHE) < cache_limit:
+                policy = LocalCrossEncoderConfig(
+                    query_policy=f"cache-cap-{cache_size}-{len(flash_worker_module._WORKER_CLASS_CACHE)}"
+                )
+                build_flash_worker(policy)
+
+            self.assertEqual(len(flash_worker_module._WORKER_CLASS_CACHE), cache_limit)
+            with self.assertRaises(FlashScoringError):
+                build_flash_worker(
+                    LocalCrossEncoderConfig(query_policy=f"refused-cache-{cache_size}")
+                )
+
+            self.assertIs(build_flash_worker(stable_policy), stable_class)
+            self.assertIs(sys.modules[stable_class.__module__], stable_module)
+            self.assertEqual(inspect.getsource(stable_class), stable_source)
+            self.assertEqual(linecache.getlines(stable_module.__file__), stable_source.splitlines(True))
+            self.assertIs(pickle.loads(pickle.dumps(stable_class)), stable_class)
 
 
 if __name__ == "__main__":

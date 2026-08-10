@@ -2,22 +2,33 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any
+
+
+# Generated classes are intentionally never evicted: their module and source
+# identities remain valid for inspect, pickle, and already-created instances.
+# Refusing a new policy at this modest cap is safer than invalidating a class
+# that Flash or a caller may still hold.
+_WORKER_CLASS_CACHE_MAX = 32
+_WORKER_CLASS_CACHE_LOCK = threading.RLock()
+_WORKER_CLASS_CACHE: dict[str, type[Any]] = {}
+_WORKER_MODULE_CACHE: dict[str, ModuleType] = {}
 
 
 def build_flash_worker(
     config: object | None = None,
     *,
-    loader: Callable[..., object] | None = None,
     endpoint_factory: Callable[[type[Any]], type[Any]] | None = None,
 ) -> type[Any]:
     """Build or lazily decorate a source-stable class-style Flash worker.
 
     The effective local model policy is rendered as primitive literals inside
-    the returned class body because Flash ships only that source.  ``loader``
-    is an explicit local-test seam and is deliberately not part of the class
-    source or the normal remote path.
+    the returned class body because Flash ships only that source.  A loader is
+    an explicit constructor seam on the returned class for local tests; it is
+    never stored on the cached class or shared between worker instances.
     """
 
     import hashlib
@@ -58,7 +69,6 @@ def build_flash_worker(
     )
     class_source = """class FlashPassageWorker:
     _MODEL_CONFIG = __MODEL_CONFIG__
-    _default_loader: object | None = None
 
     def __init__(self, model_config: object | None = None, loader: object | None = None) -> None:
         from trec_ragtime.passage_scoring import (
@@ -74,13 +84,10 @@ def build_flash_worker(
             effective_config = LocalCrossEncoderConfig(**model_config)
         else:
             raise TypeError("model_config must be LocalCrossEncoderConfig or a config mapping")
-        selected_loader = loader
-        if selected_loader is None:
-            selected_loader = getattr(type(self), "_default_loader", None)
-        if selected_loader is None:
+        if loader is None:
             self._scorer = LocalCrossEncoderScorer(effective_config)
         else:
-            self._scorer = LocalCrossEncoderScorer(effective_config, loader=selected_loader)
+            self._scorer = LocalCrossEncoderScorer(effective_config, loader=loader)
         self._scorer._ensure_loaded()
 
     @staticmethod
@@ -178,21 +185,32 @@ def build_flash_worker(
 """.replace("__MODEL_CONFIG__", model_literal)
 
     source_digest = hashlib.sha256(class_source.encode("utf-8")).hexdigest()
-    filename = f"<trec-ragtime-flash-worker-{source_digest}.py>"
-    module_name = f"_trec_ragtime_flash_worker_{source_digest}"
-    linecache.cache[filename] = (
-        len(class_source),
-        None,
-        class_source.splitlines(keepends=True),
-        filename,
-    )
-    module = types.ModuleType(module_name)
-    module.__file__ = filename
-    sys.modules[module_name] = module
-    namespace = module.__dict__
-    exec(compile(class_source, filename, "exec"), namespace)
-    worker_class = namespace["FlashPassageWorker"]
-    worker_class._default_loader = loader
+    with _WORKER_CLASS_CACHE_LOCK:
+        worker_class = _WORKER_CLASS_CACHE.get(source_digest)
+        if worker_class is None:
+            if len(_WORKER_CLASS_CACHE) >= _WORKER_CLASS_CACHE_MAX:
+                from .flash_passage_scorer import FlashScoringError
+
+                raise FlashScoringError(
+                    "Flash worker class cache is full; refusing a distinct model policy"
+                )
+            filename = f"<trec-ragtime-flash-worker-{source_digest}.py>"
+            module_name = f"_trec_ragtime_flash_worker_{source_digest}"
+            linecache.cache[filename] = (
+                len(class_source),
+                None,
+                class_source.splitlines(keepends=True),
+                filename,
+            )
+            module = types.ModuleType(module_name)
+            module.__file__ = filename
+            namespace = module.__dict__
+            exec(compile(class_source, filename, "exec"), namespace)
+            worker_class = namespace["FlashPassageWorker"]
+            # Install a generated module only once for this source digest.
+            sys.modules[module_name] = module
+            _WORKER_MODULE_CACHE[source_digest] = module
+            _WORKER_CLASS_CACHE[source_digest] = worker_class
     if endpoint_factory is not None:
         return endpoint_factory(worker_class)
     return worker_class
