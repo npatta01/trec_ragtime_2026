@@ -18,7 +18,6 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
-from .artifact_store import ArtifactStoreConfigurationError, ArtifactStoreError
 from .client import RagtimeError
 from .huggingface import HuggingFaceError
 from .local_corpus import LocalCorpusError
@@ -61,6 +60,14 @@ class QueryTask:
     query: str
     attempt: int
     query_context: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryTaskResult:
+    """Checkpoint data plus a fresh retrieval for same-process assembly."""
+
+    record: dict[str, Any]
+    retrieval: RetrievalResult | None = None
 
 
 class RetrieverLike(Protocol):
@@ -339,11 +346,17 @@ def _build_retrieval_identity(
 def _validate_result_reference(
     result: RetrievalResult,
     identity: Any,
-) -> dict[str, object]:
+) -> dict[str, object] | None:
+    if not result.fully_hydrated or result.hydration_failures:
+        raise ValueError(
+            "successful baseline retrieval is not completely hydrated"
+        )
     reference = result.retrieval_artifact
+    if reference is None:
+        return None
     if not isinstance(reference, RetrievalArtifactReference):
         raise ValueError(
-            "successful baseline retrieval is missing a RetrievalArtifactReference"
+            "successful baseline retrieval has an invalid RetrievalArtifactReference"
         )
     try:
         matches = (
@@ -358,10 +371,6 @@ def _validate_result_reference(
     if not matches:
         raise ValueError(
             "retrieval artifact reference does not match the exact query identity"
-        )
-    if not result.fully_hydrated or result.hydration_failures:
-        raise ValueError(
-            "successful baseline retrieval is not completely hydrated and persisted"
         )
     return reference.as_record()
 
@@ -405,9 +414,11 @@ def _query_record_from_result(
     top_k: int,
     identity: Any,
 ) -> dict[str, Any]:
+    if result.query != query or result.pipeline != PIPELINE:
+        raise ValueError("retrieval result does not match the query checkpoint")
     search = result.search_result
     hits = search.hits[:top_k]
-    return {
+    record: dict[str, Any] = {
         "topic_id": topic_id,
         "query_index": query_index,
         "query": query,
@@ -421,8 +432,11 @@ def _query_record_from_result(
         "remote_cached": search.remote_cached,
         "hit_count": len(hits),
         "hits": [hit.as_record() for hit in hits],
-        "retrieval_artifact": _validate_result_reference(result, identity),
     }
+    retrieval_artifact = _validate_result_reference(result, identity)
+    if retrieval_artifact is not None:
+        record["retrieval_artifact"] = retrieval_artifact
+    return record
 
 
 def _run_query_task(
@@ -430,7 +444,7 @@ def _run_query_task(
     *,
     retriever: RetrieverLike,
     top_k: int,
-) -> dict[str, Any]:
+) -> _QueryTaskResult:
     started_at = _now()
     started = time.perf_counter()
     try:
@@ -448,28 +462,25 @@ def _run_query_task(
             fallback_on_hf_error=False,
             query_context=task.query_context,
         )
-    except ArtifactStoreError:
-        # Artifact-store transport and configuration failures are systemic.
-        # Let the runner finalize the run rather than checkpointing a retryable
-        # per-query error.
-        raise
     except (RagtimeError, HuggingFaceError, LocalCorpusError, ValueError) as exc:
-        return {
-            "topic_id": task.topic_id,
-            "query_index": task.query_index,
-            "query": task.query,
-            "query_chars": len(task.query),
-            "pipeline": PIPELINE,
-            "started_at": started_at,
-            "status": "error",
-            "duration_seconds": round(time.perf_counter() - started, 3),
-            "attempt": task.attempt,
-            "error_type": type(exc).__name__,
-            "error_detail": str(exc),
-            "hits": [],
-        }
+        return _QueryTaskResult(
+            record={
+                "topic_id": task.topic_id,
+                "query_index": task.query_index,
+                "query": task.query,
+                "query_chars": len(task.query),
+                "pipeline": PIPELINE,
+                "started_at": started_at,
+                "status": "error",
+                "duration_seconds": round(time.perf_counter() - started, 3),
+                "attempt": task.attempt,
+                "error_type": type(exc).__name__,
+                "error_detail": str(exc),
+                "hits": [],
+            }
+        )
     try:
-        return _query_record_from_result(
+        record = _query_record_from_result(
             topic_id=task.topic_id,
             query_index=task.query_index,
             query=task.query,
@@ -480,21 +491,24 @@ def _run_query_task(
             top_k=top_k,
             identity=identity,
         )
+        return _QueryTaskResult(record=record, retrieval=result)
     except ValueError as exc:
-        return {
-            "topic_id": task.topic_id,
-            "query_index": task.query_index,
-            "query": task.query,
-            "query_chars": len(task.query),
-            "pipeline": PIPELINE,
-            "started_at": started_at,
-            "status": "error",
-            "duration_seconds": round(time.perf_counter() - started, 3),
-            "attempt": task.attempt,
-            "error_type": type(exc).__name__,
-            "error_detail": str(exc),
-            "hits": [],
-        }
+        return _QueryTaskResult(
+            record={
+                "topic_id": task.topic_id,
+                "query_index": task.query_index,
+                "query": task.query,
+                "query_chars": len(task.query),
+                "pipeline": PIPELINE,
+                "started_at": started_at,
+                "status": "error",
+                "duration_seconds": round(time.perf_counter() - started, 3),
+                "attempt": task.attempt,
+                "error_type": type(exc).__name__,
+                "error_detail": str(exc),
+                "hits": [],
+            }
+        )
 
 
 def _query_records_for_topic(
@@ -686,20 +700,28 @@ def _topic_record(
     retriever: RetrieverLike,
     top_k: int,
     rrf_k: int,
+    fresh_results: Mapping[tuple[str, int], RetrievalResult] | None = None,
 ) -> dict[str, Any]:
     successful = [record for record in query_records if record["status"] == "success"]
-    cached_results = [
-        _load_cached_query_result(
-            record,
-            baseline=baseline,
-            plan_sha256=plan_sha256,
-            retriever=retriever,
-            top_k=top_k,
-            expected_query_index=query_index,
-        )
-        for query_index, record in enumerate(query_records, start=1)
-        if record["status"] == "success"
-    ]
+    current_results = fresh_results or {}
+    cached_results: list[RetrievalResult] = []
+    for query_index, record in enumerate(query_records, start=1):
+        if record["status"] != "success":
+            continue
+        fresh = current_results.get((plan.topic_id, query_index))
+        if fresh is not None:
+            cached_results.append(fresh)
+        else:
+            cached_results.append(
+                _load_cached_query_result(
+                    record,
+                    baseline=baseline,
+                    plan_sha256=plan_sha256,
+                    retriever=retriever,
+                    top_k=top_k,
+                    expected_query_index=query_index,
+                )
+            )
     ranked_lists = [
         tuple(SearchHit(**hit) for hit in record["hits"])
         for record in successful
@@ -851,20 +873,6 @@ def _hydration_error_topic_record(
     }
 
 
-def _systemic_artifact_store_failure(error: ArtifactStoreError) -> dict[str, str]:
-    """Return safe manifest metadata without copying exception details."""
-
-    if isinstance(error, ArtifactStoreConfigurationError):
-        detail = "artifact store configuration failure"
-    else:
-        detail = "artifact store operation failed"
-    return {
-        "category": "systemic",
-        "error_type": type(error).__name__,
-        "error_detail": detail,
-    }
-
-
 def run_query_baseline(
     plans_path: Path,
     *,
@@ -1008,6 +1016,7 @@ def _run_query_baseline_locked(
     )
     topics = _read_latest_jsonl(topics_path, key_fields=("topic_id",))
     created_at = prior_manifest.get("created_at") if prior_manifest else _now()
+    fresh_results: dict[tuple[str, int], RetrievalResult] = {}
 
     def write_manifest(
         status: str, *, failure: dict[str, str] | None = None
@@ -1078,9 +1087,8 @@ def _run_query_baseline_locked(
                 retriever=retriever,
                 top_k=top_k,
                 rrf_k=rrf_k,
+                fresh_results=fresh_results,
             )
-        except ArtifactStoreError:
-            raise
         except (RagtimeError, HuggingFaceError, LocalCorpusError, ValueError) as exc:
             topic = _hydration_error_topic_record(
                 plan,
@@ -1168,14 +1176,13 @@ def _run_query_baseline_locked(
         thread_name_prefix="ragtime-baseline",
     )
     stopped_on_failure = False
-    fatal_artifact_error: ArtifactStoreError | None = None
     total_queries = sum(len(_queries_for(plan, baseline)) for plan in plans)
     try:
         while True:
             wave = list(islice(task_iterator, concurrency))
             if not wave:
                 break
-            futures: dict[Future[dict[str, Any]], QueryTask] = {
+            futures: dict[Future[_QueryTaskResult], QueryTask] = {
                 executor.submit(
                     _run_query_task,
                     task,
@@ -1191,13 +1198,12 @@ def _run_query_baseline_locked(
                 done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                 for future in sorted(done, key=lambda item: futures[item].ordinal):
                     task = futures.pop(future)
-                    try:
-                        checkpoint = future.result()
-                    except ArtifactStoreError as exc:
-                        fatal_artifact_error = exc
-                        break
+                    task_result = future.result()
+                    checkpoint = task_result.record
                     key = (task.topic_id, task.query_index)
                     checkpoints[key] = checkpoint
+                    if task_result.retrieval is not None:
+                        fresh_results[key] = task_result.retrieval
                     pending_keys.discard(key)
                     _write_jsonl(
                         queries_path,
@@ -1213,21 +1219,11 @@ def _run_query_baseline_locked(
                             f"status={checkpoint['status']} "
                             f"failed_queries={counts['failed_queries']}"
                         )
-                if fatal_artifact_error is not None:
-                    break
-            if fatal_artifact_error is not None:
-                break
             if wave_failed and concurrency > 1:
                 stopped_on_failure = True
                 break
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
-
-    if fatal_artifact_error is not None:
-        write_manifest(
-            "failed", failure=_systemic_artifact_store_failure(fatal_artifact_error)
-        )
-        raise fatal_artifact_error
 
     for plan in plans:
         plan_keys = {
@@ -1237,17 +1233,7 @@ def _run_query_baseline_locked(
             )
         }
         if plan_keys.isdisjoint(pending_keys):
-            try:
-                publish_topic(plan)
-            except ArtifactStoreError as exc:
-                fatal_artifact_error = exc
-                break
-
-    if fatal_artifact_error is not None:
-        write_manifest(
-            "failed", failure=_systemic_artifact_store_failure(fatal_artifact_error)
-        )
-        raise fatal_artifact_error
+            publish_topic(plan)
 
     if stopped_on_failure:
         write_manifest("stopped_on_failure")
@@ -1343,9 +1329,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     except ConcurrentRetrievalStopped as exc:
         print(f"ERROR: {exc}", file=sys.stderr, flush=True)
-        return 2
-    except ArtifactStoreError:
-        print("ERROR: fatal artifact store failure", file=sys.stderr, flush=True)
         return 2
     print(f"Baseline artifact: {run_dir}")
     return 0

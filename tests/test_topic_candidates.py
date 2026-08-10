@@ -262,6 +262,7 @@ def make_retrieval_result(
     documents: tuple[RetrievedDocument, ...],
     *,
     missing_translation_ids: tuple[str, ...] = (),
+    with_reference: bool = True,
 ) -> RetrievalResult:
     request_digest = hashlib.sha256(query.encode("utf-8")).digest()
     fingerprint = hashlib.sha256(b"control-a-test-retriever").digest()
@@ -285,12 +286,16 @@ def make_retrieval_result(
         ),
         documents=documents,
         missing_translation_ids=missing_translation_ids,
-        retrieval_artifact=RetrievalArtifactReference(
-            object_key=retrieval_object_key(fingerprint, request_digest),
-            request_digest=request_digest,
-            retriever_fingerprint=fingerprint,
-            stored_at=123.0,
-            cache_hit=False,
+        retrieval_artifact=(
+            RetrievalArtifactReference(
+                object_key=retrieval_object_key(fingerprint, request_digest),
+                request_digest=request_digest,
+                retriever_fingerprint=fingerprint,
+                stored_at=123.0,
+                cache_hit=False,
+            )
+            if with_reference
+            else None
         ),
     )
 
@@ -482,6 +487,40 @@ class ControlARunnerTests(unittest.TestCase):
             statuses[0]["retrieval_artifact"]["cache_hit"], False
         )
 
+    def test_complete_result_without_reference_is_a_success_and_omits_reference(self) -> None:
+        first = RetrievedDocument(
+            rank=1,
+            document_id="doc-first",
+            score=1.0,
+            text="first text",
+            url=None,
+            date=None,
+            language="eng",
+            content_source="local_corpus",
+            content_local_cache_hit=True,
+        )
+        retriever = FakeRetriever(
+            [
+                make_retrieval_result(
+                    "first problem", (first,), with_reference=False
+                ),
+                make_retrieval_result("second problem", (), with_reference=False),
+            ]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="uncached-complete",
+        )
+
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["counts"]["failed_topics"], 0)
+        self.assertNotIn("retrieval_artifact", manifest["topic_status"][0])
+        self.assertNotIn("retrieval_artifact", manifest["topic_status"][1])
+        self.assertEqual(manifest["counts"]["candidates"], 1)
+
     def test_incomplete_result_keeps_candidates_and_counts_without_reference(self) -> None:
         unresolved = RetrievedDocument(
             rank=1,
@@ -522,7 +561,7 @@ class ControlARunnerTests(unittest.TestCase):
         self.assertEqual(manifest["counts"]["failed_topics"], 0)
         self.assertEqual(manifest["counts"]["candidates"], 1)
         self.assertEqual(manifest["counts"]["unresolved_documents"], 1)
-        self.assertIsNone(manifest["topic_status"][0]["retrieval_artifact"])
+        self.assertNotIn("retrieval_artifact", manifest["topic_status"][0])
         candidates = [
             json.loads(line)
             for line in (run_dir / "candidates.jsonl").read_text().splitlines()

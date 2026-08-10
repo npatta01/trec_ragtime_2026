@@ -12,10 +12,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from trec_ragtime.client import RagtimeApiError
-from trec_ragtime.artifact_store import (
-    ArtifactStoreConfigurationError,
-    ArtifactStoreRemoteError,
-)
 from trec_ragtime.local_corpus import LocalCorpusReadError
 from trec_ragtime.models import (
     HuggingFaceDocument,
@@ -104,6 +100,7 @@ class FakeRetriever:
         self.corpus_revision = corpus_revision
         self.hydration_error = hydration_error
         self.calls: list[tuple[str, str, int | None, int | None, bool]] = []
+        self.cached_calls: list[tuple[str, str, int | None, int | None, bool]] = []
         self.contexts: list[dict[str, object] | None] = []
 
     @property
@@ -176,6 +173,15 @@ class FakeRetriever:
         fallback_on_hf_error: bool,
         query_context: dict[str, object] | None = None,
     ) -> RetrievalResult | None:
+        self.cached_calls.append(
+            (
+                query,
+                pipeline,
+                top_k,
+                max_content_fallbacks,
+                fallback_on_hf_error,
+            )
+        )
         response = self.responses.get(query)
         if isinstance(response, RetrievalResult):
             return response
@@ -470,91 +476,120 @@ class QueryBaselineTests(unittest.TestCase):
             ],
         )
 
-    def test_artifact_store_configuration_failure_is_systemic_and_not_retried(self) -> None:
-        error = ArtifactStoreConfigurationError(
-            "bucket=secret-bucket path=/private/cache query=single zero "
-            "token=secret-token"
-        )
-        retriever = FakeRetriever(
-            {
-                "single zero": error,
-                "single one": _retrieval_result("single one", ["doc-b"]),
-            }
-        )
-
-        with self.assertRaises(ArtifactStoreConfigurationError):
-            run_query_baseline(
-                self.plans_path,
-                baseline="b",
-                retriever=retriever,
-                output_root=self.root / "runs",
-                run_id="artifact-config-failure",
-                expected_topic_ids=self.expected_topic_ids,
-                expected_plan_sha256=None,
+    def test_baseline_b_keeps_complete_uncached_result_in_memory(self) -> None:
+        responses = {
+            "single zero": _retrieval_result("single zero", ["doc-a"]),
+            "single one": _retrieval_result("single one", ["doc-b"]),
+        }
+        for query in responses:
+            result = responses[query]
+            responses[query] = RetrievalResult(
+                search_result=result.search_result,
+                documents=result.documents,
+                missing_translation_ids=result.missing_translation_ids,
             )
+        retriever = FakeRetriever(responses)
 
-        self.assertEqual(
-            retriever.calls,
-            [("single zero", "ragtime2", 100, 0, False)],
-        )
-        manifest = json.loads(
-            (self.root / "runs" / "artifact-config-failure" / "manifest.json").read_text()
-        )
-        self.assertEqual(manifest["status"], "failed")
-        self.assertEqual(manifest["failure"]["category"], "systemic")
-        self.assertEqual(
-            manifest["failure"]["error_type"], "ArtifactStoreConfigurationError"
-        )
-        self.assertEqual(
-            manifest["failure"]["error_detail"],
-            "artifact store configuration failure",
-        )
-        self.assertNotIn("secret-bucket", json.dumps(manifest))
-        self.assertNotIn("secret-token", json.dumps(manifest))
-
-    def test_fatal_artifact_store_worker_failure_finalizes_sanitized_manifest(self) -> None:
-        error = ArtifactStoreRemoteError(
-            "bucket=secret-bucket path=/private/cache query=single zero "
-            "body=secret-body token=secret-token"
-        )
-        retriever = FakeRetriever(
-            {
-                "single zero": error,
-                "single one": _retrieval_result("single one", ["doc-b"]),
-            }
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=retriever,
+            output_root=self.root / "runs",
+            run_id="uncached-in-memory",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
         )
 
-        with self.assertRaises(ArtifactStoreRemoteError):
-            run_query_baseline(
-                self.plans_path,
-                baseline="b",
-                retriever=retriever,
-                output_root=self.root / "runs",
-                run_id="artifact-remote-failure",
-                expected_topic_ids=self.expected_topic_ids,
-                expected_plan_sha256=None,
+        topics = {
+            row["topic_id"]: row
+            for row in map(json.loads, (run_dir / "topics.jsonl").read_text().splitlines())
+        }
+        self.assertEqual([topics[topic]["status"] for topic in self.expected_topic_ids], ["success", "success"])
+        self.assertEqual([topics[topic]["candidate_count"] for topic in self.expected_topic_ids], [1, 1])
+        self.assertEqual(retriever.cached_calls, [])
+        queries = [
+            json.loads(line)
+            for line in (run_dir / "queries.jsonl").read_text().splitlines()
+        ]
+        self.assertTrue(all("retrieval_artifact" not in row for row in queries))
+
+    def test_resume_recomputes_successful_checkpoint_without_reference(self) -> None:
+        uncached = {
+            query: RetrievalResult(
+                search_result=result.search_result,
+                documents=result.documents,
+                missing_translation_ids=result.missing_translation_ids,
             )
+            for query, result in {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }.items()
+        }
+        first = FakeRetriever(uncached)
+        first_run = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=first,
+            output_root=self.root / "runs",
+            run_id="recompute-no-reference",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        first_topics = [
+            json.loads(line)
+            for line in (first_run / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            [topic["status"] for topic in first_topics], ["success", "success"]
+        )
 
-        manifest = json.loads(
-            (self.root / "runs" / "artifact-remote-failure" / "manifest.json").read_text()
+        second = FakeRetriever(uncached)
+        run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=second,
+            output_root=self.root / "runs",
+            run_id="recompute-no-reference",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
         )
-        self.assertEqual(manifest["status"], "failed")
-        self.assertEqual(manifest["failure"]["category"], "systemic")
-        self.assertEqual(
-            manifest["failure"]["error_type"], "ArtifactStoreRemoteError"
+
+        self.assertEqual([call[0] for call in second.calls], ["single zero", "single one"])
+        self.assertEqual(second.cached_calls, [])
+
+    def test_baseline_c_keeps_complete_uncached_facets_in_memory(self) -> None:
+        responses = {
+            query: RetrievalResult(
+                search_result=result.search_result,
+                documents=result.documents,
+                missing_translation_ids=result.missing_translation_ids,
+            )
+            for query, result in {
+                "facet zero a": _retrieval_result("facet zero a", ["doc-a"]),
+                "facet zero b": _retrieval_result("facet zero b", ["doc-b"]),
+                "facet one a": _retrieval_result("facet one a", ["doc-c"]),
+                "facet one b": _retrieval_result("facet one b", ["doc-d"]),
+            }.items()
+        }
+        retriever = FakeRetriever(responses)
+
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="c",
+            retriever=retriever,
+            output_root=self.root / "runs",
+            run_id="uncached-facets",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
         )
-        self.assertEqual(
-            manifest["failure"]["error_detail"], "artifact store operation failed"
-        )
-        serialized = json.dumps(manifest)
-        for secret in (
-            "secret-bucket",
-            "/private/cache",
-            "single zero",
-            "secret-body",
-            "secret-token",
-        ):
-            self.assertNotIn(secret, serialized)
+
+        topics = [
+            json.loads(line)
+            for line in (run_dir / "topics.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
+        self.assertEqual([topic["candidate_count"] for topic in topics], [2, 2])
+        self.assertEqual(retriever.cached_calls, [])
 
     def test_baseline_c_labels_partial_and_error_topics(self) -> None:
         retriever = FakeRetriever(
@@ -1062,6 +1097,9 @@ class QueryBaselineTests(unittest.TestCase):
         )
 
         self.assertEqual(warm.calls, [])
+        self.assertEqual(
+            [call[0] for call in warm.cached_calls], ["single zero", "single one"]
+        )
         topics = [
             json.loads(line)
             for line in (run_dir / "topics.jsonl").read_text().splitlines()

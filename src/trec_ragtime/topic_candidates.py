@@ -337,19 +337,23 @@ def _validated_reference(
     query: str,
     top_k: int,
 ) -> dict[str, object] | None:
-    """Validate the write-backed reference for a complete result.
+    """Validate the optional write-backed reference for a complete result.
 
     Incomplete hydration is intentionally uncacheable, but remains a valid
-    Control-A candidate snapshot.  Complete results must carry the exact
-    identity returned by the retriever's persisted-write contract.
+    Control-A candidate snapshot.  Complete results without a reference are
+    still valid; any present reference must carry the exact retriever identity.
     """
 
     if not result.fully_hydrated or result.hydration_failures:
         return None
+    if result.query != query or result.pipeline != "ragtime2":
+        raise ValueError("retrieval result does not match the Control-A query")
     reference = result.retrieval_artifact
+    if reference is None:
+        return None
     if not isinstance(reference, RetrievalArtifactReference):
         raise ValueError(
-            "complete Control-A retrieval is missing a RetrievalArtifactReference"
+            "complete Control-A retrieval has an invalid RetrievalArtifactReference"
         )
     identity = _build_retrieval_identity(retriever, query=query, top_k=top_k)
     try:
@@ -453,14 +457,14 @@ def run_control_a(
                 }
             )
             continue
-        topic_status.append(
-            {
-                "missing_translation_ids": sorted(missing_translation_ids),
-                "topic_id": topic.topic_id,
-                "unresolved_ids": unresolved_ids,
-                "retrieval_artifact": retrieval_artifact,
-            }
-        )
+        status: dict[str, object] = {
+            "missing_translation_ids": sorted(missing_translation_ids),
+            "topic_id": topic.topic_id,
+            "unresolved_ids": unresolved_ids,
+        }
+        if retrieval_artifact is not None:
+            status["retrieval_artifact"] = retrieval_artifact
+        topic_status.append(status)
         records.extend(
             _candidate_record(
                 topic,
