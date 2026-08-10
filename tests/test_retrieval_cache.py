@@ -11,7 +11,9 @@ import msgspec
 import trec_ragtime as public_api
 
 from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.cache import ResponseCache, base_url_digest
 from trec_ragtime.models import (
+    HydrationFailure,
     PipelineResult,
     RetrievalResult,
     RetrievedDocument,
@@ -348,6 +350,53 @@ class RetrievalCacheTestCase(unittest.TestCase):
     def test_request_wire_is_publicly_exported(self) -> None:
         self.assertIs(public_api.RetrievalRequestWire, RetrievalRequestWire)
 
+    def test_base_url_validation_matches_response_cache_identity(self) -> None:
+        response_cache = ResponseCache(MemoryArtifactStore())
+        response_request = {"query": "¿qué ocurrió? 中文", "pipeline": "ragtime2%20"}
+        invalid_base_urls = (
+            "not-a-url",
+            "ftp://api.example.test",
+            "https://",
+            "https://api.example.test?",
+            "https://api.example.test#",
+            "https://api.example.test:",
+            "https://api.example.test:/path",
+            "https://:443/path",
+            "https://api.example.test:invalid/path",
+            "https://[::1/path",
+            "https://api.example.test /path",
+        )
+        for base_url in invalid_base_urls:
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(ValueError):
+                    response_cache.object_key(
+                        base_url=base_url,
+                        operation="pipeline",
+                        request=response_request,
+                    )
+                with self.assertRaises(ValueError):
+                    request_fixture(base_url=base_url)
+
+        request = request_fixture(base_url="https://api.example.test/")
+        self.assertEqual(request.base_url_digest, base_url_digest("https://api.example.test"))
+
+        path = "https://api.example.test/api/v1"
+        path_request = request_fixture(base_url=f"{path}///")
+        self.assertEqual(path_request.base_url, path)
+        self.assertEqual(path_request.base_url_digest, base_url_digest(path))
+        self.assertEqual(
+            response_cache.object_key(
+                base_url=f"{path}///",
+                operation="pipeline",
+                request=response_request,
+            ),
+            response_cache.object_key(
+                base_url=path,
+                operation="pipeline",
+                request=response_request,
+            ),
+        )
+
     def test_identity_is_stable_across_machine_path_refresh_and_credentials(self) -> None:
         first = request_fixture()
         second = request_fixture(
@@ -501,6 +550,22 @@ class RetrievalCacheTestCase(unittest.TestCase):
                 with self.assertRaises((ValueError, TypeError, ArtifactValidationError)):
                     RetrievalArtifactCache(store).put(request_fixture(), invalid)
                 self.assertEqual(store.writes, [])
+
+    def test_nonempty_operational_hydration_failure_is_rejected(self) -> None:
+        result = result_fixture(
+            hydration_failures=(
+                # A complete retrieval artifact never hides operational failures.
+                # This is a valid failure value, so completeness is the rejection.
+                HydrationFailure(split="eng", message="timeout"),
+            )
+        )
+        with self.assertRaises(ValueError):
+            RetrievalArtifactCache(MemoryArtifactStore()).put(request_fixture(), result)
+
+    def test_nonempty_malformed_hydration_failure_is_a_type_error(self) -> None:
+        result = result_fixture(hydration_failures=("not-a-hydration-failure",))
+        with self.assertRaises(TypeError):
+            RetrievalArtifactCache(MemoryArtifactStore()).put(request_fixture(), result)
 
     def test_missing_translation_is_cacheable_when_source_text_is_present(self) -> None:
         result = result_fixture(

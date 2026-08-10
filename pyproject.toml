@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "duckdb>=1.5.4,<2",
-  "fsspec>=2026.6.0",
+  "fsspec>=2026.6.0,<2027",
   "huggingface-hub>=1.5,<2",
   "ipykernel>=6.30.0",
   "ipython>=9.0.0",

@@ -151,6 +151,42 @@ class ResponseCacheTestCase(unittest.TestCase):
                     )
                 self.assertNotIn("secret-token", str(raised.exception))
 
+    def test_base_url_requires_http_scheme_and_network_location(self) -> None:
+        for base_url in (
+            "not-a-url",
+            "ftp://api.example.test",
+            "https://",
+            "https://api.example.test?",
+            "https://api.example.test#",
+            "https://api.example.test:",
+            "https://api.example.test:/path",
+            "https://:443/path",
+            "https://api.example.test:invalid/path",
+            "https://[::1/path",
+            "https://api.example.test /path",
+        ):
+            with self.subTest(base_url=base_url), self.assertRaises(ValueError):
+                self.cache.object_key(
+                    base_url=base_url,
+                    operation=self.operation,
+                    request=self.request,
+                )
+
+    def test_base_url_paths_normalize_trailing_delimiters(self) -> None:
+        with_path = "https://api.example.test/api/v1"
+        self.assertEqual(
+            self.cache.object_key(
+                base_url=f"{with_path}///",
+                operation=self.operation,
+                request=self.request,
+            ),
+            self.cache.object_key(
+                base_url=with_path,
+                operation=self.operation,
+                request=self.request,
+            ),
+        )
+
     def test_representative_credential_fields_are_rejected_without_persistence(self) -> None:
         credential_fields = (
             "client_secret",

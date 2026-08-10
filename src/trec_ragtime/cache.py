@@ -193,12 +193,35 @@ def _normalize_base_url(base_url: str) -> str:
     normalized = base_url.strip().rstrip("/")
     if not normalized:
         raise ValueError("base URL must not be empty")
-    parsed = urlsplit(normalized)
+    if "?" in normalized or "#" in normalized:
+        raise ValueError("base URL must not contain credentials, a query, or a fragment")
+    scheme_separator = normalized.find("://")
+    if scheme_separator >= 0:
+        authority_end = len(normalized)
+        for delimiter in "/?#":
+            delimiter_index = normalized.find(delimiter, scheme_separator + 3)
+            if delimiter_index >= 0:
+                authority_end = min(authority_end, delimiter_index)
+        authority = normalized[scheme_separator + 3 : authority_end]
+        if any(character.isspace() or ord(character) < 32 for character in authority):
+            raise ValueError("base URL authority is invalid")
+    try:
+        parsed = urlsplit(normalized)
+        # Force validation of malformed numeric ports at this shared identity
+        # boundary rather than deferring it to an HTTP client.
+        parsed.port
+    except ValueError:
+        raise ValueError("base URL must be an absolute HTTP(S) URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.netloc.rsplit("@", 1)[-1].endswith(":")
+    ):
+        raise ValueError("base URL must be an absolute HTTP(S) URL")
     if (
         parsed.username is not None
         or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
     ):
         raise ValueError("base URL must not contain credentials, a query, or a fragment")
     return normalized

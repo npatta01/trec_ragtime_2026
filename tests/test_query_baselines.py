@@ -12,6 +12,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from trec_ragtime.client import RagtimeApiError
+from trec_ragtime.artifact_store import (
+    ArtifactStoreConfigurationError,
+    ArtifactStoreRemoteError,
+)
 from trec_ragtime.local_corpus import LocalCorpusReadError
 from trec_ragtime.models import (
     HuggingFaceDocument,
@@ -465,6 +469,92 @@ class QueryBaselineTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_artifact_store_configuration_failure_is_systemic_and_not_retried(self) -> None:
+        error = ArtifactStoreConfigurationError(
+            "bucket=secret-bucket path=/private/cache query=single zero "
+            "token=secret-token"
+        )
+        retriever = FakeRetriever(
+            {
+                "single zero": error,
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+
+        with self.assertRaises(ArtifactStoreConfigurationError):
+            run_query_baseline(
+                self.plans_path,
+                baseline="b",
+                retriever=retriever,
+                output_root=self.root / "runs",
+                run_id="artifact-config-failure",
+                expected_topic_ids=self.expected_topic_ids,
+                expected_plan_sha256=None,
+            )
+
+        self.assertEqual(
+            retriever.calls,
+            [("single zero", "ragtime2", 100, 0, False)],
+        )
+        manifest = json.loads(
+            (self.root / "runs" / "artifact-config-failure" / "manifest.json").read_text()
+        )
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["failure"]["category"], "systemic")
+        self.assertEqual(
+            manifest["failure"]["error_type"], "ArtifactStoreConfigurationError"
+        )
+        self.assertEqual(
+            manifest["failure"]["error_detail"],
+            "artifact store configuration failure",
+        )
+        self.assertNotIn("secret-bucket", json.dumps(manifest))
+        self.assertNotIn("secret-token", json.dumps(manifest))
+
+    def test_fatal_artifact_store_worker_failure_finalizes_sanitized_manifest(self) -> None:
+        error = ArtifactStoreRemoteError(
+            "bucket=secret-bucket path=/private/cache query=single zero "
+            "body=secret-body token=secret-token"
+        )
+        retriever = FakeRetriever(
+            {
+                "single zero": error,
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+
+        with self.assertRaises(ArtifactStoreRemoteError):
+            run_query_baseline(
+                self.plans_path,
+                baseline="b",
+                retriever=retriever,
+                output_root=self.root / "runs",
+                run_id="artifact-remote-failure",
+                expected_topic_ids=self.expected_topic_ids,
+                expected_plan_sha256=None,
+            )
+
+        manifest = json.loads(
+            (self.root / "runs" / "artifact-remote-failure" / "manifest.json").read_text()
+        )
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["failure"]["category"], "systemic")
+        self.assertEqual(
+            manifest["failure"]["error_type"], "ArtifactStoreRemoteError"
+        )
+        self.assertEqual(
+            manifest["failure"]["error_detail"], "artifact store operation failed"
+        )
+        serialized = json.dumps(manifest)
+        for secret in (
+            "secret-bucket",
+            "/private/cache",
+            "single zero",
+            "secret-body",
+            "secret-token",
+        ):
+            self.assertNotIn(secret, serialized)
 
     def test_baseline_c_labels_partial_and_error_topics(self) -> None:
         retriever = FakeRetriever(

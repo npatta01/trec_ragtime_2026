@@ -13,12 +13,11 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
 import msgspec
 
 from .artifact_store import ArtifactStoreLike, ArtifactValidationError
-from .cache import canonicalize_json
+from .cache import _normalize_base_url, canonicalize_json
 from .models import (
     HydrationFailure,
     PipelineResult,
@@ -54,23 +53,6 @@ def _finite(value: Any, *, name: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite number")
     return number
-
-
-def _normalized_base_url(base_url: str) -> str:
-    if not isinstance(base_url, str):
-        raise TypeError("base_url must be a string")
-    normalized = base_url.strip().rstrip("/")
-    parsed = urlsplit(normalized)
-    if not normalized or parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("base_url must be an absolute HTTP(S) URL")
-    if (
-        parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("base_url must not contain credentials, a query, or a fragment")
-    return normalized
 
 
 class FrozenDict(dict[str, Any]):
@@ -204,7 +186,7 @@ def retriever_fingerprint(
     if corpus_identity is None:
         raise TypeError("corpus_identity is required")
     _validate_schema_version(schema_version)
-    normalized = _normalized_base_url(base_url)
+    normalized = _normalize_base_url(base_url)
     payload = {
         "schema_version": schema_version,
         "base_url_digest": hashlib.sha256(normalized.encode("utf-8")).digest(),
@@ -273,10 +255,10 @@ class RetrievalRequestIdentity:
             raise ValueError("fallback_on_hf_error requires finite max_content_fallbacks")
         if not isinstance(self.content_collection, str) or not self.content_collection:
             raise ValueError("content_collection must be a non-empty string")
-        _normalized_base_url(self.base_url)
+        _normalize_base_url(self.base_url)
         if self.query_context is not None and not isinstance(self.query_context, Mapping):
             raise TypeError("query_context must be a mapping or None")
-        object.__setattr__(self, "base_url", _normalized_base_url(self.base_url))
+        object.__setattr__(self, "base_url", _normalize_base_url(self.base_url))
         object.__setattr__(self, "backend_policy", _freeze_json(self.backend_policy))
         object.__setattr__(
             self,
@@ -483,6 +465,12 @@ class RetrievalResultWire(msgspec.Struct, frozen=True, forbid_unknown_fields=Tru
 
 
 class RetrievalRequestWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Canonical typed wire representation of one retrieval identity.
+
+    This request struct is an identity boundary for MessagePack encoding; it
+    is not the persisted result envelope stored by :class:`RetrievalArtifactCache`.
+    """
+
     schema_version: int
     base_url_digest: bytes
     query_utf8: bytes
@@ -567,7 +555,7 @@ def _validate_result(request: RetrievalRequestIdentity, result: RetrievalResult)
     documents = tuple(result.documents)
     if len(documents) != len(hits):
         raise ValueError("hydrated documents must align one-to-one with search hits")
-    document_ids: set[str] = set()
+    documents_by_id: dict[str, RetrievedDocument] = {}
     for hit, document in zip(hits, documents, strict=True):
         if not isinstance(document, RetrievedDocument):
             raise TypeError("documents must be RetrievedDocument values")
@@ -579,9 +567,9 @@ def _validate_result(request: RetrievalRequestIdentity, result: RetrievalResult)
             or document.score != hit.score
         ):
             raise ValueError("hydrated documents must preserve hit rank, ID, and score")
-        if document.document_id in document_ids:
+        if document.document_id in documents_by_id:
             raise ValueError("document IDs must be unique")
-        document_ids.add(document.document_id)
+        documents_by_id[document.document_id] = document
         if not isinstance(document.text, str):
             raise ValueError("complete retrieval artifacts require source text")
         _finite(document.score, name="document score")
@@ -611,18 +599,18 @@ def _validate_result(request: RetrievalRequestIdentity, result: RetrievalResult)
         else:
             raise ValueError("document content source is not supported")
 
-    if result.hydration_failures:
-        raise ValueError("operational hydration failures are not cacheable")
     failures = tuple(result.hydration_failures)
     if any(not isinstance(failure, HydrationFailure) for failure in failures):
         raise TypeError("hydration_failures must be HydrationFailure values")
+    if failures:
+        raise ValueError("operational hydration failures are not cacheable")
     missing = tuple(result.missing_translation_ids)
     if len(set(missing)) != len(missing):
         raise ValueError("missing translation IDs must be unique")
     for document_id in missing:
-        if document_id not in document_ids:
+        if document_id not in documents_by_id:
             raise ValueError("missing translation ID is not a hydrated document")
-        document = documents[next(index for index, item in enumerate(documents) if item.document_id == document_id)]
+        document = documents_by_id[document_id]
         if document.english_text is not None or document.language == "eng":
             raise ValueError("translation status is inconsistent with document metadata")
     for document in documents:

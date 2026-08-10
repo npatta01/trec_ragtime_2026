@@ -18,6 +18,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
+from .artifact_store import ArtifactStoreConfigurationError, ArtifactStoreError
 from .client import RagtimeError
 from .huggingface import HuggingFaceError
 from .local_corpus import LocalCorpusError
@@ -447,6 +448,11 @@ def _run_query_task(
             fallback_on_hf_error=False,
             query_context=task.query_context,
         )
+    except ArtifactStoreError:
+        # Artifact-store transport and configuration failures are systemic.
+        # Let the runner finalize the run rather than checkpointing a retryable
+        # per-query error.
+        raise
     except (RagtimeError, HuggingFaceError, LocalCorpusError, ValueError) as exc:
         return {
             "topic_id": task.topic_id,
@@ -845,6 +851,20 @@ def _hydration_error_topic_record(
     }
 
 
+def _systemic_artifact_store_failure(error: ArtifactStoreError) -> dict[str, str]:
+    """Return safe manifest metadata without copying exception details."""
+
+    if isinstance(error, ArtifactStoreConfigurationError):
+        detail = "artifact store configuration failure"
+    else:
+        detail = "artifact store operation failed"
+    return {
+        "category": "systemic",
+        "error_type": type(error).__name__,
+        "error_detail": detail,
+    }
+
+
 def run_query_baseline(
     plans_path: Path,
     *,
@@ -989,35 +1009,37 @@ def _run_query_baseline_locked(
     topics = _read_latest_jsonl(topics_path, key_fields=("topic_id",))
     created_at = prior_manifest.get("created_at") if prior_manifest else _now()
 
-    def write_manifest(status: str) -> None:
-        _write_json(
-            manifest_path,
-            {
-                "schema_version": "query_baseline_v1",
-                "run_id": run_id,
-                "baseline": baseline,
-                "variant": _BASELINE_NAMES[baseline],
-                "status": status,
-                "created_at": created_at,
-                "updated_at": _now(),
-                "query_plan": {
-                    "path": str(plans_path.resolve()),
-                    "sha256": plan_sha256,
-                },
-                "corpus": corpus_identity,
-                "query_construction": (
-                    "problem_background_single_query_v1"
-                    if baseline == "b"
-                    else "problem_background_facets_v1"
-                ),
-                "pipeline": PIPELINE,
-                "top_k": top_k,
-                "rrf_k": rrf_k,
-                "transport_retries": 0,
-                "concurrency": concurrency,
-                "counts": _manifest_counts(plans, checkpoints, topics),
+    def write_manifest(
+        status: str, *, failure: dict[str, str] | None = None
+    ) -> None:
+        manifest = {
+            "schema_version": "query_baseline_v1",
+            "run_id": run_id,
+            "baseline": baseline,
+            "variant": _BASELINE_NAMES[baseline],
+            "status": status,
+            "created_at": created_at,
+            "updated_at": _now(),
+            "query_plan": {
+                "path": str(plans_path.resolve()),
+                "sha256": plan_sha256,
             },
-        )
+            "corpus": corpus_identity,
+            "query_construction": (
+                "problem_background_single_query_v1"
+                if baseline == "b"
+                else "problem_background_facets_v1"
+            ),
+            "pipeline": PIPELINE,
+            "top_k": top_k,
+            "rrf_k": rrf_k,
+            "transport_retries": 0,
+            "concurrency": concurrency,
+            "counts": _manifest_counts(plans, checkpoints, topics),
+        }
+        if failure is not None:
+            manifest["failure"] = failure
+        _write_json(manifest_path, manifest)
 
     def publish_topic(plan: QueryPlan) -> bool:
         try:
@@ -1057,6 +1079,8 @@ def _run_query_baseline_locked(
                 top_k=top_k,
                 rrf_k=rrf_k,
             )
+        except ArtifactStoreError:
+            raise
         except (RagtimeError, HuggingFaceError, LocalCorpusError, ValueError) as exc:
             topic = _hydration_error_topic_record(
                 plan,
@@ -1144,6 +1168,7 @@ def _run_query_baseline_locked(
         thread_name_prefix="ragtime-baseline",
     )
     stopped_on_failure = False
+    fatal_artifact_error: ArtifactStoreError | None = None
     total_queries = sum(len(_queries_for(plan, baseline)) for plan in plans)
     try:
         while True:
@@ -1166,7 +1191,11 @@ def _run_query_baseline_locked(
                 done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                 for future in sorted(done, key=lambda item: futures[item].ordinal):
                     task = futures.pop(future)
-                    checkpoint = future.result()
+                    try:
+                        checkpoint = future.result()
+                    except ArtifactStoreError as exc:
+                        fatal_artifact_error = exc
+                        break
                     key = (task.topic_id, task.query_index)
                     checkpoints[key] = checkpoint
                     pending_keys.discard(key)
@@ -1184,11 +1213,21 @@ def _run_query_baseline_locked(
                             f"status={checkpoint['status']} "
                             f"failed_queries={counts['failed_queries']}"
                         )
+                if fatal_artifact_error is not None:
+                    break
+            if fatal_artifact_error is not None:
+                break
             if wave_failed and concurrency > 1:
                 stopped_on_failure = True
                 break
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+
+    if fatal_artifact_error is not None:
+        write_manifest(
+            "failed", failure=_systemic_artifact_store_failure(fatal_artifact_error)
+        )
+        raise fatal_artifact_error
 
     for plan in plans:
         plan_keys = {
@@ -1198,7 +1237,17 @@ def _run_query_baseline_locked(
             )
         }
         if plan_keys.isdisjoint(pending_keys):
-            publish_topic(plan)
+            try:
+                publish_topic(plan)
+            except ArtifactStoreError as exc:
+                fatal_artifact_error = exc
+                break
+
+    if fatal_artifact_error is not None:
+        write_manifest(
+            "failed", failure=_systemic_artifact_store_failure(fatal_artifact_error)
+        )
+        raise fatal_artifact_error
 
     if stopped_on_failure:
         write_manifest("stopped_on_failure")
@@ -1294,6 +1343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     except ConcurrentRetrievalStopped as exc:
         print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+        return 2
+    except ArtifactStoreError:
+        print("ERROR: fatal artifact store failure", file=sys.stderr, flush=True)
         return 2
     print(f"Baseline artifact: {run_dir}")
     return 0

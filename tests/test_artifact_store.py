@@ -291,6 +291,25 @@ class ActualSimpleCacheFactory:
         )
 
 
+class ConcurrentRealSimpleCacheTarget(AbstractFileSystem):
+    """Small real-fsspec target used to exercise independent cache wrappers."""
+
+    protocol = "hf"
+
+    def __init__(self, remote: dict[str, bytes], barrier: threading.Barrier) -> None:
+        self.remote = remote
+        self.barrier = barrier
+
+    @staticmethod
+    def _key(path: str) -> str:
+        return path.removeprefix("hf://").removeprefix("buckets/")
+
+    def put(self, lpath, rpath, **kwargs) -> None:
+        self.barrier.wait(timeout=2)
+        for source, destination in zip(lpath, rpath):
+            self.remote[self._key(destination)] = Path(source).read_bytes()
+
+
 class UnavailableHydrationSimpleCache:
     """A SimpleCache-shaped filesystem without its exact hydration helper."""
 
@@ -775,6 +794,74 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(open_calls, [])
         self.assertEqual(exists_calls, [])
 
+    def test_default_store_rejects_fsspec_without_exact_hydration_primitive(self) -> None:
+        with patch(
+            "trec_ragtime.artifact_store.fsspec.get_filesystem_class",
+            return_value=object,
+        ):
+            with self.assertRaises(ArtifactStoreConfigurationError) as raised:
+                ArtifactStore(
+                    bucket_id="owner/bucket",
+                    local_dir=self.local_dir,
+                    api_factory=lambda **kwargs: None,
+                )
+
+        self.assertIn("fsspec>=2026.6.0,<2027", str(raised.exception))
+        self.assertIn("_get_cached_file_before_open", str(raised.exception))
+
+    def test_real_fsspec_stores_are_distinct_and_write_different_keys_concurrently(self) -> None:
+        barrier = threading.Barrier(2)
+        target = ConcurrentRealSimpleCacheTarget(self.remote, barrier)
+
+        def factory(protocol: str, **kwargs):
+            self.assertTrue(kwargs.pop("skip_instance_cache"))
+            return fsspec.filesystem(
+                protocol,
+                fs=target,
+                cache_storage=str(self.local_dir),
+                skip_instance_cache=True,
+            )
+
+        first = self.make_store(
+            prefix="",
+            filesystem_factory_override=factory,
+        )
+        second = self.make_store(
+            prefix="",
+            filesystem_factory_override=factory,
+        )
+        first._verify_private_bucket()
+        second._verify_private_bucket()
+        first_fs = first._get_filesystem()
+        second_fs = second._get_filesystem()
+        self.assertIsNot(first_fs, second_fs)
+
+        failures: list[BaseException] = []
+
+        def write(store: ArtifactStore, key: str, payload: bytes) -> None:
+            try:
+                store.write(key, payload)
+            except BaseException as error:  # pragma: no cover - assertion below
+                failures.append(error)
+
+        first_thread = threading.Thread(
+            target=write,
+            args=(first, "first.mpk", b"first"),
+        )
+        second_thread = threading.Thread(
+            target=write,
+            args=(second, "second.mpk", b"second"),
+        )
+        first_thread.start()
+        second_thread.start()
+        first_thread.join(timeout=3)
+        second_thread.join(timeout=3)
+
+        self.assertFalse(first_thread.is_alive() or second_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(self.remote["owner/bucket/first.mpk"], b"first")
+        self.assertEqual(self.remote["owner/bucket/second.mpk"], b"second")
+
     def test_successful_write_uploads_and_retains_mode_0600_candidate(self) -> None:
         store = self.make_store()
         store.write("object.mpk", b"new-payload")
@@ -861,6 +948,11 @@ class ArtifactStoreTestCase(unittest.TestCase):
         with self.assertRaises(ArtifactStoreRemoteError) as raised:
             store.read("object.mpk")
         self.assertNotIn("super-secret", str(raised.exception))
+
+    def test_false_token_is_reported_as_not_configured(self) -> None:
+        store = self.make_store(token=False)
+
+        self.assertFalse(store.configuration()["token_configured"])
 
     def test_read_validated_only_repairs_artifact_validation_errors(self) -> None:
         store = self.make_store()

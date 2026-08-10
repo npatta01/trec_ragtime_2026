@@ -31,6 +31,7 @@ DEFAULT_HYDRATION_RETRY_ATTEMPTS = 3
 DEFAULT_HYDRATION_RETRY_DELAY_SECONDS = 0.25
 MAX_HYDRATION_RETRY_ATTEMPTS = 5
 MAX_HYDRATION_RETRY_DELAY_SECONDS = 5.0
+REQUIRED_FSSPEC_VERSION = ">=2026.6.0,<2027"
 
 
 class ArtifactStoreError(Exception):
@@ -81,12 +82,14 @@ def _legacy_cache_setting_name() -> str | None:
 
 
 class ArtifactStore:
-    """Store immutable-ish artifacts in a private HF Bucket and L1 cache.
+    """Store identity-derived artifacts in a private HF Bucket and L1 cache.
 
     ``api_factory`` and ``filesystem_factory`` are intentionally injectable so
     offline tests can exercise the complete L1/L2 protocol without making a
     network request.  They are both lazy: a valid L1 read never constructs an
-    HF client or filesystem.
+    HF client or filesystem.  Explicit refresh writes replace an existing
+    value atomically; successful writes are last-successful-write-wins for a
+    given identity-derived key.
     """
 
     def __init__(
@@ -139,6 +142,20 @@ class ArtifactStore:
         self._hydration_retry_delay = hydration_retry_delay_value
         self._sleep = sleep if sleep is not None else time.sleep
         self._api_factory = api_factory or HfApi
+        if filesystem_factory is None:
+            try:
+                simplecache_class = fsspec.get_filesystem_class("simplecache")
+                hydration_primitive = getattr(
+                    simplecache_class, "_get_cached_file_before_open", None
+                )
+            except Exception:
+                hydration_primitive = None
+            if not callable(hydration_primitive):
+                raise _configuration_error(
+                    "fsspec"
+                    f"{REQUIRED_FSSPEC_VERSION} is required: "
+                    "SimpleCacheFileSystem._get_cached_file_before_open is unavailable"
+                )
         self._filesystem_factory = filesystem_factory or fsspec.filesystem
         self._api: Any | None = None
         self._filesystem: Any | None = None
@@ -223,7 +240,7 @@ class ArtifactStore:
             raise _configuration_error("artifact cache directory must not be a symlink")
         try:
             ensure_private_cache_dir(path)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             raise _configuration_error(
                 "artifact cache directory must be a private mode-0700 directory"
             ) from None
@@ -290,8 +307,7 @@ class ArtifactStore:
                     target_protocol="hf",
                     cache_storage=str(self.local_dir),
                     target_options=target_options,
-                    check_files=False,
-                    expiry_time=0,
+                    skip_instance_cache=True,
                 )
             except Exception:
                 raise ArtifactStoreRemoteError(
@@ -516,7 +532,11 @@ class ArtifactStore:
         return decoder(payload)
 
     def write(self, object_key: str, payload: bytes) -> None:
-        """Upload bytes through simplecache and retain a mode-0600 candidate."""
+        """Atomically upload bytes, allowing explicit refresh replacement.
+
+        Artifact keys are identity-derived, while writes are intentionally
+        last-successful-write-wins for refreshes of the same key.
+        """
 
         object_key = self._validate_object_key(object_key)
         if not isinstance(payload, bytes):
@@ -542,7 +562,7 @@ class ArtifactStore:
             "prefix": self.prefix,
             "local_dir": str(self.local_dir),
             "namespace": self.namespace,
-            "token_configured": self.token not in (None, ""),
+            "token_configured": bool(self.token),
         }
 
 

@@ -337,7 +337,16 @@ class RagtimeClientTests(unittest.TestCase):
         self.assertEqual(store.write_calls, [])
 
     def test_artifact_store_is_constructed_only_when_caching_is_enabled(self) -> None:
-        with patch("trec_ragtime.client.ArtifactStore.from_env") as from_env:
+        with patch.dict(
+            os.environ,
+            {
+                "RAGTIME_BASE_URL": "https://dummy.example",
+                "RAGTIME_BEARER_TOKEN": "dummy-token",
+                "RAGTIME_CACHE_PATH": "",
+                "RAGTIME_CACHE_DIR": "",
+            },
+            clear=True,
+        ), patch("trec_ragtime.client.ArtifactStore.from_env") as from_env:
             RagtimeClient.from_env(use_cache=False, session=RecordingSession())
         from_env.assert_not_called()
 
