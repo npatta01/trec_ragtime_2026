@@ -1,7 +1,7 @@
 [project]
 name = "trec-ragtime-2026"
 version = "0.1.0"
-description = "Small notebooks and static reference material for TREC RAGTIME 2026."
+description = "Retrieval, corpus, and multilingual baseline tools for TREC RAGTIME 2026."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 ragtime-corpus = "trec_ragtime.corpus_cli:main"
+ragtime-run = "trec_ragtime.run_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12"]

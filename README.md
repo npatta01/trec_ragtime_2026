@@ -330,13 +330,68 @@ token.
   cache directory and database are created with user-only permissions and must
   not be committed.
 
+## Generate A Valid Multilingual Baseline Run
+
+The package now includes a submission-oriented baseline that runs every topic,
+fuses one or more searches with weighted reciprocal-rank fusion, hydrates the
+fused IDs once, and writes both report-generation JSONL and a six-column MLIR
+run. Its report writer is deliberately extractive: it copies relevant English
+source or released machine-translation sentences and cites the original
+canonical document ID. This makes it a low-hallucination control run, not the
+final abstractive system.
+
+Decrypt the environment and build the complete corpus first. Keep generated
+participant artifacts in the ignored `run-output/` directory:
+
+```powershell
+sops decrypt --output .env config/secrets.sops.env
+uv run ragtime-corpus status
+New-Item -ItemType Directory -Force run-output | Out-Null
+uv run ragtime-run `
+  --topics topics/topics.all.2026.v0625-fix.jsonl `
+  --reports run-output/baseline-reports.jsonl `
+  --mlir run-output/baseline-mlir.run `
+  --artifacts run-output/baseline-audit.jsonl `
+  --team-id YOUR_TEAM_ID `
+  --run-id baseline-ragtime2 `
+  --facets
+```
+
+The default composite planner searches `ragtime2%100` once per topic.
+`--facets` adds deterministic problem-statement facets. For model-generated
+questions, translations, or native-language entity expansions, pass
+`--query-plan plans.jsonl`. Each line contains a topic and its queries:
+
+```json
+{"topic_id":"2000","queries":[{"query_id":"2000:eng:1","text":"focused English question","pipeline":"ragtime2%100","language":"eng","weight":1.0},{"query_id":"2000:spa:1","text":"pregunta enfocada","pipeline":"spa","language":"spa","weight":1.0}]}
+```
+
+The audit JSONL records query provenance, fused ranks, hydration status, and the
+evidence sentences selected for each report. The writers enforce complete topic
+coverage for every loaded topic, run-ID length, exact citation/reference unions,
+deterministic MLIR ordering, the 1,000-document retrieval cap, and each topic's
+NFKC-normalized character limit. Run the organizer validator before submission;
+`uvx` installs the pinned validator in an isolated environment:
+
+```powershell
+uvx `
+  --from "git+https://github.com/hltcoe/rag-run-validator.git@eb0811b229736746306d234081b348f77b2f646b" `
+  rag_run_validator run-output/baseline-reports.jsonl `
+  --topics topics/topics.all.2026.v0625-fix.jsonl `
+  --strict_on_length
+```
+
+Designate this control run as **automatic** in the submission system; it uses
+no manual topic-level intervention.
+
 ## Repository Map
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the
   required decrypt-first secret workflow.
 - [`src/trec_ragtime`](src/trec_ragtime): reusable private API client, local
   DuckDB corpus index and builder, Dataset Viewer fallback, high-level
-  retriever, typed responses, and cross-worktree caches.
+  retriever, multilingual query planning and fusion, submission writers,
+  extractive baseline runner, typed responses, and cross-worktree caches.
 - [`topics/topics.all.2026.v0625-fix.jsonl`](topics/topics.all.2026.v0625-fix.jsonl):
   [official corrected June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625-fix.jsonl),
   normalized to one JSON object per line.
@@ -349,8 +404,8 @@ token.
   one-query cached search with complete local-corpus document enrichment.
 - [`pyproject.toml`](pyproject.toml) and [`uv.lock`](uv.lock): reproducible Python
   environment managed by uv.
-- [`tests`](tests): offline unit tests for HTTP, cache, corpus build, and local
-  enrichment behavior.
+- [`tests`](tests): offline unit tests for HTTP, cache, corpus build, local
+  enrichment, fusion, report generation, and submission contracts.
 
 The RAGTIME2 snapshot and generated DuckDB index live in the Git-common project
 cache, not in any tracked worktree. Track details can change, so use the
