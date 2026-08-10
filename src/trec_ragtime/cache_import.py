@@ -131,6 +131,49 @@ def _source_bytes(source: Path) -> tuple[bytes, str, int]:
     return payload, hashlib.sha256(payload).hexdigest(), len(payload)
 
 
+def _preflight_manifest_path(source: Path, manifest_path: Path) -> None:
+    """Reject manifest paths that could replace or alias the source file.
+
+    This check intentionally happens before reading the source or writing any
+    destination artifact.  ``Path.samefile`` is not sufficient on its own:
+    the manifest may be a hardlink or a symlink, and the source may be absent
+    (in which case lexical/resolved identity still matters for diagnostics).
+    """
+
+    if not source.is_absolute():
+        raise ValueError("SQLite source path must be absolute")
+    if not manifest_path.is_absolute():
+        raise ValueError("manifest path must be absolute")
+    try:
+        if source.resolve(strict=False) == manifest_path.resolve(strict=False):
+            raise CacheImportError(
+                "manifest path must not replace the SQLite source"
+            )
+    except (OSError, RuntimeError):
+        raise CacheImportError("manifest and source paths could not be compared") from None
+
+    try:
+        source_stat = source.stat()
+    except FileNotFoundError:
+        source_stat = None
+    except OSError:
+        raise CacheImportError("manifest and source paths could not be compared") from None
+
+    try:
+        manifest_stat = manifest_path.stat()
+    except FileNotFoundError:
+        manifest_stat = None
+    except OSError:
+        raise CacheImportError("manifest and source paths could not be compared") from None
+
+    if source_stat is not None and manifest_stat is not None:
+        if os.path.samestat(source_stat, manifest_stat):
+            raise CacheImportError("manifest path must not replace the SQLite source")
+
+    if manifest_path.is_symlink():
+        raise CacheImportError("manifest path must not be a symlink")
+
+
 def _read_only_connection(source: Path) -> sqlite3.Connection:
     # Keep this exact URI form: mode=ro prevents an absent path from being
     # created and prevents any migration statement from mutating the source.
@@ -381,6 +424,8 @@ def import_sqlite_cache(
     if cache.namespace != canonical_namespace:
         raise ValueError("cache namespace does not match canonical namespace")
     source = Path(source).expanduser()
+    manifest_path = Path(manifest_path).expanduser()
+    _preflight_manifest_path(source, manifest_path)
     destination = _safe_destination(cache)
     before, source_sha256, source_size = _source_bytes(source)
     imported = Counter({operation: 0 for operation in SUPPORTED_OPERATIONS})
@@ -445,6 +490,11 @@ def import_sqlite_cache(
                             request=validated.request,
                             response=validated.response,
                             stored_at=validated.stored_at,
+                        )
+                        cache.evict_local(
+                            base_url=validated.base_url,
+                            operation=validated.operation,
+                            request=validated.request,
                         )
                         reread = cache.get(
                             base_url=validated.base_url,

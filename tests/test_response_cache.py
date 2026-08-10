@@ -187,6 +187,24 @@ class ResponseCacheTestCase(unittest.TestCase):
                 self.assertNotIn("secret-value", str(raised.exception))
         self.assertEqual(self.store.write_calls, [])
 
+    def test_semantic_token_count_field_is_allowed(self) -> None:
+        request = {"query": "hello", "token_count": 3}
+        response = {"scores": {}, "token_count": 3}
+
+        self.cache.object_key(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=request,
+        )
+        self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=request,
+            response=response,
+            stored_at=100.0,
+        )
+        self.assertEqual(len(self.store.write_calls), 1)
+
     def test_ordinary_semantically_distinct_mappings_do_not_collide(self) -> None:
         first = self.cache.object_key(
             base_url=self.base_url,

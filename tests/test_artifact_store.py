@@ -286,6 +286,30 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(self.api_constructed, 0)
         self.assertEqual(self.fs_constructed, 0)
 
+    def test_existing_permissive_l1_candidate_is_secured_before_read(self) -> None:
+        store = self.make_store()
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"local")
+        os.chmod(candidate, 0o644)
+
+        self.assertEqual(store.read("object.mpk"), b"local")
+        self.assertEqual(stat.S_IMODE(candidate.stat().st_mode), 0o600)
+        self.assertEqual(self.api_constructed, 0)
+        self.assertEqual(self.fs_constructed, 0)
+
+    def test_evict_local_removes_only_the_exact_candidate(self) -> None:
+        store = self.make_store(prefix="")
+        store.write("object.mpk", b"local")
+        other_candidate = store.local_candidate("other.mpk")
+        other_candidate.write_bytes(b"other")
+        os.chmod(other_candidate, 0o600)
+
+        store.evict_local("object.mpk")
+
+        self.assertFalse(store.local_candidate("object.mpk").exists())
+        self.assertEqual(other_candidate.read_bytes(), b"other")
+        self.assertEqual(self.remote["owner/bucket/object.mpk"], b"local")
+
     def test_l2_hit_uses_exact_paths_info_and_populates_l1_once(self) -> None:
         store = self.make_store()
 

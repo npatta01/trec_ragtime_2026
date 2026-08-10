@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -18,7 +19,11 @@ from urllib.parse import urlsplit
 
 import msgspec
 
-from .artifact_store import ArtifactStoreLike, ArtifactValidationError
+from .artifact_store import (
+    ArtifactStoreLike,
+    ArtifactStoreRemoteError,
+    ArtifactValidationError,
+)
 
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_CACHE_NAMESPACE = "ragtime2-2026-v1"
@@ -78,6 +83,11 @@ def _normalized_field_name(name: str) -> str:
 
 def _is_credential_field(name: str) -> bool:
     normalized = _normalized_field_name(name)
+    # ``token_count`` is a semantic measurement, not a bearer credential.  It
+    # is the one common token-prefixed field that must remain representable;
+    # exact token fields and provider/header spellings below stay rejected.
+    if normalized == "token_count":
+        return False
     if normalized in _CREDENTIAL_FIELDS:
         return True
     parts = normalized.split("_")
@@ -105,6 +115,76 @@ def _is_credential_field(name: str) -> bool:
         parts[index : index + 2] == ["api", "key"]
         for index in range(len(parts) - 1)
     )
+
+
+_PUBLIC_METADATA_SENSITIVE_PARTS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "authentication",
+        "body",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "query",
+        "response",
+        "secret",
+        "url",
+    }
+)
+_PUBLIC_METADATA_BUCKET_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_PUBLIC_METADATA_PREFIX_PART = re.compile(
+    r"[A-Za-z0-9_~%+-][A-Za-z0-9._~%+-]*\Z"
+)
+
+
+def _safe_public_metadata_value(field: str, value: Any) -> str:
+    """Validate one injected-store metadata value without echoing it."""
+
+    try:
+        if field == "local_dir" and isinstance(value, os.PathLike):
+            value = os.fspath(value)
+        if not isinstance(value, str):
+            raise ValueError
+        if field == "prefix" and value == "":
+            return value
+        if not value or any(
+            character.isspace() or ord(character) < 32 for character in value
+        ):
+            raise ValueError
+        if "//" in value and "://" in value:
+            raise ValueError
+        if any(character in value for character in "?#\\=@{}[]<>\"';&:"):
+            raise ValueError
+        normalized = _normalized_field_name(value)
+        if _is_credential_field(value) or any(
+            part in _PUBLIC_METADATA_SENSITIVE_PARTS
+            for part in normalized.split("_")
+        ):
+            raise ValueError
+        if field == "bucket_id":
+            parts = value.split("/")
+            if len(parts) != 2 or any(
+                not _PUBLIC_METADATA_BUCKET_PART.fullmatch(part) for part in parts
+            ):
+                raise ValueError
+        elif field == "prefix":
+            parts = value.split("/")
+            if any(
+                not part or part in {".", ".."}
+                or not _PUBLIC_METADATA_PREFIX_PART.fullmatch(part)
+                for part in parts
+            ):
+                raise ValueError
+        elif field == "local_dir":
+            if not os.path.isabs(value):
+                raise ValueError
+        else:
+            raise ValueError
+    except Exception:
+        raise ValueError("artifact cache metadata is invalid") from None
+    return value
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -427,6 +507,56 @@ class ResponseCache:
         self.store.write(response_object_key(normalized_operation, expected_request_digest), encoded)
         return timestamp
 
+    def evict_local(
+        self,
+        *,
+        base_url: str,
+        operation: str,
+        request: Mapping[str, Any],
+    ) -> None:
+        """Evict exactly one L1 candidate without probing or changing L2."""
+
+        _, expected_request_digest = self._identity(
+            base_url=base_url,
+            operation=operation,
+            request=request,
+        )
+        normalized_operation = _validate_operation(operation)
+        evict = getattr(self.store, "evict_local", None)
+        if not callable(evict):
+            raise ArtifactStoreRemoteError(
+                "artifact store cannot evict a local cache candidate"
+            )
+        evict(response_object_key(normalized_operation, expected_request_digest))
+
+
+def sanitized_cache_configuration(
+    namespace: str, store: object | None
+) -> dict[str, object]:
+    """Return safe public cache metadata, including injected stores.
+
+    Runtime clients expose this data in manifests and status surfaces.  An
+    injected ``ArtifactStoreLike`` is not trusted merely because it satisfies
+    the protocol, so all copied values are constrained to their expected
+    path-like forms and failures use a value-free message.
+    """
+
+    try:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError
+        normalized_namespace = _safe_public_metadata_value("prefix", namespace.strip())
+        configuration: dict[str, object] = {"namespace": normalized_namespace}
+        for field in ("bucket_id", "prefix", "local_dir"):
+            try:
+                value = getattr(store, field, None)
+            except Exception:
+                raise ValueError from None
+            if value is not None:
+                configuration[field] = _safe_public_metadata_value(field, value)
+        return configuration
+    except Exception:
+        raise ValueError("artifact cache metadata is invalid") from None
+
 
 __all__ = [
     "CACHE_SCHEMA_VERSION",
@@ -442,4 +572,5 @@ __all__ = [
     "request_digest",
     "request_identity_digest",
     "response_object_key",
+    "sanitized_cache_configuration",
 ]

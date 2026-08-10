@@ -247,6 +247,23 @@ class HuggingFaceCorpusTests(unittest.TestCase):
             corpus = HuggingFaceCorpus(use_cache=False)
         corpus.close()
 
+    def test_injected_store_metadata_is_rejected_without_echoing_values(self) -> None:
+        cache, store = make_cache()
+        store.bucket_id = "owner/private?token=do-not-echo"
+        store.prefix = "https://private.example/body=do-not-echo"
+        store.local_dir = "owner/credential=do-not-echo"
+
+        with self.assertWarns(DeprecationWarning):
+            corpus = HuggingFaceCorpus(
+                splits=("eng",),
+                cache=cache,
+                session=RecordingGetSession(),
+            )
+        with self.assertRaises(HuggingFaceConfigurationError) as raised:
+            _ = corpus.cache_configuration
+        self.assertNotIn("do-not-echo", str(raised.exception))
+        corpus.close()
+
     def test_batches_filters_escapes_ids_and_preserves_requested_order(self) -> None:
         session = RecordingGetSession(
             FakeResponse(filter_payload(document_row("doc'a", "A"))),

@@ -18,19 +18,30 @@ from trec_ragtime.cache_import import CacheImportError, import_sqlite_cache
 class MemoryArtifactStore:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.local: dict[str, bytes] = {}
         self.reads: list[str] = []
+        self.read_sources: list[str] = []
         self.bucket_id = "owner/private-cache"
         self.prefix = "migration-v1"
 
     def read_validated(self, object_key: str, decoder: Any) -> Any | None:
         self.reads.append(object_key)
-        encoded = self.objects.get(object_key)
+        encoded = self.local.get(object_key)
+        source = "local"
+        if encoded is None:
+            encoded = self.objects.get(object_key)
+            source = "remote"
         if encoded is None:
             return None
+        self.read_sources.append(source)
         return decoder(encoded)
 
     def write(self, object_key: str, payload: bytes) -> None:
         self.objects[object_key] = payload
+        self.local[object_key] = payload
+
+    def evict_local(self, object_key: str) -> None:
+        self.local.pop(object_key, None)
 
 
 def pipeline_row(
@@ -180,6 +191,14 @@ class CacheImportTestCase(unittest.TestCase):
             ),
             pipeline_row(cache_key="non-finite", stored_at=math.inf),
             pipeline_row(
+                cache_key="non-finite-score",
+                response={
+                    "query": "safe query",
+                    "pipeline": "ragtime2%100",
+                    "scores": {"doc-1": math.inf},
+                },
+            ),
+            pipeline_row(
                 cache_key="secret",
                 response={
                     "query": "safe query",
@@ -202,8 +221,19 @@ class CacheImportTestCase(unittest.TestCase):
         self.assertEqual(summary.imported["content"], 1)
         self.assertEqual(summary.imported["huggingface_document"], 1)
         self.assertEqual(summary.verified, summary.imported)
+        self.assertEqual(
+            summary.skipped,
+            {
+                "pipeline": 6,
+                "content": 1,
+                "huggingface_document": 1,
+                "unsupported": 1,
+            },
+        )
+        self.assertEqual(summary.skipped_reasons, {"row_rejected": 9})
         self.assertEqual(self.source.read_bytes(), before)
         self.assertGreaterEqual(len(store.reads), 3)
+        self.assertEqual(store.read_sources, ["remote", "remote", "remote"])
 
         manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
         self.assertEqual(manifest["source"]["sha256"], source_hash)
@@ -217,7 +247,9 @@ class CacheImportTestCase(unittest.TestCase):
             },
         )
         self.assertEqual(manifest["counts"]["pipeline"]["imported"], 1)
+        self.assertEqual(manifest["counts"]["pipeline"]["skipped"], 6)
         self.assertEqual(manifest["counts"]["huggingface_document"]["verified"], 1)
+        self.assertEqual(manifest["skipped_reasons"], {"row_rejected": 9})
         manifest_text = self.manifest.read_text(encoding="utf-8")
         for forbidden in (
             "source text",
@@ -251,6 +283,26 @@ class CacheImportTestCase(unittest.TestCase):
         assert entry is not None
         self.assertEqual(entry.stored_at, stored_at)
 
+    def test_l2_failure_after_l1_eviction_fails_independent_verification(self) -> None:
+        self.source.unlink()
+        self._create_source([pipeline_row()])
+
+        class RemoteDisappearsStore(MemoryArtifactStore):
+            def evict_local(self, object_key: str) -> None:
+                super().evict_local(object_key)
+                self.objects.clear()
+
+        store = RemoteDisappearsStore()
+        cache = ResponseCache(store, clock=time.time)
+        before = self.source.read_bytes()
+
+        with self.assertRaises(CacheImportError):
+            import_sqlite_cache(self.source, cache, self.manifest)
+
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual(store.read_sources, [])
+
     def test_source_is_opened_read_only_and_missing_source_does_not_get_created(self) -> None:
         self.source.unlink()
         with self.assertRaises(FileNotFoundError):
@@ -262,6 +314,29 @@ class CacheImportTestCase(unittest.TestCase):
         before = self.source.read_bytes()
         import_sqlite_cache(self.source, self._cache()[0], self.manifest)
         self.assertEqual(self.source.read_bytes(), before)
+
+    def test_manifest_source_collision_is_rejected_before_reads_or_writes(self) -> None:
+        for collision in ("same-path", "hardlink", "symlink"):
+            with self.subTest(collision=collision):
+                self.source.unlink()
+                self._create_source([pipeline_row()])
+                if collision == "same-path":
+                    manifest_path = self.source
+                elif collision == "hardlink":
+                    manifest_path = self.root / "manifest-hardlink.json"
+                    manifest_path.hardlink_to(self.source)
+                else:
+                    manifest_path = self.root / "manifest-symlink.json"
+                    manifest_path.symlink_to(self.source)
+                before = self.source.read_bytes()
+                cache, store = self._cache()
+
+                with self.assertRaises(CacheImportError) as raised:
+                    import_sqlite_cache(self.source, cache, manifest_path)
+
+                self.assertNotIn(str(self.source), str(raised.exception))
+                self.assertEqual(self.source.read_bytes(), before)
+                self.assertEqual(store.objects, {})
 
     def test_noncanonical_namespace_override_is_rejected_without_writes_or_source_mutation(self) -> None:
         self.source.unlink()

@@ -16,7 +16,12 @@ from requests_ratelimiter import LimiterMixin
 from urllib3.util.retry import Retry
 
 from .artifact_store import ArtifactStore, ArtifactStoreLike, _legacy_cache_setting_name
-from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, ResponseCache
+from .cache import (
+    DEFAULT_CACHE_NAMESPACE,
+    CacheEntry,
+    ResponseCache,
+    sanitized_cache_configuration,
+)
 from .models import Document, PipelineResult, SearchHit
 
 DEFAULT_PIPELINE = "ragtime2"
@@ -270,15 +275,15 @@ class RagtimeClient:
 
         if self.cache is None:
             return None
-        configuration: dict[str, object] = {
-            "namespace": self.cache.namespace,
-        }
-        store = self.artifact_store
-        for field in ("bucket_id", "prefix", "local_dir"):
-            value = getattr(store, field, None)
-            if value is not None:
-                configuration[field] = str(value) if field == "local_dir" else value
-        return configuration
+        try:
+            return sanitized_cache_configuration(
+                self.cache.namespace,
+                self.artifact_store,
+            )
+        except ValueError:
+            raise RagtimeConfigurationError(
+                "artifact cache metadata is invalid"
+            ) from None
 
     def close(self) -> None:
         if self._owns_session:

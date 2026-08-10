@@ -400,6 +400,18 @@ class RagtimeClientTests(unittest.TestCase):
         self.assertIs(client.artifact_store, store)
         self.assertFalse(hasattr(client, "cache_path"))
 
+    def test_injected_store_metadata_is_rejected_without_echoing_values(self) -> None:
+        cache, store = make_cache()
+        store.bucket_id = "owner/private?token=do-not-echo"
+        store.prefix = "https://private.example/body=do-not-echo"
+        store.local_dir = "owner/credential=do-not-echo"
+        client = RagtimeClient("https://api.example", "secret", cache=cache, use_cache=True)
+
+        with self.assertRaises(RagtimeConfigurationError) as raised:
+            _ = client.cache_configuration
+
+        self.assertNotIn("do-not-echo", str(raised.exception))
+
     def test_constructor_rejects_invalid_cache_ttls(self) -> None:
         for value in (-1, float("nan"), float("inf"), True):
             with self.subTest(value=value), self.assertRaises(RagtimeConfigurationError):

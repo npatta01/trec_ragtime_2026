@@ -53,6 +53,8 @@ class ArtifactStoreLike(Protocol):
 
     def write(self, object_key: str, payload: bytes) -> None: ...
 
+    def evict_local(self, object_key: str) -> None: ...
+
 
 ApiFactory = Callable[..., Any]
 FilesystemFactory = Callable[..., Any]
@@ -287,6 +289,10 @@ class ArtifactStore:
             raise ArtifactStoreRemoteError("local artifact cache candidate is a symlink")
         if not stat.S_ISREG(file_status.st_mode):
             raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
+        # L1 is owner-only even when a candidate was created or modified
+        # outside this process.  Secure the exact regular path before reading
+        # bytes; symlinks and non-regular files remain fatal.
+        self._secure_candidate(candidate)
         try:
             return True, candidate.read_bytes()
         except OSError:
@@ -389,6 +395,23 @@ class ArtifactStore:
         if found:
             return cast(bytes, payload)
         return self._read_remote(object_key)
+
+    def evict_local(self, object_key: str) -> None:
+        """Evict only one validated L1 candidate; never touch the bucket."""
+
+        object_key = self._validate_object_key(object_key)
+        candidate = self.local_candidate(object_key)
+        try:
+            file_status = candidate.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise ArtifactStoreRemoteError("failed to inspect local artifact cache") from None
+        if stat.S_ISLNK(file_status.st_mode):
+            raise ArtifactStoreRemoteError("local artifact cache candidate is a symlink")
+        if not stat.S_ISREG(file_status.st_mode):
+            raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
+        self._remove_candidate(candidate)
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], T]
