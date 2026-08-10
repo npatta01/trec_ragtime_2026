@@ -425,11 +425,27 @@ class RetrievalImportTests(unittest.TestCase):
                 )
             self.assertEqual(self.store.objects, {})
 
-    def test_control_missing_backend_is_rejected_without_writes(self) -> None:
+    def test_legacy_control_v1_without_backend_imports_complete_candidates(self) -> None:
         run = self._write_control_run()
         manifest_path = run / "manifest.json"
         payload = json.loads(manifest_path.read_text())
         del payload["corpus"]["backend"]
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        summary = import_retrieval_run(
+            run,
+            corpus=self.corpus,
+            cache=self.cache,
+            manifest_path=self.root / "out.json",
+            base_url="https://organizer.example.test",
+        )
+        self.assertEqual(summary.imported, 1)
+        self.assertEqual(len(self.store.objects), 1)
+
+    def test_control_explicit_nonlocal_backend_is_rejected_without_writes(self) -> None:
+        run = self._write_control_run()
+        manifest_path = run / "manifest.json"
+        payload = json.loads(manifest_path.read_text())
+        payload["corpus"]["backend"] = "dataset_viewer"
         manifest_path.write_text(json.dumps(payload), encoding="utf-8")
         with self.assertRaises(RetrievalImportError):
             import_retrieval_run(

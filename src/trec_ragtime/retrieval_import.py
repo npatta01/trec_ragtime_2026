@@ -265,12 +265,22 @@ def _check_manifest_corpus(
     expected = manifest.get("corpus")
     if not isinstance(expected, Mapping):
         raise RetrievalImportError("run manifest has no corpus identity")
-    if expected.get("backend") != "local":
+    if schema == CONTROL_A_SCHEMA:
+        # Pre-fc7b3e2 Control-A v1 manifests recorded only path/revision. The
+        # importer has already received a validated LocalCorpusIndex, so an
+        # absent backend is the one supported legacy spelling of "local".
+        if "backend" in expected and expected["backend"] != "local":
+            raise RetrievalImportError("run manifest does not describe a local corpus")
+    elif expected.get("backend") != "local":
         raise RetrievalImportError("run manifest does not describe a local corpus")
-    required = {"backend", "revision"}
+    # Control-A v1 predates the backend field; the validated LocalCorpusIndex
+    # supplied by the importer makes that legacy omission unambiguous. Baseline
+    # manifests are newer and must continue to carry the complete identity.
+    required = {"revision"}
     if schema == QUERY_BASELINE_SCHEMA:
         required.update(
             {
+                "backend",
                 "schema_version",
                 "dataset",
                 "config",
