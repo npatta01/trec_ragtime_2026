@@ -85,7 +85,9 @@ class FakeAsyncRunner:
             elif self.mode == "extra":
                 rows = request["rows"] + [{"hash": "00" * 32, "score": 0.0}]
             elif self.mode == "nan":
-                rows = [{"hash": row["hash"], "score": math.nan} for row in request["rows"]]
+                rows = [
+                    {"hash": row["hash"], "score": math.nan} for row in request["rows"]
+                ]
             elif self.mode == "malformed":
                 return b'{"scores":[{"hash": "not-a-hash"}]}'
             else:
@@ -168,10 +170,14 @@ class FlashWireCodecTests(unittest.TestCase):
         self.assertEqual(decoded["schema_version"], WIRE_SCHEMA_VERSION)
         self.assertEqual(decoded["scorer_fingerprint"], "local-policy-v1")
         self.assertEqual(decoded["query"], "q-é")
-        self.assertEqual(decoded["rows"][0], {"hash": sha256_bytes("é漢字").hex(), "text": "é漢字"})
+        self.assertEqual(
+            decoded["rows"][0], {"hash": sha256_bytes("é漢字").hex(), "text": "é漢字"}
+        )
         self.assertLess(len(first), FLASH_PAYLOAD_LIMIT_BYTES)
 
-    def test_wire_decoders_reject_unknown_fields_malformed_hashes_and_non_finite_scores(self) -> None:
+    def test_wire_decoders_reject_unknown_fields_malformed_hashes_and_non_finite_scores(
+        self,
+    ) -> None:
         with self.assertRaises(FlashScoringError):
             decode_flash_request(
                 b'{"schema_version":1,"scorer_fingerprint":"p",'
@@ -206,18 +212,26 @@ class FlashWireCodecTests(unittest.TestCase):
                 request.replace(b'"schema_version":1', b'"schema_version":2')
             )
         with self.assertRaises(FlashScoringError):
-            decode_flash_request(request.replace(b'"scorer_fingerprint":"policy-v1"', b'"scorer_fingerprint":""'))
+            decode_flash_request(
+                request.replace(
+                    b'"scorer_fingerprint":"policy-v1"', b'"scorer_fingerprint":""'
+                )
+            )
 
         response = encode_flash_response(
             ({"hash": sha256_bytes("text"), "score": 1.0},),
             schema_version=WIRE_SCHEMA_VERSION,
             scorer_fingerprint="policy-v1",
         )
-        self.assertEqual(decode_flash_response(response)["scorer_fingerprint"], "policy-v1")
+        self.assertEqual(
+            decode_flash_response(response)["scorer_fingerprint"], "policy-v1"
+        )
 
 
 class RunpodFlashConfigTests(unittest.TestCase):
-    def test_effective_policy_carries_full_local_identity_and_normalizes_aliases(self) -> None:
+    def test_effective_policy_carries_full_local_identity_and_normalizes_aliases(
+        self,
+    ) -> None:
         policy = LocalCrossEncoderConfig()
         config = RunpodFlashConfig(
             endpoint_id="endpoint-a",
@@ -236,7 +250,10 @@ class RunpodFlashConfigTests(unittest.TestCase):
 
         self.assertEqual(effective.tokenizer_name, "custom/tokenizer")
         self.assertEqual(effective.tokenizer_revision, "tokenizer-revision")
-        self.assertEqual(effective.sentence_transformers_version, policy.sentence_transformers_version)
+        self.assertEqual(
+            effective.sentence_transformers_version,
+            policy.sentence_transformers_version,
+        )
         self.assertEqual(effective.transformers_version, policy.transformers_version)
         self.assertEqual(effective.tokenizers_version, policy.tokenizers_version)
         self.assertEqual(effective.torch_version, policy.torch_version)
@@ -266,7 +283,9 @@ class RunpodFlashConfigTests(unittest.TestCase):
         self.assertEqual(base.fingerprint, transport_variant.fingerprint)
         for field_name in ("worker_name", "gpu"):
             with self.subTest(field_name=field_name), self.assertRaises(ValueError):
-                RunpodFlashConfig(endpoint_id="endpoint-a", **{field_name: "bad\nvalue"})
+                RunpodFlashConfig(
+                    endpoint_id="endpoint-a", **{field_name: "bad\nvalue"}
+                )
 
     def test_result_fingerprint_excludes_transport_only_settings(self) -> None:
         policy = LocalCrossEncoderConfig(
@@ -345,8 +364,12 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             scorer.score("query", (first, second))
 
-    def test_failed_batch_cancels_and_awaits_all_siblings_before_returning(self) -> None:
-        passages = tuple(_passage(f"text-{index}", document_id=str(index)) for index in range(4))
+    def test_failed_batch_cancels_and_awaits_all_siblings_before_returning(
+        self,
+    ) -> None:
+        passages = tuple(
+            _passage(f"text-{index}", document_id=str(index)) for index in range(4)
+        )
         runner = QuiescingFailureRunner()
         scorer = RunpodFlashPassageScorer(
             RunpodFlashConfig(endpoint_id="fake", batch_size=1, concurrency=2),
@@ -373,11 +396,14 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
         scores = scorer.score("query", (first, duplicate, second, third))
 
-        self.assertEqual(scores, {
-            first.content_hash: 5.0,
-            second.content_hash: 6.0,
-            third.content_hash: 5.0,
-        })
+        self.assertEqual(
+            scores,
+            {
+                first.content_hash: 5.0,
+                second.content_hash: 6.0,
+                third.content_hash: 5.0,
+            },
+        )
         self.assertEqual(len(runner.payloads), 2)
         self.assertEqual(
             [row["text"] for row in decode_flash_request(runner.payloads[0])["rows"]],
@@ -388,8 +414,12 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             ["third"],
         )
 
-    def test_batches_by_actual_final_utf8_payload_and_rejects_oversized_row(self) -> None:
-        passages = tuple(_passage("漢字-é" * count, document_id=str(count)) for count in range(1, 8))
+    def test_batches_by_actual_final_utf8_payload_and_rejects_oversized_row(
+        self,
+    ) -> None:
+        passages = tuple(
+            _passage("漢字-é" * count, document_id=str(count)) for count in range(1, 8)
+        )
         config = RunpodFlashConfig(
             endpoint_id="fake",
             batch_size=99,
@@ -402,14 +432,18 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
         self.assertGreater(len(runner.payloads), 1)
         self.assertTrue(all(len(payload) < 500 for payload in runner.payloads))
-        self.assertTrue(all(len(payload) < FLASH_PAYLOAD_LIMIT_BYTES for payload in runner.payloads))
+        self.assertTrue(
+            all(len(payload) < FLASH_PAYLOAD_LIMIT_BYTES for payload in runner.payloads)
+        )
 
         too_large = _passage("x" * 500, document_id="too-large")
         with self.assertRaises(FlashScoringError):
             scorer.score("q", (too_large,))
 
     def test_concurrency_is_bounded_and_all_batches_complete(self) -> None:
-        passages = tuple(_passage(f"text-{index}", document_id=str(index)) for index in range(8))
+        passages = tuple(
+            _passage(f"text-{index}", document_id=str(index)) for index in range(8)
+        )
         runner = FakeAsyncRunner(delay=0.02)
         scorer = RunpodFlashPassageScorer(
             RunpodFlashConfig(endpoint_id="fake", batch_size=1, concurrency=2),
@@ -462,7 +496,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         scorer.close()
         self.assertFalse(loop_thread.is_alive())
 
-    def test_score_after_close_rejects_without_creating_an_unawaited_coroutine(self) -> None:
+    def test_score_after_close_rejects_without_creating_an_unawaited_coroutine(
+        self,
+    ) -> None:
         passage = _passage("passage")
         scorer = RunpodFlashPassageScorer(
             RunpodFlashConfig(endpoint_id="fake"), FakeAsyncRunner()
@@ -510,7 +546,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             },
         )
 
-    def test_bridge_startup_timeout_stops_a_late_created_loop_within_a_bound(self) -> None:
+    def test_bridge_startup_timeout_stops_a_late_created_loop_within_a_bound(
+        self,
+    ) -> None:
         existing_loop_threads = {
             thread.ident
             for thread in threading.enumerate()
@@ -563,7 +601,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             },
         )
 
-    def test_bridge_discards_cancellation_resistant_tasks_and_joins_thread(self) -> None:
+    def test_bridge_discards_cancellation_resistant_tasks_and_joins_thread(
+        self,
+    ) -> None:
         bridge = _EventLoopBridge()
 
         async def cancellation_resistant() -> None:
@@ -604,7 +644,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                         self.events.append(f"drain-{dispatch}")
                         await asyncio.sleep(0)
 
-        passages = tuple(_passage(f"text-{index}", document_id=str(index)) for index in range(4))
+        passages = tuple(
+            _passage(f"text-{index}", document_id=str(index)) for index in range(4)
+        )
         runner = OuterTimeoutRunner()
         scorer = RunpodFlashPassageScorer(
             RunpodFlashConfig(
@@ -635,7 +677,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         self.assertEqual(tuple(runner.events), events_at_return)
         scorer.close()
 
-    def test_stdout_and_stderr_never_contain_query_text_hash_or_credentials(self) -> None:
+    def test_stdout_and_stderr_never_contain_query_text_hash_or_credentials(
+        self,
+    ) -> None:
         query = "secret query"
         text_value = "secret passage"
         token = "bearer-secret"
@@ -643,7 +687,10 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         runner = FakeAsyncRunner()
         output = io.StringIO()
         error_output = io.StringIO()
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error_output):
+        with (
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(error_output),
+        ):
             RunpodFlashPassageScorer(
                 RunpodFlashConfig(endpoint_id="fake"), runner
             ).score(query, (passage,))
@@ -652,7 +699,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         for secret in (query, text_value, token, passage.content_hash.hex()):
             self.assertNotIn(secret, combined)
 
-    def test_local_and_remote_fake_models_have_exact_score_parity_through_wire(self) -> None:
+    def test_local_and_remote_fake_models_have_exact_score_parity_through_wire(
+        self,
+    ) -> None:
         policy = LocalCrossEncoderConfig(
             device="cuda",
             precision="float16",
@@ -669,7 +718,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             def __init__(self, calls: dict[str, list[Any]]) -> None:
                 self.calls = calls
 
-            def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+            def __call__(
+                self, query: str, text: str, **kwargs: Any
+            ) -> dict[str, list[list[int]]]:
                 self.calls["tokenizer"].append((query, text, kwargs))
                 length = 100 if text == "overflow" else len(query) + len(text)
                 return {"input_ids": [[1] * length]}
@@ -678,11 +729,15 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             def __init__(self, calls: dict[str, list[Any]]) -> None:
                 self.calls = calls
 
-            def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+            def predict(
+                self, pairs: list[tuple[str, str]], **kwargs: Any
+            ) -> list[float]:
                 self.calls["predict"].append((pairs, kwargs))
                 return [float(len(text) * 2 + 0.5) for _, text in pairs]
 
-        def loader_for(calls: dict[str, list[Any]]) -> Callable[[LocalCrossEncoderConfig], object]:
+        def loader_for(
+            calls: dict[str, list[Any]],
+        ) -> Callable[[LocalCrossEncoderConfig], object]:
             return lambda config: (Model(calls), Tokenizer(calls))
 
         local = LocalCrossEncoderScorer(policy, loader=loader_for(local_calls))
@@ -722,16 +777,34 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         self.assertEqual(request["scorer_fingerprint"], policy.fingerprint)
         self.assertEqual(observed["response"]["scorer_fingerprint"], policy.fingerprint)
         for calls in (local_calls, worker_calls):
-            self.assertEqual([entry[:2] for entry in calls["tokenizer"]], [
-                ("Q: query", "a"),
-                ("Q: query", "longer"),
-            ])
-            self.assertTrue(all(entry[2]["truncation"] is False for entry in calls["tokenizer"]))
-            self.assertTrue(all(entry[2]["max_length"] == 20 for entry in calls["tokenizer"]))
-            self.assertEqual([entry[0] for entry in calls["predict"]], [[("Q: query", "a")], [("Q: query", "longer")]])
-            self.assertTrue(all(entry[1]["apply_softmax"] is False for entry in calls["predict"]))
-            self.assertTrue(all(entry[1]["convert_to_numpy"] is True for entry in calls["predict"]))
-            self.assertTrue(all(entry[1]["convert_to_tensor"] is False for entry in calls["predict"]))
+            self.assertEqual(
+                [entry[:2] for entry in calls["tokenizer"]],
+                [
+                    ("Q: query", "a"),
+                    ("Q: query", "longer"),
+                ],
+            )
+            self.assertTrue(
+                all(entry[2]["truncation"] is False for entry in calls["tokenizer"])
+            )
+            self.assertTrue(
+                all(entry[2]["max_length"] == 20 for entry in calls["tokenizer"])
+            )
+            self.assertEqual(
+                [entry[0] for entry in calls["predict"]],
+                [[("Q: query", "a")], [("Q: query", "longer")]],
+            )
+            self.assertTrue(
+                all(entry[1]["apply_softmax"] is False for entry in calls["predict"])
+            )
+            self.assertTrue(
+                all(entry[1]["convert_to_numpy"] is True for entry in calls["predict"])
+            )
+            self.assertTrue(
+                all(
+                    entry[1]["convert_to_tensor"] is False for entry in calls["predict"]
+                )
+            )
 
         overflowing = _passage("overflow", document_id="overflow")
         with self.assertRaises(PassageScoringError):
@@ -800,7 +873,9 @@ class EndpointRunnerTests(unittest.TestCase):
         self.assertEqual(calls[2], ("wait", 3.0))
 
     def test_endpoint_run_and_wait_failures_cancel_the_submitted_job(self) -> None:
-        request_config = RunpodFlashConfig(endpoint_id="endpoint-id", request_timeout=0.01)
+        request_config = RunpodFlashConfig(
+            endpoint_id="endpoint-id", request_timeout=0.01
+        )
         request = encode_flash_request(
             "query",
             ({"hash": sha256_bytes("text"), "text": "text"},),
@@ -847,7 +922,9 @@ class EndpointRunnerTests(unittest.TestCase):
                     runner.run_batch_sync(request)
                 self.assertEqual(job.cancel_calls, 1)
 
-    def test_endpoint_run_errors_and_malformed_or_missing_output_are_fatal(self) -> None:
+    def test_endpoint_run_errors_and_malformed_or_missing_output_are_fatal(
+        self,
+    ) -> None:
         config = RunpodFlashConfig(endpoint_id="endpoint-id")
         request = encode_flash_request(
             "query",
@@ -864,10 +941,13 @@ class EndpointRunnerTests(unittest.TestCase):
                 raise RuntimeError("run failed")
 
         with self.assertRaises(FlashScoringError):
-            self._make_runner(config, endpoint_factory=EndpointRunError).run_batch_sync(request)
+            self._make_runner(config, endpoint_factory=EndpointRunError).run_batch_sync(
+                request
+            )
 
         for output in (None, {"scores": [{"hash": "bad"}]}):
             with self.subTest(output=output):
+
                 class Job:
                     async def wait(self, timeout: float | None = None) -> Job:
                         return self
@@ -887,11 +967,14 @@ class EndpointRunnerTests(unittest.TestCase):
                         return Job()
 
                 with self.assertRaises(FlashScoringError):
-                    self._make_runner(config, endpoint_factory=Endpoint).run_batch_sync(request)
+                    self._make_runner(config, endpoint_factory=Endpoint).run_batch_sync(
+                        request
+                    )
 
     def test_endpoint_runner_cancels_job_when_its_async_call_is_cancelled(self) -> None:
         config = RunpodFlashConfig(endpoint_id="endpoint-id")
         started = threading.Event()
+
         # The fake endpoint is only used inside the explicitly created async test host.
         class Job:
             cancel_calls = 0
@@ -938,7 +1021,9 @@ class EndpointRunnerTests(unittest.TestCase):
 
 
 class FlashWorkerTests(unittest.TestCase):
-    def test_endpoint_style_decorator_receives_resolved_provisioning_policy_without_calling_it(self) -> None:
+    def test_endpoint_style_decorator_receives_resolved_provisioning_policy_without_calling_it(
+        self,
+    ) -> None:
         policy = LocalCrossEncoderConfig(query_policy="endpoint-style-decorator")
         config = RunpodFlashConfig(
             endpoint_id="endpoint-id",
@@ -998,7 +1083,9 @@ class FlashWorkerTests(unittest.TestCase):
         self.assertEqual(resolver_calls, [])
         self.assertEqual(Worker.__name__, "FlashPassageWorker")
 
-    def test_worker_source_is_stable_for_normalized_runtime_aliases_and_pins_tokenizer(self) -> None:
+    def test_worker_source_is_stable_for_normalized_runtime_aliases_and_pins_tokenizer(
+        self,
+    ) -> None:
         base = LocalCrossEncoderConfig(
             tokenizer_name="custom/tokenizer",
             tokenizer_revision="tokenizer-revision",
@@ -1023,7 +1110,9 @@ class FlashWorkerTests(unittest.TestCase):
         self.assertNotIn('"device":"rocm"', source)
         self.assertNotIn('"precision":"fp32"', source)
 
-    def test_worker_rejects_patched_runtime_metadata_before_loader_or_reporting_client_fingerprint(self) -> None:
+    def test_worker_rejects_patched_runtime_metadata_before_loader_or_reporting_client_fingerprint(
+        self,
+    ) -> None:
         policy = LocalCrossEncoderConfig(query_policy="worker-runtime-drift")
         Worker = build_flash_worker(policy)
         loader_calls: list[LocalCrossEncoderConfig] = []
@@ -1052,7 +1141,9 @@ class FlashWorkerTests(unittest.TestCase):
 
         self.assertEqual(loader_calls, [])
 
-    def test_generated_worker_has_one_public_kwargs_endpoint_and_fake_decorator_executes_it(self) -> None:
+    def test_generated_worker_has_one_public_kwargs_endpoint_and_fake_decorator_executes_it(
+        self,
+    ) -> None:
         policy = LocalCrossEncoderConfig(max_length=100, query_format="Q: {query}")
         captured: dict[str, Any] = {}
 
@@ -1061,13 +1152,17 @@ class FlashWorkerTests(unittest.TestCase):
             return worker_class
 
         class Tokenizer:
-            def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+            def __call__(
+                self, query: str, text: str, **kwargs: Any
+            ) -> dict[str, list[list[int]]]:
                 return {"input_ids": [[1] * (len(query) + len(text))]}
 
         class Model:
             tokenizer = Tokenizer()
 
-            def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+            def predict(
+                self, pairs: list[tuple[str, str]], **kwargs: Any
+            ) -> list[float]:
                 return [10.5 if text == "text" else -2.25 for _, text in pairs]
 
         Worker = build_flash_worker(policy, endpoint_factory=endpoint_factory)
@@ -1092,7 +1187,9 @@ class FlashWorkerTests(unittest.TestCase):
         )
         self.assertEqual(response["schema_version"], WIRE_SCHEMA_VERSION)
         self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
-        self.assertEqual(response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 10.5}])
+        self.assertEqual(
+            response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 10.5}]
+        )
 
     def test_extracted_worker_source_preserves_non_default_model_policy(self) -> None:
         policy = LocalCrossEncoderConfig(
@@ -1109,11 +1206,15 @@ class FlashWorkerTests(unittest.TestCase):
         loader_configs: list[LocalCrossEncoderConfig] = []
 
         class Tokenizer:
-            def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+            def __call__(
+                self, query: str, text: str, **kwargs: Any
+            ) -> dict[str, list[list[int]]]:
                 return {"input_ids": [[1] * (len(query) + len(text))]}
 
         class Model:
-            def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+            def predict(
+                self, pairs: list[tuple[str, str]], **kwargs: Any
+            ) -> list[float]:
                 return [3.5 for _ in pairs]
 
         def loader(config: LocalCrossEncoderConfig) -> object:
@@ -1138,7 +1239,9 @@ class FlashWorkerTests(unittest.TestCase):
 
         self.assertEqual(loader_configs, [policy])
         self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
-        self.assertEqual(response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 3.5}])
+        self.assertEqual(
+            response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 3.5}]
+        )
 
     def test_same_effective_policy_reuses_source_stable_picklable_class(self) -> None:
         policy = LocalCrossEncoderConfig(
@@ -1162,16 +1265,24 @@ class FlashWorkerTests(unittest.TestCase):
         self.assertIs(first, second)
         self.assertIs(sys.modules[first.__module__], first_module)
         self.assertEqual(inspect.getsource(first), first_source)
-        self.assertEqual(linecache.getlines(first_module.__file__), first_source.splitlines(True))
+        self.assertEqual(
+            linecache.getlines(first_module.__file__), first_source.splitlines(True)
+        )
         self.assertIs(pickle.loads(pickle.dumps(first)), first)
 
-    def test_cached_worker_instances_keep_independent_loaders_and_warm_once(self) -> None:
-        policy = LocalCrossEncoderConfig(max_length=100, query_policy="loader-isolation")
+    def test_cached_worker_instances_keep_independent_loaders_and_warm_once(
+        self,
+    ) -> None:
+        policy = LocalCrossEncoderConfig(
+            max_length=100, query_policy="loader-isolation"
+        )
         Worker = build_flash_worker(policy)
         load_calls: list[list[LocalCrossEncoderConfig]] = [[], []]
 
         class Tokenizer:
-            def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+            def __call__(
+                self, query: str, text: str, **kwargs: Any
+            ) -> dict[str, list[list[int]]]:
                 return {"input_ids": [[1] * 2]}
 
         class Model:
@@ -1179,7 +1290,9 @@ class FlashWorkerTests(unittest.TestCase):
                 self.score_value = score
                 self.predict_calls = 0
 
-            def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+            def predict(
+                self, pairs: list[tuple[str, str]], **kwargs: Any
+            ) -> list[float]:
                 self.predict_calls += 1
                 return [self.score_value for _ in pairs]
 
@@ -1233,7 +1346,9 @@ class FlashWorkerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             worker.score(**{**kwargs, "scorer_fingerprint": "wrong-policy"})
 
-    def test_worker_and_local_scorer_share_fake_raw_logits_formatting_kwargs_and_overflow(self) -> None:
+    def test_worker_and_local_scorer_share_fake_raw_logits_formatting_kwargs_and_overflow(
+        self,
+    ) -> None:
         policy = LocalCrossEncoderConfig(
             max_length=10,
             batch_size=1,
@@ -1244,7 +1359,9 @@ class FlashWorkerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
-            def __call__(self, query: str, text: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+            def __call__(
+                self, query: str, text: str, **kwargs: Any
+            ) -> dict[str, list[list[int]]]:
                 self.calls.append((query, text, kwargs))
                 count = 100 if text == "overflow" else 3
                 return {"input_ids": [[1] * count]}
@@ -1252,9 +1369,13 @@ class FlashWorkerTests(unittest.TestCase):
         class RecordingModel:
             def __init__(self, tokenizer: RecordingTokenizer) -> None:
                 self.tokenizer = tokenizer
-                self.predict_calls: list[tuple[list[tuple[str, str]], dict[str, Any]]] = []
+                self.predict_calls: list[
+                    tuple[list[tuple[str, str]], dict[str, Any]]
+                ] = []
 
-            def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+            def predict(
+                self, pairs: list[tuple[str, str]], **kwargs: Any
+            ) -> list[float]:
                 self.predict_calls.append((pairs, kwargs))
                 return [8.25 for _ in pairs]
 
@@ -1262,7 +1383,9 @@ class FlashWorkerTests(unittest.TestCase):
         local_model = RecordingModel(local_tokenizer)
         worker_tokenizer = RecordingTokenizer()
         worker_model = RecordingModel(worker_tokenizer)
-        local = LocalCrossEncoderScorer(policy, loader=lambda config: (local_model, local_tokenizer))
+        local = LocalCrossEncoderScorer(
+            policy, loader=lambda config: (local_model, local_tokenizer)
+        )
         Worker = build_flash_worker(policy)
         worker = Worker(loader=lambda config: (worker_model, worker_tokenizer))
         passage = _passage("text")
@@ -1276,7 +1399,10 @@ class FlashWorkerTests(unittest.TestCase):
         )
 
         self.assertEqual(local_scores, {passage.content_hash: 8.25})
-        self.assertEqual(worker_response["scores"], [{"hash": passage.content_hash.hex(), "score": 8.25}])
+        self.assertEqual(
+            worker_response["scores"],
+            [{"hash": passage.content_hash.hex(), "score": 8.25}],
+        )
         for model, tokenizer in (
             (local_model, local_tokenizer),
             (worker_model, worker_tokenizer),
@@ -1295,14 +1421,20 @@ class FlashWorkerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             worker.score(
                 query="query",
-                rows=[{"hash": overflowing.content_hash.hex(), "text": overflowing.text}],
+                rows=[
+                    {"hash": overflowing.content_hash.hex(), "text": overflowing.text}
+                ],
                 schema_version=WIRE_SCHEMA_VERSION,
                 scorer_fingerprint=policy.fingerprint,
             )
 
-    def test_z_worker_class_cache_refuses_growth_without_invalidating_prior_identity(self) -> None:
+    def test_z_worker_class_cache_refuses_growth_without_invalidating_prior_identity(
+        self,
+    ) -> None:
         cache_size = len(flash_worker_module._WORKER_CLASS_CACHE)
-        stable_policy = LocalCrossEncoderConfig(query_policy=f"stable-cache-{cache_size}")
+        stable_policy = LocalCrossEncoderConfig(
+            query_policy=f"stable-cache-{cache_size}"
+        )
         stable_class = build_flash_worker(stable_policy)
         stable_source = inspect.getsource(stable_class)
         stable_module = sys.modules[stable_class.__module__]
@@ -1324,7 +1456,10 @@ class FlashWorkerTests(unittest.TestCase):
             self.assertIs(build_flash_worker(stable_policy), stable_class)
             self.assertIs(sys.modules[stable_class.__module__], stable_module)
             self.assertEqual(inspect.getsource(stable_class), stable_source)
-            self.assertEqual(linecache.getlines(stable_module.__file__), stable_source.splitlines(True))
+            self.assertEqual(
+                linecache.getlines(stable_module.__file__),
+                stable_source.splitlines(True),
+            )
             self.assertIs(pickle.loads(pickle.dumps(stable_class)), stable_class)
 
 

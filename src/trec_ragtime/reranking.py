@@ -274,7 +274,9 @@ class RerankedDocument:
         )
         cache_key = _optional_identity(self.cache_key, "cache_key")
         if (cache_fingerprint is None) != (cache_key is None):
-            raise ValueError("cache_fingerprint and cache_key must be provided together")
+            raise ValueError(
+                "cache_fingerprint and cache_key must be provided together"
+            )
         if self.aggregation != max_passage_v1:
             raise ValueError("unsupported passage aggregation")
 
@@ -296,17 +298,24 @@ class RerankedDocument:
             raise ValueError("passage_scores must be a tuple")
         if not isinstance(self.passage_evidence, tuple):
             raise ValueError("passage_evidence must be a tuple")
-        if any(_validate_hash(value, "passage_id") != value for value in self.passage_ids):
+        if any(
+            _validate_hash(value, "passage_id") != value for value in self.passage_ids
+        ):
             raise ValueError("passage_ids are malformed")
-        if any(_validate_hash(value, "passage hash") != value for value in self.passage_hashes):
+        if any(
+            _validate_hash(value, "passage hash") != value
+            for value in self.passage_hashes
+        ):
             raise ValueError("passage_hashes are malformed")
-        if len(self.passage_ids) != len(self.passage_hashes) or len(
-            self.passage_ids
-        ) != len(self.passage_scores) or len(self.passage_ids) != len(
-            self.passage_evidence
+        if (
+            len(self.passage_ids) != len(self.passage_hashes)
+            or len(self.passage_ids) != len(self.passage_scores)
+            or len(self.passage_ids) != len(self.passage_evidence)
         ):
             raise ValueError("passage convenience fields and evidence disagree")
-        if any(not isinstance(value, PassageEvidence) for value in self.passage_evidence):
+        if any(
+            not isinstance(value, PassageEvidence) for value in self.passage_evidence
+        ):
             raise ValueError("passage_evidence must contain PassageEvidence values")
         for evidence, passage_id, content_hash, passage_score in zip(
             self.passage_evidence,
@@ -323,7 +332,9 @@ class RerankedDocument:
                     }
                 )
             except (AttributeError, TypeError, ValueError) as error:
-                raise ValueError("passage_evidence contains invalid evidence") from error
+                raise ValueError(
+                    "passage_evidence contains invalid evidence"
+                ) from error
             if evidence.document_id != self.document_id:
                 raise ValueError("passage evidence document_id disagrees")
             if evidence.representation != self.representation:
@@ -349,12 +360,18 @@ class RerankedDocument:
                 raise ValueError("scored documents require passage evidence")
             if self.representation == "report_text":
                 if self.language != "eng" or self.report_text != self.selected_text:
-                    raise ValueError("report_text documents require exact English report text")
+                    raise ValueError(
+                        "report_text documents require exact English report text"
+                    )
             else:
                 if self.selected_text != self.canonical_text:
-                    raise ValueError("canonical documents must select exact source text")
+                    raise ValueError(
+                        "canonical documents must select exact source text"
+                    )
                 if self.language is None or self.language != self.source_language:
-                    raise ValueError("canonical documents require their source language")
+                    raise ValueError(
+                        "canonical documents require their source language"
+                    )
             expected_source_hash = sha256_bytes(self.canonical_text)
             expected_representation_hash = sha256_bytes(self.selected_text)
             cursor = 0
@@ -370,9 +387,7 @@ class RerankedDocument:
                 if evidence.representation_hash != expected_representation_hash:
                     raise ValueError("passage evidence representation hash disagrees")
                 expected_previous = (
-                    None
-                    if index == 0
-                    else self.passage_evidence[index - 1].passage_id
+                    None if index == 0 else self.passage_evidence[index - 1].passage_id
                 )
                 expected_next = (
                     None
@@ -385,8 +400,13 @@ class RerankedDocument:
                     raise ValueError("next passage linkage disagrees")
                 if evidence.start_char != cursor:
                     raise ValueError("passage evidence must reconstruct selected_text")
-                if self.selected_text[evidence.start_char : evidence.end_char] != evidence.text:
-                    raise ValueError("passage evidence text does not match selected_text")
+                if (
+                    self.selected_text[evidence.start_char : evidence.end_char]
+                    != evidence.text
+                ):
+                    raise ValueError(
+                        "passage evidence text does not match selected_text"
+                    )
                 cursor = evidence.end_char
             if cursor != len(self.selected_text):
                 raise ValueError("passage evidence does not cover selected_text")
@@ -408,9 +428,17 @@ class RerankedDocument:
         else:
             if self.score is not None:
                 raise ValueError("unscored documents must not have a score")
-            if self.winning_passage_id is not None or self.winning_content_hash is not None:
+            if (
+                self.winning_passage_id is not None
+                or self.winning_content_hash is not None
+            ):
                 raise ValueError("unscored documents must not have a winning passage")
-            if self.passage_evidence or self.passage_ids or self.passage_hashes or self.passage_scores:
+            if (
+                self.passage_evidence
+                or self.passage_ids
+                or self.passage_hashes
+                or self.passage_scores
+            ):
                 raise ValueError("unscored documents must not have passage evidence")
             if self.status == "unresolved":
                 if (
@@ -421,9 +449,13 @@ class RerankedDocument:
                     raise ValueError("unresolved documents must not have selected text")
             elif self.status == "missing_representation":
                 if self.canonical_text is None:
-                    raise ValueError("missing representations require hydrated source text")
+                    raise ValueError(
+                        "missing representations require hydrated source text"
+                    )
                 if self.selected_text is not None:
-                    raise ValueError("missing representations must not have selected text")
+                    raise ValueError(
+                        "missing representations must not have selected text"
+                    )
                 if self.representation == "canonical":
                     if self.language is not None:
                         raise ValueError(
@@ -443,12 +475,18 @@ class RerankedDocument:
                     raise ValueError("no_passages documents require selected text")
                 if self.representation == "report_text":
                     if self.language != "eng" or self.report_text != self.selected_text:
-                        raise ValueError("no_passages report text must be English and exact")
+                        raise ValueError(
+                            "no_passages report text must be English and exact"
+                        )
                 else:
                     if self.selected_text != self.canonical_text:
-                        raise ValueError("no_passages canonical text must be exact source text")
+                        raise ValueError(
+                            "no_passages canonical text must be exact source text"
+                        )
                     if self.language is None or self.language != self.source_language:
-                        raise ValueError("no_passages canonical text requires source language")
+                        raise ValueError(
+                            "no_passages canonical text requires source language"
+                        )
 
     @property
     def winning_passage(self) -> PassageEvidence | None:
@@ -619,9 +657,7 @@ def _validate_reranking_result(result: RerankingResult) -> None:
             raise ValueError("document cache_key disagrees with result")
         if document.aggregation != result.aggregation:
             raise ValueError("document aggregation disagrees with result")
-    expected_order = tuple(
-        sorted(result.documents, key=_reranked_document_sort_key)
-    )
+    expected_order = tuple(sorted(result.documents, key=_reranked_document_sort_key))
     if expected_order != result.documents:
         raise ValueError("result documents are not in deterministic reranked order")
 
@@ -640,7 +676,9 @@ def _reranked_document_sort_key(
     return (1, 0.0, document.organizer_rank, document.document_id, None)
 
 
-def _validate_search_rows(retrieval: RetrievalResult) -> tuple[tuple[SearchHit, RetrievedDocument], ...]:
+def _validate_search_rows(
+    retrieval: RetrievalResult,
+) -> tuple[tuple[SearchHit, RetrievedDocument], ...]:
     if not isinstance(retrieval, RetrievalResult):
         raise TypeError("retrieval must be a RetrievalResult")
     query = _non_blank(retrieval.query, "retrieval query", allow_newlines=True)
@@ -651,7 +689,9 @@ def _validate_search_rows(retrieval: RetrievalResult) -> tuple[tuple[SearchHit, 
     documents = retrieval.documents
     if isinstance(hits, (str, bytes, bytearray)) or not isinstance(hits, Sequence):
         raise ValueError("retrieval search hits must be a sequence")
-    if isinstance(documents, (str, bytes, bytearray)) or not isinstance(documents, Sequence):
+    if isinstance(documents, (str, bytes, bytearray)) or not isinstance(
+        documents, Sequence
+    ):
         raise ValueError("retrieval documents must be a sequence")
 
     hits_by_id: dict[str, SearchHit] = {}
@@ -667,13 +707,17 @@ def _validate_search_rows(retrieval: RetrievalResult) -> tuple[tuple[SearchHit, 
         if rank in hit_ranks:
             raise ValueError(f"duplicate search hit rank: {rank}")
         hit_ranks.add(rank)
-        hits_by_id[document_id] = SearchHit(rank=rank, document_id=document_id, score=score)
+        hits_by_id[document_id] = SearchHit(
+            rank=rank, document_id=document_id, score=score
+        )
 
     documents_by_id: dict[str, RetrievedDocument] = {}
     document_ranks: set[int] = set()
     for document in documents:
         if not isinstance(document, RetrievedDocument):
-            raise ValueError("retrieval documents must contain RetrievedDocument values")
+            raise ValueError(
+                "retrieval documents must contain RetrievedDocument values"
+            )
         document_id = _non_blank(document.document_id, "retrieved document_id")
         rank = _positive_int(document.rank, "retrieved document rank")
         score = _finite_float(document.score, "retrieved document score")
@@ -684,21 +728,29 @@ def _validate_search_rows(retrieval: RetrievalResult) -> tuple[tuple[SearchHit, 
         document_ranks.add(rank)
         if document.text is not None and not isinstance(document.text, str):
             raise ValueError(f"document text must be a string or None: {document_id}")
-        if document.english_text is not None and not isinstance(document.english_text, str):
-            raise ValueError(f"document english_text must be a string or None: {document_id}")
+        if document.english_text is not None and not isinstance(
+            document.english_text, str
+        ):
+            raise ValueError(
+                f"document english_text must be a string or None: {document_id}"
+            )
         documents_by_id[document_id] = document
         del score
 
     if set(hits_by_id) != set(documents_by_id):
         missing = sorted(set(hits_by_id).difference(documents_by_id))
         extra = sorted(set(documents_by_id).difference(hits_by_id))
-        raise ValueError(f"search/document IDs are misaligned; missing={missing}, extra={extra}")
+        raise ValueError(
+            f"search/document IDs are misaligned; missing={missing}, extra={extra}"
+        )
 
     rows: list[tuple[SearchHit, RetrievedDocument]] = []
     for document_id, hit in hits_by_id.items():
         document = documents_by_id[document_id]
         if document.rank != hit.rank or document.score != hit.score:
-            raise ValueError(f"search/document rank or score is misaligned: {document_id}")
+            raise ValueError(
+                f"search/document rank or score is misaligned: {document_id}"
+            )
         rows.append((hit, document))
     rows.sort(key=lambda row: (row[0].rank, row[0].document_id))
     return tuple(rows)
@@ -718,7 +770,11 @@ def _scorer_identity(
             getattr(scorer, "cache_fingerprint", None), "cache fingerprint"
         )
         key_factory = getattr(scorer, "cache_key", None)
-        if key_factory is not None and not callable(key_factory) and not isinstance(key_factory, str):
+        if (
+            key_factory is not None
+            and not callable(key_factory)
+            and not isinstance(key_factory, str)
+        ):
             raise TypeError("scorer cache_key must be a string or callable")
         return fingerprint, cache_fingerprint, key_factory
 
@@ -761,7 +817,9 @@ def _passage_validation(
     expected_representation_hash = sha256_bytes(selected_text)
     for passage in passages:
         if passage.document_id != document_id:
-            raise PassageValidationError("chunker returned a passage for another document")
+            raise PassageValidationError(
+                "chunker returned a passage for another document"
+            )
         if passage.representation != representation:
             raise PassageValidationError("chunker returned another representation")
         if passage.language != language:
@@ -769,9 +827,13 @@ def _passage_validation(
         if passage.chunker_fingerprint != chunker_fingerprint:
             raise PassageValidationError("chunker returned another fingerprint")
         if passage.source_content_hash != expected_source_hash:
-            raise PassageValidationError("passage source hash does not match canonical text")
+            raise PassageValidationError(
+                "passage source hash does not match canonical text"
+            )
         if passage.representation_hash != expected_representation_hash:
-            raise PassageValidationError("passage representation hash does not match selected text")
+            raise PassageValidationError(
+                "passage representation hash does not match selected text"
+            )
 
 
 def _make_result_document(
@@ -788,7 +850,9 @@ def _make_result_document(
     document = prepared.document
     passage_ids = tuple(passage.passage_id for passage in prepared.passages)
     passage_hashes = tuple(passage.content_hash for passage in prepared.passages)
-    passage_scores = tuple(float(scores[passage.content_hash]) for passage in prepared.passages)
+    passage_scores = tuple(
+        float(scores[passage.content_hash]) for passage in prepared.passages
+    )
     passage_evidence = tuple(
         PassageEvidence(
             document_id=passage.document_id,
@@ -849,8 +913,7 @@ def _make_result_document(
         )
 
     candidates = tuple(
-        (float(scores[passage.content_hash]), passage)
-        for passage in prepared.passages
+        (float(scores[passage.content_hash]), passage) for passage in prepared.passages
     )
     winning_score = max(score for score, _ in candidates)
     winning_passage = min(
@@ -934,7 +997,11 @@ def rerank_retrieval(
         if representation == "canonical":
             selected_text = canonical_text
             selected_language = document.language
-            if selected_language is None or not isinstance(selected_language, str) or not selected_language.strip():
+            if (
+                selected_language is None
+                or not isinstance(selected_language, str)
+                or not selected_language.strip()
+            ):
                 prepared = _PreparedDocument(
                     document=document,
                     organizer_rank=hit.rank,
@@ -973,7 +1040,11 @@ def rerank_retrieval(
             representation=representation,
             language=selected_language,
         )
-        if passages is None or isinstance(passages, (str, bytes, bytearray)) or not isinstance(passages, Sequence):
+        if (
+            passages is None
+            or isinstance(passages, (str, bytes, bytearray))
+            or not isinstance(passages, Sequence)
+        ):
             raise ValueError("chunker must return a sequence of passages")
         passage_tuple = tuple(passages)
         if not passage_tuple:
@@ -1014,7 +1085,9 @@ def rerank_retrieval(
 
     scores: Mapping[bytes, float]
     if unique_passages:
-        passages_to_score = tuple(unique_passages[key] for key in sorted(unique_passages))
+        passages_to_score = tuple(
+            unique_passages[key] for key in sorted(unique_passages)
+        )
         raw_scores = scorer.score(query, passages_to_score)
         scores = validate_passage_scores(passages_to_score, raw_scores)
     else:
@@ -1063,9 +1136,7 @@ def _json_evidence(evidence: PassageEvidence) -> dict[str, object]:
         "end_char": evidence.end_char,
         "language": evidence.language,
         "next_passage_id": (
-            None
-            if evidence.next_passage_id is None
-            else evidence.next_passage_id.hex()
+            None if evidence.next_passage_id is None else evidence.next_passage_id.hex()
         ),
         "overlap_chars": evidence.overlap_chars,
         "overlap_tokens": evidence.overlap_tokens,
@@ -1122,10 +1193,14 @@ def _json_record(
         "topic_id": document.topic_id,
         "url": document.url,
         "winning_content_hash": (
-            None if document.winning_content_hash is None else document.winning_content_hash.hex()
+            None
+            if document.winning_content_hash is None
+            else document.winning_content_hash.hex()
         ),
         "winning_passage_id": (
-            None if document.winning_passage_id is None else document.winning_passage_id.hex()
+            None
+            if document.winning_passage_id is None
+            else document.winning_passage_id.hex()
         ),
         "winning_passage": (
             None if winning_passage is None else _json_evidence(winning_passage)
@@ -1162,9 +1237,7 @@ def _unsupported_noreplace(message: str) -> None:
 
 def _raise_posix_publish_error(error_number: int, destination: Path) -> None:
     if error_number == errno.EEXIST:
-        raise FileExistsError(
-            error_number, os.strerror(error_number), str(destination)
-        )
+        raise FileExistsError(error_number, os.strerror(error_number), str(destination))
     if error_number in _POSIX_UNSUPPORTED_ERRORS:
         _unsupported_noreplace("atomic no-replace publication is unavailable")
     raise OSError(error_number, os.strerror(error_number), str(destination))
@@ -1281,7 +1354,9 @@ def _publish_noreplace(source: Path, destination: Path) -> None:
     if sys.platform.startswith("win"):
         _publish_noreplace_windows(source, destination)
         return
-    _unsupported_noreplace("atomic no-replace publication is unavailable on this platform")
+    _unsupported_noreplace(
+        "atomic no-replace publication is unavailable on this platform"
+    )
 
 
 def write_reranking_artifact(

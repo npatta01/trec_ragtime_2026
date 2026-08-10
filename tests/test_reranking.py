@@ -283,8 +283,12 @@ class RerankingTests(unittest.TestCase):
             self.assertEqual(evidence.source_content_hash, sha256_bytes("first second"))
             self.assertEqual(evidence.representation_hash, sha256_bytes("first second"))
             self.assertEqual(evidence.content_hash, sha256_bytes(evidence.text))
-            self.assertEqual(evidence.end_char - evidence.start_char, len(evidence.text))
-            self.assertEqual(evidence.score, ranked.passage_scores[evidence.chunk_index])
+            self.assertEqual(
+                evidence.end_char - evidence.start_char, len(evidence.text)
+            )
+            self.assertEqual(
+                evidence.score, ranked.passage_scores[evidence.chunk_index]
+            )
             self.assertIsNot(evidence.__setattr__, object.__setattr__)
         self.assertEqual(
             ranked.winning_passage,
@@ -306,19 +310,32 @@ class RerankingTests(unittest.TestCase):
             scorer=RecordingScorer({"a": 2.0, "b": 1.0}),
             representation="canonical",
         )
-        self.assertEqual([document.reranked_rank for document in result.documents], [1, 2])
+        self.assertEqual(
+            [document.reranked_rank for document in result.documents], [1, 2]
+        )
         with self.assertRaises(ValueError):
             replace(
                 result,
-                documents=(replace(result.documents[0], reranked_rank=2), result.documents[1]),
+                documents=(
+                    replace(result.documents[0], reranked_rank=2),
+                    result.documents[1],
+                ),
             )
         with self.assertRaises(ValueError):
-            replace(result, documents=(replace(result.documents[0], topic_id="other"), result.documents[1]))
+            replace(
+                result,
+                documents=(
+                    replace(result.documents[0], topic_id="other"),
+                    result.documents[1],
+                ),
+            )
         counts = result.status_counts
         counts["scored"] = 0
         self.assertEqual(result.status_counts["scored"], 2)
 
-    def test_document_validation_rejects_invalid_status_score_winner_and_report_language(self) -> None:
+    def test_document_validation_rejects_invalid_status_score_winner_and_report_language(
+        self,
+    ) -> None:
         result = rerank_retrieval(
             _retrieval((_document("doc-1", rank=1, score=0.5, text="text"),)),
             topic_id="topic-1",
@@ -339,7 +356,9 @@ class RerankingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build_invalid()
 
-    def test_result_rejects_swapped_documents_even_when_ranks_are_renumbered(self) -> None:
+    def test_result_rejects_swapped_documents_even_when_ranks_are_renumbered(
+        self,
+    ) -> None:
         result = rerank_retrieval(
             _retrieval(
                 (
@@ -401,7 +420,9 @@ class RerankingTests(unittest.TestCase):
         self.assertEqual(result.documents[0].status, "no_passages")
         forged_document = object.__new__(RerankedDocument)
         for field in result.documents[0].__dataclass_fields__:
-            object.__setattr__(forged_document, field, getattr(result.documents[0], field))
+            object.__setattr__(
+                forged_document, field, getattr(result.documents[0], field)
+            )
         object.__setattr__(forged_document, "selected_text", "forged")
         with self.assertRaises(ValueError):
             replace(result, documents=(forged_document,))
@@ -419,12 +440,16 @@ class RerankingTests(unittest.TestCase):
         self.assertEqual(result.documents[0].status, "missing_representation")
         forged_document = object.__new__(RerankedDocument)
         for field in result.documents[0].__dataclass_fields__:
-            object.__setattr__(forged_document, field, getattr(result.documents[0], field))
+            object.__setattr__(
+                forged_document, field, getattr(result.documents[0], field)
+            )
         object.__setattr__(forged_document, "report_text", "forged report")
         with self.assertRaises(ValueError):
             replace(result, documents=(forged_document,))
 
-    def test_result_rejects_contradictory_unresolved_and_missing_canonical_states(self) -> None:
+    def test_result_rejects_contradictory_unresolved_and_missing_canonical_states(
+        self,
+    ) -> None:
         unresolved = rerank_retrieval(
             _retrieval((_document("unresolved", rank=1, score=0.5, text=None),)),
             topic_id="topic-1",
@@ -453,7 +478,9 @@ class RerankingTests(unittest.TestCase):
                 documents=(replace(missing_canonical.documents[0], language="eng"),),
             )
 
-    def test_report_text_selection_preserves_exact_source_and_english_language(self) -> None:
+    def test_report_text_selection_preserves_exact_source_and_english_language(
+        self,
+    ) -> None:
         document = _document(
             "doc-1",
             rank=1,
@@ -519,7 +546,9 @@ class RerankingTests(unittest.TestCase):
         self.assertEqual(chunker.calls[0]["language"], "spa")
         self.assertEqual(result.documents[0].selected_language, "spa")
 
-    def test_max_aggregation_tie_breaks_by_hash_and_scorer_deduplicates_content(self) -> None:
+    def test_max_aggregation_tie_breaks_by_hash_and_scorer_deduplicates_content(
+        self,
+    ) -> None:
         first = _document("doc-a", rank=2, score=0.1, text="shared first second")
         second = _document("doc-b", rank=1, score=0.2, text="shared")
         third = _document("doc-c", rank=3, score=0.3, text="other")
@@ -530,7 +559,9 @@ class RerankingTests(unittest.TestCase):
                 "doc-c": ("other",),
             }
         )
-        scorer = CachedRecordingScorer({"shared": 5.0, " first": 2.0, " second": 5.0, "other": 5.0})
+        scorer = CachedRecordingScorer(
+            {"shared": 5.0, " first": 2.0, " second": 5.0, "other": 5.0}
+        )
 
         result = rerank_retrieval(
             _retrieval((third, first, second)),
@@ -543,13 +574,28 @@ class RerankingTests(unittest.TestCase):
         self.assertEqual(len(scorer.calls), 1)
         self.assertEqual(
             scorer.calls[0][1],
-            tuple(sorted({sha256_bytes(text) for text in ("shared", " first", " second", "other")})),
+            tuple(
+                sorted(
+                    {
+                        sha256_bytes(text)
+                        for text in ("shared", " first", " second", "other")
+                    }
+                )
+            ),
         )
-        self.assertEqual([document.document_id for document in result.documents], ["doc-b", "doc-a", "doc-c"])
-        doc_a = next(document for document in result.documents if document.document_id == "doc-a")
+        self.assertEqual(
+            [document.document_id for document in result.documents],
+            ["doc-b", "doc-a", "doc-c"],
+        )
+        doc_a = next(
+            document for document in result.documents if document.document_id == "doc-a"
+        )
         self.assertEqual(doc_a.status, "scored")
         self.assertEqual(doc_a.score, 5.0)
-        self.assertEqual(doc_a.winning_content_hash, min(sha256_bytes("shared"), sha256_bytes(" second")))
+        self.assertEqual(
+            doc_a.winning_content_hash,
+            min(sha256_bytes("shared"), sha256_bytes(" second")),
+        )
         self.assertEqual(doc_a.aggregation, max_passage_v1)
         self.assertEqual(doc_a.cache_fingerprint, "cache-v1")
         self.assertTrue(doc_a.cache_key)
@@ -587,12 +633,21 @@ class RerankingTests(unittest.TestCase):
         )
         self.assertEqual(first, second)
 
-    def test_unresolved_missing_representation_and_no_passages_are_retained_after_scored(self) -> None:
+    def test_unresolved_missing_representation_and_no_passages_are_retained_after_scored(
+        self,
+    ) -> None:
         documents = (
             _document("scored", rank=4, score=0.1, text="scored"),
             _document("unresolved", rank=1, score=0.9, text=None),
             _document("missing", rank=2, score=0.8, text="source", language="spa"),
-            _document("empty", rank=3, score=0.7, text="empty", language="spa", english_text=None),
+            _document(
+                "empty",
+                rank=3,
+                score=0.7,
+                text="empty",
+                language="spa",
+                english_text=None,
+            ),
         )
         chunker = EmptyChunker()
         chunker.chunks = {"scored": ("scored",)}
@@ -669,7 +724,9 @@ class RerankingTests(unittest.TestCase):
                 )
 
         class BadScorer(RecordingScorer):
-            def score(self, query: str, passages: Sequence[Passage]) -> Mapping[bytes, Any]:
+            def score(
+                self, query: str, passages: Sequence[Passage]
+            ) -> Mapping[bytes, Any]:
                 return {passages[0].content_hash: math.nan}
 
         with self.assertRaises(ValueError):
@@ -718,15 +775,26 @@ class RerankingArtifactTests(unittest.TestCase):
         self.assertEqual(manifest["query"], "artifact query")
         self.assertEqual(manifest["pipeline"], "ragtime2%100")
         self.assertEqual(manifest["source_retrieval_ref"], "retrieval-artifact-v1")
-        self.assertEqual(manifest["records"]["sha256"], hashlib.sha256(records_bytes).hexdigest())
+        self.assertEqual(
+            manifest["records"]["sha256"], hashlib.sha256(records_bytes).hexdigest()
+        )
         self.assertEqual(
             manifest["counts"],
-            {"missing_representation": 0, "no_passages": 0, "scored": 1, "unresolved": 1},
+            {
+                "missing_representation": 0,
+                "no_passages": 0,
+                "scored": 1,
+                "unresolved": 1,
+            },
         )
         self.assertNotIn("created_at", manifest)
-        self.assertNotIn(str(self.destination), manifest_path.read_text(encoding="utf-8"))
+        self.assertNotIn(
+            str(self.destination), manifest_path.read_text(encoding="utf-8")
+        )
         self.assertEqual(records_bytes.count(b"\n"), 2)
-        self.assertEqual(records_bytes, (self.destination / "reranked.jsonl").read_bytes())
+        self.assertEqual(
+            records_bytes, (self.destination / "reranked.jsonl").read_bytes()
+        )
         rows = [json.loads(line) for line in records_bytes.splitlines()]
         scored_row = rows[0]
         self.assertEqual(scored_row["reranked_rank"], 1)
@@ -738,7 +806,9 @@ class RerankingArtifactTests(unittest.TestCase):
         self.assertEqual(scored_row["scorer_fingerprint"], "scorer-v1")
         self.assertEqual(scored_row["cache_fingerprint"], "cache-v1")
         self.assertEqual(len(scored_row["passage_evidence"]), 1)
-        self.assertEqual(scored_row["winning_passage"], scored_row["passage_evidence"][0])
+        self.assertEqual(
+            scored_row["winning_passage"], scored_row["passage_evidence"][0]
+        )
         self.assertEqual(
             set(scored_row["passage_evidence"][0]),
             {
@@ -770,8 +840,12 @@ class RerankingArtifactTests(unittest.TestCase):
             self.result,
             source_retrieval_ref="retrieval-artifact-v1",
         )
-        self.assertEqual(first_bytes[0], (second_destination / "manifest.json").read_bytes())
-        self.assertEqual(first_bytes[1], (second_destination / "reranked.jsonl").read_bytes())
+        self.assertEqual(
+            first_bytes[0], (second_destination / "manifest.json").read_bytes()
+        )
+        self.assertEqual(
+            first_bytes[1], (second_destination / "reranked.jsonl").read_bytes()
+        )
 
     def test_writer_requires_explicit_nonblank_source_reference(self) -> None:
         with self.assertRaises(TypeError):
@@ -784,7 +858,9 @@ class RerankingArtifactTests(unittest.TestCase):
                     source_retrieval_ref=reference,
                 )
 
-    def test_writer_refuses_overwrite_without_changing_existing_destination(self) -> None:
+    def test_writer_refuses_overwrite_without_changing_existing_destination(
+        self,
+    ) -> None:
         self.destination.mkdir()
         sentinel = self.destination / "sentinel"
         sentinel.write_bytes(b"keep")
@@ -809,13 +885,18 @@ class RerankingArtifactTests(unittest.TestCase):
                     source_retrieval_ref="retrieval-artifact-v1",
                 )
         self.assertFalse(self.destination.exists())
-        self.assertEqual(tuple(path for path in parent.iterdir() if path.name.startswith(".run.")), ())
+        self.assertEqual(
+            tuple(path for path in parent.iterdir() if path.name.startswith(".run.")),
+            (),
+        )
 
     def test_writer_revalidates_a_forged_result_before_emitting(self) -> None:
         forged = object.__new__(RerankingResult)
         for field in self.result.__dataclass_fields__:
             object.__setattr__(forged, field, getattr(self.result, field))
-        object.__setattr__(forged, "documents", (replace(self.result.documents[0], reranked_rank=2),))
+        object.__setattr__(
+            forged, "documents", (replace(self.result.documents[0], reranked_rank=2),)
+        )
         with self.assertRaises(ValueError):
             write_reranking_artifact(
                 self.destination,
@@ -849,11 +930,15 @@ class RerankingArtifactTests(unittest.TestCase):
         original_evidence = self.result.documents[0].passage_evidence[0]
         forged_evidence = object.__new__(PassageEvidence)
         for field in original_evidence.__dataclass_fields__:
-            object.__setattr__(forged_evidence, field, getattr(original_evidence, field))
+            object.__setattr__(
+                forged_evidence, field, getattr(original_evidence, field)
+            )
         object.__setattr__(forged_evidence, "boundary", "forged")
         forged_document = object.__new__(RerankedDocument)
         for field in self.result.documents[0].__dataclass_fields__:
-            object.__setattr__(forged_document, field, getattr(self.result.documents[0], field))
+            object.__setattr__(
+                forged_document, field, getattr(self.result.documents[0], field)
+            )
         object.__setattr__(forged_document, "passage_evidence", (forged_evidence,))
         forged_result = object.__new__(RerankingResult)
         for field in self.result.__dataclass_fields__:
@@ -888,7 +973,14 @@ class RerankingArtifactTests(unittest.TestCase):
                     source_retrieval_ref="retrieval-artifact-v1",
                 )
         self.assertEqual(sentinel.read_bytes(), b"winner")
-        self.assertEqual(tuple(path for path in self.destination.parent.iterdir() if path.name.startswith(".run.")), ())
+        self.assertEqual(
+            tuple(
+                path
+                for path in self.destination.parent.iterdir()
+                if path.name.startswith(".run.")
+            ),
+            (),
+        )
 
     def test_noreplace_dispatches_to_platform_helpers(self) -> None:
         for platform_name, helper_name in (
@@ -916,16 +1008,23 @@ class RerankingArtifactTests(unittest.TestCase):
             "CDLL",
             return_value=libc,
         ):
-            reranking_module._publish_noreplace_darwin(Path("source"), Path("destination"))
+            reranking_module._publish_noreplace_darwin(
+                Path("source"), Path("destination")
+            )
         renamex_np.assert_called_once_with(b"source", b"destination", 4)
 
         renamex_np = Mock(return_value=-1)
         libc = SimpleNamespace(renamex_np=renamex_np)
-        with patch.object(
-            reranking_module.ctypes,
-            "CDLL",
-            return_value=libc,
-        ), patch.object(reranking_module.ctypes, "get_errno", return_value=errno.EEXIST):
+        with (
+            patch.object(
+                reranking_module.ctypes,
+                "CDLL",
+                return_value=libc,
+            ),
+            patch.object(
+                reranking_module.ctypes, "get_errno", return_value=errno.EEXIST
+            ),
+        ):
             with self.assertRaises(FileExistsError):
                 reranking_module._publish_noreplace_darwin(
                     Path("source"), Path("destination")
@@ -939,16 +1038,23 @@ class RerankingArtifactTests(unittest.TestCase):
             "CDLL",
             return_value=libc,
         ):
-            reranking_module._publish_noreplace_linux(Path("source"), Path("destination"))
+            reranking_module._publish_noreplace_linux(
+                Path("source"), Path("destination")
+            )
         renameat2.assert_called_once_with(-100, b"source", -100, b"destination", 1)
 
         renameat2 = Mock(return_value=-1)
         libc = SimpleNamespace(renameat2=renameat2)
-        with patch.object(
-            reranking_module.ctypes,
-            "CDLL",
-            return_value=libc,
-        ), patch.object(reranking_module.ctypes, "get_errno", return_value=errno.EEXIST):
+        with (
+            patch.object(
+                reranking_module.ctypes,
+                "CDLL",
+                return_value=libc,
+            ),
+            patch.object(
+                reranking_module.ctypes, "get_errno", return_value=errno.EEXIST
+            ),
+        ):
             with self.assertRaises(FileExistsError):
                 reranking_module._publish_noreplace_linux(
                     Path("source"), Path("destination")
@@ -973,16 +1079,19 @@ class RerankingArtifactTests(unittest.TestCase):
             with self.subTest(windows_error=windows_error):
                 move_file_ex = Mock(return_value=0)
                 kernel32 = SimpleNamespace(MoveFileExW=move_file_ex)
-                with patch.object(
-                    reranking_module.ctypes,
-                    "WinDLL",
-                    return_value=kernel32,
-                    create=True,
-                ) as win_dll, patch.object(
-                    reranking_module.ctypes,
-                    "get_last_error",
-                    return_value=windows_error,
-                    create=True,
+                with (
+                    patch.object(
+                        reranking_module.ctypes,
+                        "WinDLL",
+                        return_value=kernel32,
+                        create=True,
+                    ) as win_dll,
+                    patch.object(
+                        reranking_module.ctypes,
+                        "get_last_error",
+                        return_value=windows_error,
+                        create=True,
+                    ),
                 ):
                     with self.assertRaises(FileExistsError):
                         reranking_module._publish_noreplace_windows(
@@ -992,9 +1101,11 @@ class RerankingArtifactTests(unittest.TestCase):
                 move_file_ex.assert_called_once_with("source", "destination", 0)
 
     def test_windows_directory_fsync_is_skipped_but_file_fsync_remains(self) -> None:
-        with patch.object(reranking_module.sys, "platform", "win32"), patch.object(
-            reranking_module.os, "open"
-        ) as directory_open, patch.object(reranking_module.os, "fsync") as fsync:
+        with (
+            patch.object(reranking_module.sys, "platform", "win32"),
+            patch.object(reranking_module.os, "open") as directory_open,
+            patch.object(reranking_module.os, "fsync") as fsync,
+        ):
             reranking_module._fsync_directory(Path("directory"))
         directory_open.assert_not_called()
         fsync.assert_not_called()

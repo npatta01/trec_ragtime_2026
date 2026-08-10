@@ -110,7 +110,9 @@ def build_flash_worker(
     elif isinstance(config, LocalCrossEncoderConfig):
         effective_config = config
     else:
-        raise TypeError("config must be RunpodFlashConfig, LocalCrossEncoderConfig, or None")
+        raise TypeError(
+            "config must be RunpodFlashConfig, LocalCrossEncoderConfig, or None"
+        )
 
     model_config = {
         "batch_size": effective_config.batch_size,

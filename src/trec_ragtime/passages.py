@@ -13,9 +13,7 @@ import msgspec
 
 
 Representation = Literal["canonical", "report_text"]
-Boundary = Literal[
-    "paragraph_packed", "sentence_packed", "oversized_sentence_fallback"
-]
+Boundary = Literal["paragraph_packed", "sentence_packed", "oversized_sentence_fallback"]
 
 _REPRESENTATIONS = frozenset(("canonical", "report_text"))
 _BOUNDARIES = frozenset(
@@ -144,12 +142,16 @@ class Passage:
             raise PassageValidationError("document_id must not be blank")
         _validate_hash(self.source_content_hash, "source_content_hash")
         if self.representation not in _REPRESENTATIONS:
-            raise PassageValidationError("representation must be canonical or report_text")
+            raise PassageValidationError(
+                "representation must be canonical or report_text"
+            )
         _validate_hash(self.representation_hash, "representation_hash")
         if not isinstance(self.language, str) or not self.language.strip():
             raise PassageValidationError("language must not be blank")
         if self.representation == "report_text" and self.language != "eng":
-            raise PassageValidationError("report_text representation requires language='eng'")
+            raise PassageValidationError(
+                "report_text representation requires language='eng'"
+            )
         if isinstance(self.chunk_index, bool) or not isinstance(self.chunk_index, int):
             raise PassageValidationError("chunk_index must be an integer")
         if self.chunk_index < 0:
@@ -180,7 +182,9 @@ class Passage:
             ("overlap_tokens", self.overlap_tokens),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise PassageValidationError(f"{field_name} must be a nonnegative integer")
+                raise PassageValidationError(
+                    f"{field_name} must be a nonnegative integer"
+                )
             if value != 0:
                 raise PassageValidationError("schema version 1 requires zero overlap")
 
@@ -215,7 +219,9 @@ def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
         if passage.chunk_index != index:
             raise PassageValidationError("chunk indexes must be contiguous and ordered")
         if passage.representation_hash != expected_representation_hash:
-            raise PassageValidationError("all representation hashes must match selected_text")
+            raise PassageValidationError(
+                "all representation hashes must match selected_text"
+            )
         for field_name in (
             "document_id",
             "source_content_hash",
@@ -231,7 +237,9 @@ def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
             raise PassageValidationError("passage IDs must be unique")
         passage_ids.add(passage.passage_id)
         if passage.start_char != cursor:
-            raise PassageValidationError("passage spans must be monotonic, adjacent, and gap-free")
+            raise PassageValidationError(
+                "passage spans must be monotonic, adjacent, and gap-free"
+            )
         if passage.end_char > len(selected_text):
             raise PassageValidationError("passage end offset exceeds selected_text")
         if selected_text[passage.start_char : passage.end_char] != passage.text:
@@ -250,7 +258,9 @@ def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
         if passage.passage_id != expected_id:
             raise PassageValidationError("passage_id does not match canonical lineage")
         expected_previous = None if index == 0 else passages[index - 1].passage_id
-        expected_next = None if index == len(passages) - 1 else passages[index + 1].passage_id
+        expected_next = (
+            None if index == len(passages) - 1 else passages[index + 1].passage_id
+        )
         if passage.previous_passage_id != expected_previous:
             raise PassageValidationError("previous_passage_id is inconsistent")
         if passage.next_passage_id != expected_next:
@@ -392,7 +402,9 @@ class ChunkerConfig:
             ("overlap_tokens", self.overlap_tokens),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise PassageValidationError(f"{field_name} must be a nonnegative integer")
+                raise PassageValidationError(
+                    f"{field_name} must be a nonnegative integer"
+                )
             if value != 0:
                 raise PassageValidationError("schema version 1 requires zero overlap")
         if isinstance(self.max_length, bool) or not isinstance(self.max_length, int):
@@ -548,14 +560,18 @@ class LangChainPassageChunker:
             content = getattr(document, "page_content", None)
             metadata = getattr(document, "metadata", None)
             if not isinstance(content, str) or not content:
-                raise PassageChunkingError(f"{parent_name} splitter returned empty text")
+                raise PassageChunkingError(
+                    f"{parent_name} splitter returned empty text"
+                )
             if not isinstance(metadata, dict) or "start_index" not in metadata:
                 raise PassageChunkingError(
                     f"{parent_name} splitter did not return start_index metadata"
                 )
             start = metadata["start_index"]
             if isinstance(start, bool) or not isinstance(start, int) or start < 0:
-                raise PassageChunkingError(f"{parent_name} splitter returned invalid start_index")
+                raise PassageChunkingError(
+                    f"{parent_name} splitter returned invalid start_index"
+                )
             end = start + len(content)
             if start != cursor:
                 raise PassageChunkingError(
@@ -567,20 +583,27 @@ class LangChainPassageChunker:
                 )
             spans.append(_Span(content, start, end))
             cursor = end
-        if cursor != len(parent_text) or "".join(span.text for span in spans) != parent_text:
+        if (
+            cursor != len(parent_text)
+            or "".join(span.text for span in spans) != parent_text
+        ):
             raise PassageChunkingError(
                 f"{parent_name} splitter did not fully reconstruct its parent text"
             )
         return tuple(spans)
 
-    def _split_exact(self, splitter: object, parent_text: str, *, parent_name: str) -> tuple[_Span, ...]:
+    def _split_exact(
+        self, splitter: object, parent_text: str, *, parent_name: str
+    ) -> tuple[_Span, ...]:
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"\[W108\].*")
                 documents = splitter.create_documents([parent_text])
         except (OSError, ImportError, ValueError) as error:
             raise PassageChunkingError(f"{parent_name} splitter failed") from error
-        return self._spans_from_documents(parent_text, documents, parent_name=parent_name)
+        return self._spans_from_documents(
+            parent_text, documents, parent_name=parent_name
+        )
 
     def chunk(
         self,
@@ -598,11 +621,15 @@ class LangChainPassageChunker:
         if not isinstance(selected_text, str) or not selected_text:
             raise PassageChunkingError("selected_text must not be empty")
         if representation not in _REPRESENTATIONS:
-            raise PassageChunkingError("representation must be canonical or report_text")
+            raise PassageChunkingError(
+                "representation must be canonical or report_text"
+            )
         if not isinstance(language, str) or not language.strip():
             raise PassageChunkingError("language must not be blank")
         if representation == "report_text" and language != "eng":
-            raise PassageChunkingError("report_text representation requires language='eng'")
+            raise PassageChunkingError(
+                "report_text representation requires language='eng'"
+            )
 
         pipeline_name = self._pipeline_for_language(language)
         paragraph_documents = self._split_exact(
@@ -633,10 +660,15 @@ class LangChainPassageChunker:
                     )
                     continue
                 recursive_documents = self._split_exact(
-                    self._recursive_splitter(), sentence.text, parent_name="recursive sentence"
+                    self._recursive_splitter(),
+                    sentence.text,
+                    parent_name="recursive sentence",
                 )
                 for recursive in recursive_documents:
-                    if self.config.length_function(recursive.text) > self.config.chunk_size:
+                    if (
+                        self.config.length_function(recursive.text)
+                        > self.config.chunk_size
+                    ):
                         raise PassageChunkingError(
                             "recursive sentence fallback exceeded the configured ceiling"
                         )
@@ -694,7 +726,9 @@ class LangChainPassageChunker:
         with_neighbors = tuple(
             replace(
                 passage,
-                previous_passage_id=None if index == 0 else passages[index - 1].passage_id,
+                previous_passage_id=None
+                if index == 0
+                else passages[index - 1].passage_id,
                 next_passage_id=None
                 if index == len(passages) - 1
                 else passages[index + 1].passage_id,
@@ -716,7 +750,9 @@ class LangChainPassageChunker:
             if span.start_char != cursor:
                 raise PassageChunkingError("final spans are not adjacent")
             if selected_text[span.start_char : span.end_char] != span.text:
-                raise PassageChunkingError("final span is not an exact selected-text slice")
+                raise PassageChunkingError(
+                    "final span is not an exact selected-text slice"
+                )
             cursor = span.end_char
             chunks.append(span.text)
         if cursor != len(selected_text) or "".join(chunks) != selected_text:

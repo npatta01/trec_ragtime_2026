@@ -80,7 +80,9 @@ assert 'transformers' not in sys.modules
     def test_sha256_bytes_hashes_exact_utf8_bytes_without_normalization(self) -> None:
         self.assertEqual(
             sha256_bytes("café"),
-            bytes.fromhex("850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e"),
+            bytes.fromhex(
+                "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e"
+            ),
         )
 
     def test_zero_chunk_size_reaches_strict_config_validation(self) -> None:
@@ -88,9 +90,13 @@ assert 'transformers' not in sys.modules
             LangChainPassageChunker(chunk_size=0)
 
     def test_chunker_requires_an_explicit_length_function(self) -> None:
-        with self.assertRaisesRegex(PassageValidationError, "length_function is required"):
+        with self.assertRaisesRegex(
+            PassageValidationError, "length_function is required"
+        ):
             ChunkerConfig()
-        with self.assertRaisesRegex(PassageValidationError, "length_function is required"):
+        with self.assertRaisesRegex(
+            PassageValidationError, "length_function is required"
+        ):
             LangChainPassageChunker()
 
     def test_explicit_builtin_len_is_allowed_for_boundary_chunking(self) -> None:
@@ -98,7 +104,9 @@ assert 'transformers' not in sys.modules
 
         self.assertEqual(config.resolved_length_function_fingerprint, "builtin:len")
 
-    def test_callable_fingerprint_is_used_when_explicit_identity_is_omitted(self) -> None:
+    def test_callable_fingerprint_is_used_when_explicit_identity_is_omitted(
+        self,
+    ) -> None:
         config = ChunkerConfig(length_function=FingerprintedLength())
 
         self.assertEqual(
@@ -112,7 +120,9 @@ assert 'transformers' not in sys.modules
         with self.assertRaises(PassageValidationError):
             LangChainPassageChunker(length_function=char_length)
 
-    def test_chunker_fingerprint_changes_for_result_affecting_identity_inputs(self) -> None:
+    def test_chunker_fingerprint_changes_for_result_affecting_identity_inputs(
+        self,
+    ) -> None:
         base = ChunkerConfig(
             chunk_size=32,
             length_function=char_length,
@@ -136,7 +146,9 @@ assert 'transformers' not in sys.modules
             replace(base, length_function_fingerprint="chars-v2").resolved_fingerprint,
         )
 
-    def test_chunker_fingerprint_composes_caller_namespace_with_runtime_identity(self) -> None:
+    def test_chunker_fingerprint_composes_caller_namespace_with_runtime_identity(
+        self,
+    ) -> None:
         base = ChunkerConfig(length_function=len)
         namespaced = ChunkerConfig(length_function=len, fingerprint="caller-v1")
 
@@ -145,10 +157,14 @@ assert 'transformers' not in sys.modules
         self.assertIn("caller-v1", namespaced.resolved_fingerprint)
         self.assertNotEqual(
             namespaced.resolved_fingerprint,
-            replace(namespaced, chunk_size=namespaced.chunk_size + 1).resolved_fingerprint,
+            replace(
+                namespaced, chunk_size=namespaced.chunk_size + 1
+            ).resolved_fingerprint,
         )
 
-    def test_chunker_fingerprint_rotates_for_every_selected_runtime_distribution(self) -> None:
+    def test_chunker_fingerprint_rotates_for_every_selected_runtime_distribution(
+        self,
+    ) -> None:
         distributions = tuple(RUNTIME_DISTRIBUTION_VERSIONS)
         with patch.object(
             importlib.metadata,
@@ -163,11 +179,15 @@ assert 'transformers' not in sys.modules
                     importlib.metadata,
                     "version",
                     side_effect=fake_distribution_version(
-                        {distribution: f"{RUNTIME_DISTRIBUTION_VERSIONS[distribution]}+changed"}
+                        {
+                            distribution: f"{RUNTIME_DISTRIBUTION_VERSIONS[distribution]}+changed"
+                        }
                     ),
                 ):
                     changed = ChunkerConfig(length_function=len)
-                self.assertNotEqual(baseline.resolved_fingerprint, changed.resolved_fingerprint)
+                self.assertNotEqual(
+                    baseline.resolved_fingerprint, changed.resolved_fingerprint
+                )
 
     def test_custom_pipeline_identity_uses_its_distribution_version(self) -> None:
         calls: list[str] = []
@@ -184,7 +204,9 @@ assert 'transformers' not in sys.modules
             ["langchain-text-splitters", "spacy", "custom-pipeline"],
         )
 
-    def test_missing_runtime_distribution_identity_fails_during_config_creation(self) -> None:
+    def test_missing_runtime_distribution_identity_fails_during_config_creation(
+        self,
+    ) -> None:
         def missing_spacy(name: str) -> str:
             if name == "spacy":
                 raise importlib.metadata.PackageNotFoundError(name)
@@ -194,7 +216,9 @@ assert 'transformers' not in sys.modules
             with self.assertRaisesRegex(PassageValidationError, "spacy"):
                 ChunkerConfig(length_function=len, fingerprint="caller-v1")
 
-    def test_validate_passages_rejects_whitespace_stripping_at_reconstruction(self) -> None:
+    def test_validate_passages_rejects_whitespace_stripping_at_reconstruction(
+        self,
+    ) -> None:
         selected_text, passages = _packed_passages()
         first, second = passages
         stripped = first.text.strip()
@@ -353,7 +377,9 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                 )
                 validate_passages(selected_text, passages)
 
-    def test_forced_paragraph_cases_preserve_blank_lines_and_never_use_rcts(self) -> None:
+    def test_forced_paragraph_cases_preserve_blank_lines_and_never_use_rcts(
+        self,
+    ) -> None:
         cases = [
             case
             for case in load_cases()
@@ -394,7 +420,9 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                     ],
                 )
                 self.assertTrue(all(p.boundary == "paragraph_packed" for p in passages))
-                self.assertEqual("".join(p.text for p in passages), case["selected_text"])
+                self.assertEqual(
+                    "".join(p.text for p in passages), case["selected_text"]
+                )
 
     def test_report_text_requires_english_language(self) -> None:
         chunker = LangChainPassageChunker(
@@ -412,7 +440,9 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                 language="spa",
             )
 
-    def test_packed_sentences_keep_adjacent_whitespace_and_report_boundary(self) -> None:
+    def test_packed_sentences_keep_adjacent_whitespace_and_report_boundary(
+        self,
+    ) -> None:
         text = "First sentence. Second sentence. Third sentence."
         chunker = LangChainPassageChunker(
             ChunkerConfig(
@@ -430,14 +460,21 @@ class LangChainPassageChunkerTests(unittest.TestCase):
             language="eng",
         )
 
-        self.assertEqual([p.text for p in passages], ["First sentence. Second sentence. ", "Third sentence."])
-        self.assertEqual([p.boundary for p in passages], ["sentence_packed", "sentence_packed"])
+        self.assertEqual(
+            [p.text for p in passages],
+            ["First sentence. Second sentence. ", "Third sentence."],
+        )
+        self.assertEqual(
+            [p.boundary for p in passages], ["sentence_packed", "sentence_packed"]
+        )
         self.assertEqual(passages[0].next_passage_id, passages[1].passage_id)
         self.assertEqual(passages[1].previous_passage_id, passages[0].passage_id)
         self.assertEqual(passages[0].overlap_chars, 0)
         self.assertEqual(passages[1].overlap_tokens, 0)
 
-    def test_recursive_fallback_runs_once_only_for_an_individually_oversized_sentence(self) -> None:
+    def test_recursive_fallback_runs_once_only_for_an_individually_oversized_sentence(
+        self,
+    ) -> None:
         text = "One two three four five six seven eight nine ten eleven."
         chunker = LangChainPassageChunker(
             ChunkerConfig(
@@ -455,7 +492,9 @@ class LangChainPassageChunkerTests(unittest.TestCase):
             calls += 1
             return original(splitter, texts, metadatas)
 
-        with patch.object(recursive_splitter, "create_documents", counted_create_documents):
+        with patch.object(
+            recursive_splitter, "create_documents", counted_create_documents
+        ):
             passages = chunker.chunk(
                 document_id="doc-fallback",
                 canonical_text=text,
@@ -466,7 +505,9 @@ class LangChainPassageChunkerTests(unittest.TestCase):
 
         self.assertEqual(calls, 1)
         self.assertTrue(passages)
-        self.assertTrue(all(p.boundary == "oversized_sentence_fallback" for p in passages))
+        self.assertTrue(
+            all(p.boundary == "oversized_sentence_fallback" for p in passages)
+        )
         validate_passages(text, passages)
 
     def test_packed_multi_sentence_chunk_does_not_use_recursive_fallback(self) -> None:
@@ -494,7 +535,9 @@ class LangChainPassageChunkerTests(unittest.TestCase):
 
         self.assertEqual([p.text for p in passages], [text])
 
-    def test_recursive_fallback_rejects_chunks_that_still_exceed_the_ceiling(self) -> None:
+    def test_recursive_fallback_rejects_chunks_that_still_exceed_the_ceiling(
+        self,
+    ) -> None:
         text = "Impossible."
         chunker = LangChainPassageChunker(
             ChunkerConfig(
@@ -513,7 +556,9 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                 language="eng",
             )
 
-    def test_pair_aware_cjk_length_forces_sentence_fallback_under_its_ceiling(self) -> None:
+    def test_pair_aware_cjk_length_forces_sentence_fallback_under_its_ceiling(
+        self,
+    ) -> None:
         text = "第一二三四五六七八九十。"
         length_function = PairAwareCjkLength()
         self.assertLessEqual(len(text), 16)
@@ -535,25 +580,31 @@ class LangChainPassageChunkerTests(unittest.TestCase):
             all(length_function(passage.text) <= 16 for passage in passages)
         )
         self.assertTrue(
-            all(passage.boundary == "oversized_sentence_fallback" for passage in passages)
+            all(
+                passage.boundary == "oversized_sentence_fallback"
+                for passage in passages
+            )
         )
         self.assertEqual("".join(passage.text for passage in passages), text)
         validate_passages(text, passages)
 
     def test_passage_ids_are_stable_across_subprocesses(self) -> None:
-        text = "Stable sentence."
         code = """
 from trec_ragtime.passages import ChunkerConfig, LangChainPassageChunker
 chunker = LangChainPassageChunker(ChunkerConfig(chunk_size=100, length_function=len))
 print(chunker.chunk(document_id='stable', canonical_text='Stable sentence.', selected_text='Stable sentence.', representation='canonical', language='eng')[0].passage_id.hex())
 """
         first = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
-        second = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+        second = subprocess.check_output(
+            [sys.executable, "-c", code], text=True
+        ).strip()
         self.assertEqual(first, second)
 
 
 def _make_passages(text: str) -> tuple[Passage, ...]:
-    chunker = LangChainPassageChunker(ChunkerConfig(chunk_size=100, length_function=len))
+    chunker = LangChainPassageChunker(
+        ChunkerConfig(chunk_size=100, length_function=len)
+    )
     return chunker.chunk(
         document_id="validation",
         canonical_text=text,

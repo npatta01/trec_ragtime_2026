@@ -114,7 +114,9 @@ def _query_format_fields(query_format: str) -> tuple[str, ...]:
                 raise ValueError("query_format may contain only the {query} field")
             fields.append(field_name)
     except (ValueError, IndexError) as error:
-        raise ValueError("query_format must be a valid format containing {query}") from error
+        raise ValueError(
+            "query_format must be a valid format containing {query}"
+        ) from error
     if fields != ["query"]:
         raise ValueError("query_format must contain exactly one {query} field")
     return tuple(fields)
@@ -186,7 +188,9 @@ class LocalCrossEncoderConfig:
     _fingerprint: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int):
+        if isinstance(self.schema_version, bool) or not isinstance(
+            self.schema_version, int
+        ):
             raise ValueError("schema_version must be an integer")
         if self.schema_version <= 0:
             raise ValueError("schema_version must be positive")
@@ -286,7 +290,9 @@ def _passage_lineage(passage: Passage) -> tuple[object, ...]:
 
 
 def _unique_passages(passages: Sequence[Passage]) -> tuple[tuple[bytes, str], ...]:
-    if isinstance(passages, (str, bytes, bytearray)) or not isinstance(passages, Sequence):
+    if isinstance(passages, (str, bytes, bytearray)) or not isinstance(
+        passages, Sequence
+    ):
         raise PassageScoringError("passages must be a sequence of Passage objects")
 
     unique: dict[bytes, tuple[str, tuple[object, ...]]] = {}
@@ -306,9 +312,16 @@ def _unique_passages(passages: Sequence[Passage]) -> tuple[tuple[bytes, str], ..
             continue
         previous_text, previous_lineage = previous
         if passage.text != previous_text:
-            raise PassageScoringError("a content hash maps to contradictory passage text")
-        if passage.passage_id == cast(bytes, previous_lineage[-1]) and lineage != previous_lineage:
-            raise PassageScoringError("a content hash maps to contradictory passage lineage")
+            raise PassageScoringError(
+                "a content hash maps to contradictory passage text"
+            )
+        if (
+            passage.passage_id == cast(bytes, previous_lineage[-1])
+            and lineage != previous_lineage
+        ):
+            raise PassageScoringError(
+                "a content hash maps to contradictory passage lineage"
+            )
 
     return tuple((content_hash, text) for content_hash, (text, _) in unique.items())
 
@@ -321,7 +334,9 @@ def _normalize_score(value: object, *, key: object) -> float:
     try:
         normalized = float(value)
     except (OverflowError, TypeError, ValueError) as error:
-        raise PassageScoreValidationError("score could not be normalized to float") from error
+        raise PassageScoreValidationError(
+            "score could not be normalized to float"
+        ) from error
     if not math.isfinite(normalized):
         raise PassageScoreValidationError("scores must be finite")
     return normalized
@@ -398,7 +413,9 @@ def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
     try:
         model.tokenizer = tokenizer
     except Exception as error:
-        raise PassageScoringError("loaded CrossEncoder does not accept the pinned tokenizer") from error
+        raise PassageScoringError(
+            "loaded CrossEncoder does not accept the pinned tokenizer"
+        ) from error
     return model, tokenizer
 
 
@@ -411,7 +428,11 @@ def _unpack_loader_result(result: object) -> tuple[Any, Any]:
     else:
         model = result
         tokenizer = getattr(result, "tokenizer", None)
-    if model is None or tokenizer is None or not callable(getattr(model, "predict", None)):
+    if (
+        model is None
+        or tokenizer is None
+        or not callable(getattr(model, "predict", None))
+    ):
         raise PassageScoringError("loader must return a CrossEncoder and tokenizer")
     if not callable(tokenizer):
         raise PassageScoringError("loader must return a callable tokenizer")
@@ -497,14 +518,12 @@ class CrossEncoderPairLengthFunction:
         self._config = config
         self._query = query
         self._formatted_query = formatted_query
-        self._loader = (
-            tokenizer_loader
-            or loader
-            or _default_tokenizer_loader
-        )
+        self._loader = tokenizer_loader or loader or _default_tokenizer_loader
         self._load_lock = threading.Lock()
         self._tokenizer: Any | None = None
-        self._fingerprint = _PAIR_LENGTH_FINGERPRINT_PREFIX + hashlib.sha256(material).hexdigest()
+        self._fingerprint = (
+            _PAIR_LENGTH_FINGERPRINT_PREFIX + hashlib.sha256(material).hexdigest()
+        )
 
     @property
     def config(self) -> LocalCrossEncoderConfig:
@@ -546,9 +565,13 @@ class CrossEncoderPairLengthFunction:
                 except PassageScoringError:
                     raise
                 except Exception as error:
-                    raise PassageScoringError("unable to load the pinned tokenizer") from error
+                    raise PassageScoringError(
+                        "unable to load the pinned tokenizer"
+                    ) from error
                 if not callable(tokenizer):
-                    raise PassageScoringError("tokenizer loader must return a callable tokenizer")
+                    raise PassageScoringError(
+                        "tokenizer loader must return a callable tokenizer"
+                    )
                 self._tokenizer = tokenizer
         return cast(Any, self._tokenizer)
 
@@ -566,7 +589,9 @@ class CrossEncoderPairLengthFunction:
         except PassageScoringError:
             raise
         except Exception as error:
-            raise PassageScoringError("tokenizer failed while counting a passage pair") from error
+            raise PassageScoringError(
+                "tokenizer failed while counting a passage pair"
+            ) from error
         return _token_length(encoded)
 
 
@@ -579,7 +604,9 @@ def _prediction_values(result: object, expected_count: int) -> list[object]:
     else:
         values = [converted]
     if len(values) != expected_count:
-        raise PassageScoringError("CrossEncoder returned an unexpected number of scores")
+        raise PassageScoringError(
+            "CrossEncoder returned an unexpected number of scores"
+        )
     return values
 
 
@@ -634,7 +661,9 @@ class LocalCrossEncoderScorer:
                 except PassageScoringError:
                     raise
                 except Exception as error:
-                    raise PassageScoringError("unable to load the local CrossEncoder") from error
+                    raise PassageScoringError(
+                        "unable to load the local CrossEncoder"
+                    ) from error
                 self._model = model
                 self._tokenizer = tokenizer
         return cast(Any, self._model), cast(Any, self._tokenizer)
@@ -652,7 +681,9 @@ class LocalCrossEncoderScorer:
             except PassageScoringError:
                 raise
             except Exception as error:
-                raise PassageScoringError("tokenizer failed while validating a passage pair") from error
+                raise PassageScoringError(
+                    "tokenizer failed while validating a passage pair"
+                ) from error
             if _token_length(encoded) > self._config.max_length:
                 raise PassageScoringError("tokenizer pair overflowed max_length")
 

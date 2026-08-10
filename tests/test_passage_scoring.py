@@ -80,7 +80,9 @@ class PairCountingTokenizer:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
-    def __call__(self, query: str, passage: str, **kwargs: Any) -> dict[str, list[list[int]]]:
+    def __call__(
+        self, query: str, passage: str, **kwargs: Any
+    ) -> dict[str, list[list[int]]]:
         self.calls.append((query, passage, kwargs))
         query_tokens = sum(2 if character == "你" else 1 for character in query)
         passage_tokens = sum(2 if character == "中" else 1 for character in passage)
@@ -181,10 +183,16 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
             replace(base, query_policy="literal-v2"),
         )
 
-        self.assertEqual(len({variant.fingerprint for variant in variants}), len(variants))
-        self.assertTrue(all(variant.fingerprint != base.fingerprint for variant in variants))
+        self.assertEqual(
+            len({variant.fingerprint for variant in variants}), len(variants)
+        )
+        self.assertTrue(
+            all(variant.fingerprint != base.fingerprint for variant in variants)
+        )
 
-    def test_each_runtime_version_rotates_fingerprint_when_installed_metadata_rotates(self) -> None:
+    def test_each_runtime_version_rotates_fingerprint_when_installed_metadata_rotates(
+        self,
+    ) -> None:
         base_versions = _runtime_versions()
         base = LocalCrossEncoderConfig(**base_versions)
         distributions = {
@@ -202,7 +210,9 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
                 with patch.object(
                     importlib.metadata,
                     "version",
-                    side_effect=lambda name, versions=rotated_versions, mapping=distributions: versions[
+                    side_effect=lambda name,
+                    versions=rotated_versions,
+                    mapping=distributions: versions[
                         next(field for field, dist in mapping.items() if dist == name)
                     ],
                 ):
@@ -210,10 +220,14 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
 
                 self.assertNotEqual(rotated.fingerprint, base.fingerprint)
 
-    def test_declared_runtime_version_mismatch_fails_closed_at_config_construction(self) -> None:
+    def test_declared_runtime_version_mismatch_fails_closed_at_config_construction(
+        self,
+    ) -> None:
         installed = _runtime_versions()
         declared = dict(installed)
-        declared["transformers_version"] = "not-installed-" + installed["transformers_version"]
+        declared["transformers_version"] = (
+            "not-installed-" + installed["transformers_version"]
+        )
 
         with self.assertRaisesRegex(ValueError, "transformers_version"):
             LocalCrossEncoderConfig(**declared)
@@ -245,7 +259,9 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
 
 
 class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
-    def test_lazy_full_pair_length_formats_query_and_counts_special_tokens(self) -> None:
+    def test_lazy_full_pair_length_formats_query_and_counts_special_tokens(
+        self,
+    ) -> None:
         config = LocalCrossEncoderConfig(max_length=16, query_format="Q: {query}")
         tokenizer = PairCountingTokenizer()
         load_calls: list[LocalCrossEncoderConfig] = []
@@ -264,7 +280,9 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
         pair_length = length_function("中文")
         self.assertEqual(pair_length, 17)
         self.assertGreater(pair_length, config.max_length)
-        self.assertEqual(length_function.fingerprint, length_function.length_function_fingerprint)
+        self.assertEqual(
+            length_function.fingerprint, length_function.length_function_fingerprint
+        )
         chunker_config = ChunkerConfig(
             chunk_size=config.max_length,
             length_function=length_function,
@@ -279,7 +297,9 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             [("Q: exact 你", "中文", {"truncation": False, "return_length": True})],
         )
 
-    def test_pair_length_loader_is_tokenizer_only_and_never_imports_model_stack(self) -> None:
+    def test_pair_length_loader_is_tokenizer_only_and_never_imports_model_stack(
+        self,
+    ) -> None:
         tokenizer = PairCountingTokenizer()
         loader_calls = 0
 
@@ -288,7 +308,9 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             loader_calls += 1
             return tokenizer
 
-        length_function = CrossEncoderPairLengthFunction(LocalCrossEncoderConfig(), "query", loader=loader)
+        length_function = CrossEncoderPairLengthFunction(
+            LocalCrossEncoderConfig(), "query", loader=loader
+        )
         self.assertEqual(loader_calls, 0)
         model_stack_before = {
             name
@@ -355,7 +377,9 @@ assert 'torch' not in sys.modules
         tokenizer = RecordingTokenizer()
         load_calls: list[LocalCrossEncoderConfig] = []
 
-        def loader(config: LocalCrossEncoderConfig) -> tuple[RecordingModel, RecordingTokenizer]:
+        def loader(
+            config: LocalCrossEncoderConfig,
+        ) -> tuple[RecordingModel, RecordingTokenizer]:
             load_calls.append(config)
             return model, tokenizer
 
@@ -421,7 +445,9 @@ assert 'torch' not in sys.modules
                 self.tokenizer = object()
                 models.append(self)
 
-            def predict(self, inputs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+            def predict(
+                self, inputs: list[tuple[str, str]], **kwargs: Any
+            ) -> list[float]:
                 predict_calls.append((list(inputs), kwargs))
                 return [4.75]
 
@@ -469,10 +495,12 @@ assert 'torch' not in sys.modules
         self.assertEqual(model_name, DEFAULT_MODEL_NAME)
         self.assertEqual(
             tokenizer_loader_calls,
-            [(
-                "explicit/tokenizer",
-                {"revision": "tokenizer-revision"},
-            )],
+            [
+                (
+                    "explicit/tokenizer",
+                    {"revision": "tokenizer-revision"},
+                )
+            ],
         )
         self.assertEqual(constructor_kwargs["revision"], DEFAULT_MODEL_REVISION)
         self.assertEqual(constructor_kwargs["device"], "cuda")
@@ -493,7 +521,9 @@ assert 'torch' not in sys.modules
         self.assertTrue(predict_kwargs["convert_to_numpy"])
         self.assertFalse(predict_kwargs["convert_to_tensor"])
 
-    def test_lazy_loader_is_called_once_and_scores_deduplicate_in_deterministic_batches(self) -> None:
+    def test_lazy_loader_is_called_once_and_scores_deduplicate_in_deterministic_batches(
+        self,
+    ) -> None:
         first = _passage("first", document_id="first")
         duplicate = _passage("first", document_id="duplicate")
         second = _passage("second", document_id="second")
@@ -503,7 +533,9 @@ assert 'torch' not in sys.modules
         tokenizer = RecordingTokenizer()
         load_calls: list[LocalCrossEncoderConfig] = []
 
-        def loader(config: LocalCrossEncoderConfig) -> tuple[RecordingModel, RecordingTokenizer]:
+        def loader(
+            config: LocalCrossEncoderConfig,
+        ) -> tuple[RecordingModel, RecordingTokenizer]:
             load_calls.append(config)
             return model, tokenizer
 
@@ -519,11 +551,14 @@ assert 'torch' not in sys.modules
         result = scorer.score("exact query", passages)
         second_result = scorer.score("exact query", passages)
 
-        self.assertEqual(result, {
-            first.content_hash: -3.25,
-            second.content_hash: 0.0,
-            third.content_hash: 7.5,
-        })
+        self.assertEqual(
+            result,
+            {
+                first.content_hash: -3.25,
+                second.content_hash: 0.0,
+                third.content_hash: 7.5,
+            },
+        )
         self.assertEqual(second_result, result)
         self.assertEqual(len(load_calls), 1)
         self.assertEqual(
@@ -553,9 +588,10 @@ assert 'torch' not in sys.modules
             self.assertFalse(kwargs["apply_softmax"])
             self.assertTrue(kwargs["convert_to_numpy"])
             self.assertFalse(kwargs["convert_to_tensor"])
-            self.assertEqual(kwargs["processing_kwargs"], {
-                "text": {"truncation": False, "max_length": 100}
-            })
+            self.assertEqual(
+                kwargs["processing_kwargs"],
+                {"text": {"truncation": False, "max_length": 100}},
+            )
             self.assertEqual(type(kwargs["activation_fn"]).__name__, "Identity")
 
         for _, _, kwargs in tokenizer.calls:
@@ -568,7 +604,9 @@ assert 'torch' not in sys.modules
         tokenizer = RecordingTokenizer()
         load_devices: list[str] = []
 
-        def loader(config: LocalCrossEncoderConfig) -> tuple[RecordingModel, RecordingTokenizer]:
+        def loader(
+            config: LocalCrossEncoderConfig,
+        ) -> tuple[RecordingModel, RecordingTokenizer]:
             load_devices.append(config.effective_device)
             return model, tokenizer
 
@@ -623,7 +661,9 @@ assert 'torch' not in sys.modules
         tokenizer = RecordingTokenizer()
         load_calls = 0
 
-        def loader(config: LocalCrossEncoderConfig) -> tuple[RecordingModel, RecordingTokenizer]:
+        def loader(
+            config: LocalCrossEncoderConfig,
+        ) -> tuple[RecordingModel, RecordingTokenizer]:
             nonlocal load_calls
             load_calls += 1
             return model, tokenizer
@@ -634,7 +674,9 @@ assert 'torch' not in sys.modules
         self.assertEqual(load_calls, 0)
 
         same_id_different_document = replace(original, document_id="different-document")
-        object.__setattr__(same_id_different_document, "passage_id", original.passage_id)
+        object.__setattr__(
+            same_id_different_document, "passage_id", original.passage_id
+        )
         with self.assertRaises(PassageScoringError):
             scorer.score("query", (original, same_id_different_document))
         self.assertEqual(load_calls, 0)

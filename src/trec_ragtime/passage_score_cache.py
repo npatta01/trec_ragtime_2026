@@ -6,7 +6,7 @@ import hashlib
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
 import msgspec
 
@@ -66,7 +66,9 @@ def _representation(value: object) -> str:
 
 def _hash(value: object, field_name: str) -> bytes:
     if not isinstance(value, bytes) or len(value) != _HASH_LENGTH:
-        raise PassageScoreArtifactValidationError(f"{field_name} must be exactly 32 bytes")
+        raise PassageScoreArtifactValidationError(
+            f"{field_name} must be exactly 32 bytes"
+        )
     return value
 
 
@@ -133,7 +135,9 @@ def _validate_envelope(
     require_sorted: bool,
 ) -> PassageScoreEnvelope:
     if not isinstance(envelope, PassageScoreEnvelope):
-        raise PassageScoreArtifactValidationError("decoded object has the wrong envelope type")
+        raise PassageScoreArtifactValidationError(
+            "decoded object has the wrong envelope type"
+        )
     if (
         isinstance(envelope.schema_version, bool)
         or not isinstance(envelope.schema_version, int)
@@ -161,7 +165,9 @@ def _validate_envelope(
         schema_version=envelope.schema_version,
     )
     if envelope.score_fingerprint != expected_fingerprint:
-        raise PassageScoreArtifactValidationError("score_fingerprint does not match envelope identity")
+        raise PassageScoreArtifactValidationError(
+            "score_fingerprint does not match envelope identity"
+        )
     _hash(envelope.query_hash, "query_hash")
     _hash(envelope.coverage_digest, "coverage_digest")
     if not isinstance(envelope.coverage, tuple):
@@ -170,16 +176,26 @@ def _validate_envelope(
     if coverage != tuple(sorted(set(coverage))):
         raise PassageScoreArtifactValidationError("coverage must be unique and sorted")
     if envelope.coverage_digest != _coverage_digest(coverage):
-        raise PassageScoreArtifactValidationError("coverage_digest does not match coverage")
+        raise PassageScoreArtifactValidationError(
+            "coverage_digest does not match coverage"
+        )
     if not isinstance(envelope.scores, dict):
         raise PassageScoreArtifactValidationError("scores must be a dict")
     score_keys: list[bytes] = []
     for key, value in envelope.scores.items():
         score_keys.append(_hash(key, "score key"))
-        if isinstance(value, bool) or type(value) is not float or not math.isfinite(value):
-            raise PassageScoreArtifactValidationError("stored scores must be finite floats")
+        if (
+            isinstance(value, bool)
+            or type(value) is not float
+            or not math.isfinite(value)
+        ):
+            raise PassageScoreArtifactValidationError(
+                "stored scores must be finite floats"
+            )
     if set(score_keys) != set(coverage):
-        raise PassageScoreArtifactValidationError("scores and coverage must have exact equality")
+        raise PassageScoreArtifactValidationError(
+            "scores and coverage must have exact equality"
+        )
     if require_sorted and score_keys != sorted(score_keys):
         raise PassageScoreArtifactValidationError("stored score keys must be sorted")
     return envelope
@@ -214,7 +230,9 @@ def decode_score_envelope(payload: bytes) -> PassageScoreEnvelope:
     try:
         envelope = msgspec.msgpack.decode(payload, type=PassageScoreEnvelope)
     except (msgspec.DecodeError, TypeError, ValueError) as error:
-        raise PassageScoreArtifactValidationError("artifact payload is not valid MessagePack") from error
+        raise PassageScoreArtifactValidationError(
+            "artifact payload is not valid MessagePack"
+        ) from error
     return _validate_envelope(envelope, require_sorted=True)
 
 
@@ -224,19 +242,31 @@ def _unique_requested(
     representation: str,
     chunker_fingerprint: str,
 ) -> tuple[tuple[bytes, Passage], ...]:
-    if isinstance(passages, (str, bytes, bytearray)) or not isinstance(passages, Sequence):
-        raise PassageScoreArtifactValidationError("passages must be a sequence of Passage objects")
+    if isinstance(passages, (str, bytes, bytearray)) or not isinstance(
+        passages, Sequence
+    ):
+        raise PassageScoreArtifactValidationError(
+            "passages must be a sequence of Passage objects"
+        )
     unique: dict[bytes, Passage] = {}
     for passage in passages:
         if not isinstance(passage, Passage):
-            raise PassageScoreArtifactValidationError("passages must contain Passage objects")
+            raise PassageScoreArtifactValidationError(
+                "passages must contain Passage objects"
+            )
         if passage.representation != representation:
-            raise PassageScoreArtifactValidationError("passage representation does not match cache")
+            raise PassageScoreArtifactValidationError(
+                "passage representation does not match cache"
+            )
         if passage.chunker_fingerprint != chunker_fingerprint:
-            raise PassageScoreArtifactValidationError("passage chunker fingerprint does not match cache")
+            raise PassageScoreArtifactValidationError(
+                "passage chunker fingerprint does not match cache"
+            )
         content_hash = _hash(passage.content_hash, "passage content_hash")
         if content_hash != sha256_bytes(passage.text):
-            raise PassageScoreArtifactValidationError("passage content_hash does not match text")
+            raise PassageScoreArtifactValidationError(
+                "passage content_hash does not match text"
+            )
         unique.setdefault(content_hash, passage)
     return tuple(unique.items())
 
@@ -285,11 +315,16 @@ class PassageScoreCache:
         schema_version: int = CACHE_SCHEMA_VERSION,
         artifact_validation_error_factory: Callable[..., BaseException] | None = None,
     ) -> None:
-        if artifact_validation_error is not None and artifact_validation_error_factory is not None:
+        if (
+            artifact_validation_error is not None
+            and artifact_validation_error_factory is not None
+        ):
             raise TypeError("provide only one artifact validation exception factory")
         error_factory = artifact_validation_error or artifact_validation_error_factory
         if error_factory is None or not callable(error_factory):
-            raise TypeError("artifact_validation_error must be a callable exception class or factory")
+            raise TypeError(
+                "artifact_validation_error must be a callable exception class or factory"
+            )
         if chunker_fingerprint is None or representation is None:
             raise TypeError("chunker_fingerprint and representation are required")
         schema = _schema_version(schema_version)
@@ -391,22 +426,36 @@ class PassageScoreCache:
     ) -> None:
         _validate_envelope(envelope, require_sorted=True)
         if envelope.schema_version != self.schema_version:
-            raise PassageScoreArtifactValidationError("artifact schema does not match cache")
+            raise PassageScoreArtifactValidationError(
+                "artifact schema does not match cache"
+            )
         if envelope.scorer_fingerprint != self.scorer_fingerprint:
-            raise PassageScoreArtifactValidationError("artifact scorer fingerprint does not match cache")
+            raise PassageScoreArtifactValidationError(
+                "artifact scorer fingerprint does not match cache"
+            )
         if envelope.chunker_fingerprint != self.chunker_fingerprint:
-            raise PassageScoreArtifactValidationError("artifact chunker fingerprint does not match cache")
+            raise PassageScoreArtifactValidationError(
+                "artifact chunker fingerprint does not match cache"
+            )
         if envelope.representation != self.representation:
-            raise PassageScoreArtifactValidationError("artifact representation does not match cache")
+            raise PassageScoreArtifactValidationError(
+                "artifact representation does not match cache"
+            )
         if envelope.score_fingerprint != self.effective_fingerprint:
-            raise PassageScoreArtifactValidationError("artifact effective fingerprint does not match cache")
+            raise PassageScoreArtifactValidationError(
+                "artifact effective fingerprint does not match cache"
+            )
         if envelope.query_hash != expected_query_hash:
-            raise PassageScoreArtifactValidationError("artifact query hash does not match request")
+            raise PassageScoreArtifactValidationError(
+                "artifact query hash does not match request"
+            )
 
     def _configured_scorer(self, scorer: PassageScorer | None) -> PassageScorer:
         selected = scorer if scorer is not None else self._scorer
         if selected is None:
-            raise TypeError("a scorer is required when the cache was configured by fingerprint")
+            raise TypeError(
+                "a scorer is required when the cache was configured by fingerprint"
+            )
         try:
             fingerprint = getattr(selected, "fingerprint")
             score_method = getattr(selected, "score")
@@ -425,7 +474,9 @@ class PassageScoreCache:
         scorer: PassageScorer | None = None,
     ) -> dict[bytes, float]:
         if not isinstance(query, str) or not query.strip():
-            raise PassageScoreArtifactValidationError("query must be a non-blank string")
+            raise PassageScoreArtifactValidationError(
+                "query must be a non-blank string"
+            )
         requested = _unique_requested(
             passages,
             representation=self.representation,
@@ -447,7 +498,11 @@ class PassageScoreCache:
         else:
             prior_scores = {}
 
-        missing = tuple(passage for content_hash, passage in requested if content_hash not in prior_scores)
+        missing = tuple(
+            passage
+            for content_hash, passage in requested
+            if content_hash not in prior_scores
+        )
         result_scores = dict(prior_scores)
         if missing:
             selected_scorer = self._configured_scorer(scorer)
@@ -455,7 +510,9 @@ class PassageScoreCache:
             new_scores = validate_passage_scores(missing, response)
             merged = dict(prior_scores)
             merged.update(new_scores)
-            sorted_scores = {content_hash: merged[content_hash] for content_hash in sorted(merged)}
+            sorted_scores = {
+                content_hash: merged[content_hash] for content_hash in sorted(merged)
+            }
             coverage = tuple(sorted(sorted_scores))
             envelope = PassageScoreEnvelope(
                 schema_version=self.schema_version,
@@ -475,8 +532,7 @@ class PassageScoreCache:
             result_scores = sorted_scores
 
         return {
-            content_hash: result_scores[content_hash]
-            for content_hash, _ in requested
+            content_hash: result_scores[content_hash] for content_hash, _ in requested
         }
 
     def get_or_score(
@@ -506,7 +562,9 @@ class CachedPassageScorer:
         except AttributeError as error:
             raise TypeError("scorer must expose fingerprint and score") from error
         if not isinstance(fingerprint, str) or not callable(score_method):
-            raise TypeError("scorer must expose a string fingerprint and callable score")
+            raise TypeError(
+                "scorer must expose a string fingerprint and callable score"
+            )
         if fingerprint != cache.scorer_fingerprint:
             raise ValueError("scorer fingerprint does not match cache identity")
         self._scorer = scorer

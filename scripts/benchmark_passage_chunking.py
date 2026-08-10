@@ -42,10 +42,7 @@ class PairAwareCjkLength:
 
 
 def package_versions() -> dict[str, str]:
-    return {
-        name: importlib.metadata.version(name)
-        for name in PACKAGE_NAMES
-    }
+    return {name: importlib.metadata.version(name) for name in PACKAGE_NAMES}
 
 
 def required_model_versions(cases: list[dict[str, Any]]) -> dict[str, str]:
@@ -77,7 +74,10 @@ def _splitter_documents(splitter: Any, parent_text: str, stage: str) -> list[Any
         if parent_text[start:end] != content:
             raise AssertionError(f"{stage}: non-source slice")
         cursor = end
-    if cursor != len(parent_text) or "".join(d.page_content for d in documents) != parent_text:
+    if (
+        cursor != len(parent_text)
+        or "".join(d.page_content for d in documents) != parent_text
+    ):
         raise AssertionError(f"{stage}: incomplete reconstruction")
     return documents
 
@@ -212,7 +212,9 @@ def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
     length_function = PairAwareCjkLength()
     chunk_size = 16
     if len(text) > chunk_size or length_function(text) <= chunk_size:
-        raise AssertionError("pair-aware fixture must fit by characters but exceed by pairs")
+        raise AssertionError(
+            "pair-aware fixture must fit by characters but exceed by pairs"
+        )
     chunker = LangChainPassageChunker(
         ChunkerConfig(
             chunk_size=chunk_size,
@@ -234,7 +236,9 @@ def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
         passage.boundary == "oversized_sentence_fallback" for passage in passages
     ):
         raise AssertionError("pair-aware fixture did not use sentence fallback")
-    return tuple((passage.start_char, passage.end_char, passage.text) for passage in passages)
+    return tuple(
+        (passage.start_char, passage.end_char, passage.text) for passage in passages
+    )
 
 
 def main() -> int:
@@ -249,12 +253,16 @@ def main() -> int:
     first_pair_record = verify_pair_aware_case()
     second_pair_record = verify_pair_aware_case()
     if first_pair_record != second_pair_record:
-        raise AssertionError("pair-aware benchmark runs produced different passage records")
+        raise AssertionError(
+            "pair-aware benchmark runs produced different passage records"
+        )
 
     print("package_versions=" + json.dumps(package_versions(), sort_keys=True))
     print("spacy_model_versions=" + json.dumps(models, sort_keys=True))
     print(f"fixture_cases={len(cases)}")
-    print("fixture_length_function=explicit builtin len (boundary-only; not model-safe)")
+    print(
+        "fixture_length_function=explicit builtin len (boundary-only; not model-safe)"
+    )
     print(f"passes={len(cases) * 2}")
     print("failures=0")
     print(f"startup_seconds={startup_seconds:.6f}")
