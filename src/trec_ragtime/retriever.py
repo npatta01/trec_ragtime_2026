@@ -386,7 +386,11 @@ class RagtimeRetriever:
         if self.retrieval_cache is None:
             return None
         self._assert_corpus_publication_unchanged()
-        return self.retrieval_cache.get(identity)
+        cached = self.retrieval_cache.get(identity)
+        # The corpus may be replaced while artifact I/O is in flight; never
+        # return a hit observed across that publication boundary.
+        self._assert_corpus_publication_unchanged()
+        return cached
 
     def retrieve_cached(self, *args: Any, **kwargs: Any) -> RetrievalResult | None:
         return self.get_cached_retrieval(*args, **kwargs)
@@ -467,6 +471,8 @@ class RagtimeRetriever:
             if not retrieval_refresh:
                 self._assert_corpus_publication_unchanged()
                 cached = self.retrieval_cache.get(identity)
+                # Fail closed if publication moved during the cache read.
+                self._assert_corpus_publication_unchanged()
                 if cached is not None:
                     return cached
 
@@ -583,7 +589,12 @@ class RagtimeRetriever:
             and not result.hydration_failures
         ):
             assert identity is not None
-            return self.retrieval_cache.put(identity, result)
+            stored = self.retrieval_cache.put(identity, result)
+            # ``result`` is fully materialized and ``put`` performs no corpus
+            # reads, so a raced write can only persist that old snapshot under
+            # its matching old key; reject the stale retriever before return.
+            self._assert_corpus_publication_unchanged()
+            return stored
         return result
 
 
