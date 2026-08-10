@@ -108,6 +108,11 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         )
         self.cached = CachedChatCompletions(self.client, self.store)
 
+    def test_cached_chat_completions_is_exported_from_package_root(self) -> None:
+        from trec_ragtime import CachedChatCompletions as Exported
+
+        self.assertIs(Exported, CachedChatCompletions)
+
     def test_identical_call_uses_cached_typed_completion(self) -> None:
         first = self.cached.create(model="test-model", messages=self.messages)
         self.client.chat.completions.create = Mock(side_effect=AssertionError("provider called"))

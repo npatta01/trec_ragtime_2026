@@ -24,6 +24,7 @@ from .huggingface import (
     HuggingFaceHydrationError,
     HuggingFaceProtocolError,
 )
+from .llm_cache import CachedChatCompletions
 from .local_corpus import (
     LocalCorpusBuildError,
     LocalCorpusConfigurationError,
@@ -61,6 +62,7 @@ __all__ = [
     "DEFAULT_HF_SPLITS",
     "DEFAULT_MAX_CONTENT_FALLBACKS",
     "DEFAULT_PIPELINE",
+    "CachedChatCompletions",
     "Document",
     "DocumentCorpus",
     "HuggingFaceApiError",
