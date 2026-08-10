@@ -187,6 +187,36 @@ class RetrievalCacheTestCase(unittest.TestCase):
             request.backend_policy["policy"]["strict"] = False
         self.assertEqual(before, (request.request_digest, request.retriever_fingerprint, request.object_key))
 
+    def test_identity_mapping_blocks_normal_mutators_and_source_aliases(self) -> None:
+        source_context = {"nested": {"ordered": ["a"]}}
+        source_backend = {"policy": {"strict": True}}
+        request = request_fixture(
+            query_context=source_context,
+            backend_policy=source_backend,
+        )
+        before = (request.request_digest, request.retriever_fingerprint, request.object_key)
+        source_context["nested"]["ordered"].append("caller-mutation")
+        source_backend["policy"]["strict"] = False
+        self.assertEqual(before, (request.request_digest, request.retriever_fingerprint, request.object_key))
+
+        mapping = request.query_context
+        mutators = (
+            lambda: mapping.__init__({"changed": 1}),
+            lambda: mapping.__setitem__("changed", 1),
+            lambda: mapping.__delitem__("nested"),
+            lambda: mapping.clear(),
+            lambda: mapping.pop("nested"),
+            lambda: mapping.popitem(),
+            lambda: mapping.setdefault("changed", 1),
+            lambda: mapping.update({"changed": 1}),
+            lambda: mapping.__ior__({"changed": 1}),
+        )
+        for mutate in mutators:
+            with self.subTest(mutator=mutate):
+                with self.assertRaises(TypeError):
+                    mutate()
+        self.assertEqual(before, (request.request_digest, request.retriever_fingerprint, request.object_key))
+
     def test_identity_fields_remain_serializable_across_public_boundaries(self) -> None:
         request = request_fixture(
             query_context={"nested": {"ordered": ["a", "b"]}},

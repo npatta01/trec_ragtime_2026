@@ -74,13 +74,26 @@ def _normalized_base_url(base_url: str) -> str:
 
 
 class FrozenDict(dict[str, Any]):
-    """A JSON/MessagePack/pickle-compatible recursively immutable mapping."""
+    """A JSON/MessagePack/pickle-compatible recursively immutable mapping.
 
-    __slots__ = ()
+    Normal instance mutators, including re-initialization, are rejected after
+    construction. Explicit base-class calls such as ``dict.__setitem__`` or
+    ``dict.update`` remain Python subclass escape hatches by design.
+    """
+
+    __slots__ = ("_sealed",)
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "FrozenDict":
+        instance = dict.__new__(cls)
+        object.__setattr__(instance, "_sealed", False)
+        return instance
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if self._sealed:
+            raise TypeError("frozen identity mappings cannot be reinitialized")
         # Bypass the blocked public mutators while constructing the value.
         dict.__init__(self, *args, **kwargs)
+        object.__setattr__(self, "_sealed", True)
 
     @staticmethod
     def _immutable(*args: Any, **kwargs: Any) -> None:
@@ -97,10 +110,20 @@ class FrozenDict(dict[str, Any]):
     def __ior__(self, other: Any) -> "FrozenDict":
         raise TypeError("frozen identity mappings cannot be mutated")
 
-    def __reduce__(self) -> tuple[type["FrozenDict"], tuple[dict[str, Any]]]:
-        # Reconstruct through our constructor, which calls dict.__init__
-        # directly and therefore does not invoke blocked mutators.
-        return (FrozenDict, (dict(self),))
+    @classmethod
+    def _from_mapping(cls, value: Mapping[str, Any]) -> "FrozenDict":
+        """Private deserialization seam that seals without public ``__init__``."""
+
+        instance = cls.__new__(cls)
+        dict.__init__(instance, value)
+        object.__setattr__(instance, "_sealed", True)
+        return instance
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (FrozenDict._from_mapping, (dict(self),))
+
+    def __reduce_ex__(self, protocol: int) -> tuple[Any, tuple[dict[str, Any]]]:
+        return self.__reduce__()
 
 
 def _canonical_json(value: Any) -> Any:
