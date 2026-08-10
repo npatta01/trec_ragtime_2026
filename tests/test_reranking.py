@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import math
 import tempfile
@@ -9,7 +10,7 @@ from dataclasses import is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from trec_ragtime.models import (
     PipelineResult,
@@ -337,6 +338,120 @@ class RerankingTests(unittest.TestCase):
             with self.subTest(build_invalid=build_invalid):
                 with self.assertRaises(ValueError):
                     build_invalid()
+
+    def test_result_rejects_swapped_documents_even_when_ranks_are_renumbered(self) -> None:
+        result = rerank_retrieval(
+            _retrieval(
+                (
+                    _document("doc-a", rank=1, score=0.5, text="a"),
+                    _document("doc-b", rank=2, score=0.4, text="b"),
+                )
+            ),
+            topic_id="topic-1",
+            chunker=RecordingChunker(),
+            scorer=RecordingScorer({"a": 1.0, "b": 2.0}),
+            representation="canonical",
+        )
+        swapped = (
+            replace(result.documents[1], reranked_rank=1),
+            replace(result.documents[0], reranked_rank=2),
+        )
+        with self.assertRaises(ValueError):
+            replace(result, documents=swapped)
+
+    def test_result_rejects_duplicate_document_ids_and_organizer_ranks(self) -> None:
+        result = rerank_retrieval(
+            _retrieval(
+                (
+                    _document("doc-a", rank=1, score=0.5, text="a"),
+                    _document("doc-b", rank=2, score=0.4, text="b"),
+                )
+            ),
+            topic_id="topic-1",
+            chunker=RecordingChunker(),
+            scorer=RecordingScorer({"a": 2.0, "b": 1.0}),
+            representation="canonical",
+        )
+        duplicate_id_documents = (
+            result.documents[0],
+            replace(result.documents[0], reranked_rank=2),
+        )
+        with self.assertRaises(ValueError):
+            replace(result, documents=duplicate_id_documents)
+
+        duplicate_rank_documents = (
+            result.documents[0],
+            replace(
+                result.documents[1],
+                reranked_rank=2,
+                organizer_rank=result.documents[0].organizer_rank,
+            ),
+        )
+        with self.assertRaises(ValueError):
+            replace(result, documents=duplicate_rank_documents)
+
+    def test_result_rejects_canonical_selected_text_mismatch(self) -> None:
+        result = rerank_retrieval(
+            _retrieval((_document("doc-1", rank=1, score=0.5, text="source"),)),
+            topic_id="topic-1",
+            chunker=EmptyChunker(),
+            scorer=RecordingScorer({}),
+            representation="canonical",
+        )
+        self.assertEqual(result.documents[0].status, "no_passages")
+        forged_document = object.__new__(RerankedDocument)
+        for field in result.documents[0].__dataclass_fields__:
+            object.__setattr__(forged_document, field, getattr(result.documents[0], field))
+        object.__setattr__(forged_document, "selected_text", "forged")
+        with self.assertRaises(ValueError):
+            replace(result, documents=(forged_document,))
+
+    def test_result_rejects_false_missing_report_text_representation(self) -> None:
+        result = rerank_retrieval(
+            _retrieval(
+                (_document("doc-1", rank=1, score=0.5, text="source", language="spa"),)
+            ),
+            topic_id="topic-1",
+            chunker=EmptyChunker(),
+            scorer=RecordingScorer({}),
+            representation="report_text",
+        )
+        self.assertEqual(result.documents[0].status, "missing_representation")
+        forged_document = object.__new__(RerankedDocument)
+        for field in result.documents[0].__dataclass_fields__:
+            object.__setattr__(forged_document, field, getattr(result.documents[0], field))
+        object.__setattr__(forged_document, "report_text", "forged report")
+        with self.assertRaises(ValueError):
+            replace(result, documents=(forged_document,))
+
+    def test_result_rejects_contradictory_unresolved_and_missing_canonical_states(self) -> None:
+        unresolved = rerank_retrieval(
+            _retrieval((_document("unresolved", rank=1, score=0.5, text=None),)),
+            topic_id="topic-1",
+            chunker=RecordingChunker(),
+            scorer=RecordingScorer({}),
+            representation="canonical",
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                unresolved,
+                documents=(replace(unresolved.documents[0], language="eng"),),
+            )
+
+        missing_canonical = rerank_retrieval(
+            _retrieval(
+                (_document("missing", rank=1, score=0.5, text="source", language=None),)
+            ),
+            topic_id="topic-1",
+            chunker=RecordingChunker(),
+            scorer=RecordingScorer({}),
+            representation="canonical",
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                missing_canonical,
+                documents=(replace(missing_canonical.documents[0], language="eng"),),
+            )
 
     def test_report_text_selection_preserves_exact_source_and_english_language(self) -> None:
         document = _document(
@@ -709,6 +824,27 @@ class RerankingArtifactTests(unittest.TestCase):
             )
         self.assertFalse(self.destination.exists())
 
+    def test_writer_revalidates_swapped_and_renumbered_documents(self) -> None:
+        first, second = self.result.documents
+        forged = object.__new__(RerankingResult)
+        for field in self.result.__dataclass_fields__:
+            object.__setattr__(forged, field, getattr(self.result, field))
+        object.__setattr__(
+            forged,
+            "documents",
+            (
+                replace(second, reranked_rank=1),
+                replace(first, reranked_rank=2),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            write_reranking_artifact(
+                self.destination,
+                forged,
+                source_retrieval_ref="retrieval-artifact-v1",
+            )
+        self.assertFalse(self.destination.exists())
+
     def test_writer_revalidates_forged_passage_evidence_before_emitting(self) -> None:
         original_evidence = self.result.documents[0].passage_evidence[0]
         forged_evidence = object.__new__(PassageEvidence)
@@ -753,6 +889,104 @@ class RerankingArtifactTests(unittest.TestCase):
                 )
         self.assertEqual(sentinel.read_bytes(), b"winner")
         self.assertEqual(tuple(path for path in self.destination.parent.iterdir() if path.name.startswith(".run.")), ())
+
+    def test_noreplace_dispatches_to_platform_helpers(self) -> None:
+        for platform_name, helper_name in (
+            ("linux", "_publish_noreplace_linux"),
+            ("darwin", "_publish_noreplace_darwin"),
+            ("win32", "_publish_noreplace_windows"),
+        ):
+            with self.subTest(platform_name=platform_name):
+                with patch.object(reranking_module.sys, "platform", platform_name):
+                    with patch.object(
+                        reranking_module,
+                        helper_name,
+                        autospec=True,
+                    ) as helper:
+                        reranking_module._publish_noreplace(
+                            Path("source"), Path("destination")
+                        )
+                helper.assert_called_once_with(Path("source"), Path("destination"))
+
+    def test_darwin_noreplace_uses_exclusive_rename_and_maps_errors(self) -> None:
+        renamex_np = Mock(return_value=0)
+        libc = SimpleNamespace(renamex_np=renamex_np)
+        with patch.object(
+            reranking_module.ctypes,
+            "CDLL",
+            return_value=libc,
+        ):
+            reranking_module._publish_noreplace_darwin(Path("source"), Path("destination"))
+        renamex_np.assert_called_once_with(b"source", b"destination", 4)
+
+        renamex_np = Mock(return_value=-1)
+        libc = SimpleNamespace(renamex_np=renamex_np)
+        with patch.object(
+            reranking_module.ctypes,
+            "CDLL",
+            return_value=libc,
+        ), patch.object(reranking_module.ctypes, "get_errno", return_value=errno.EEXIST):
+            with self.assertRaises(FileExistsError):
+                reranking_module._publish_noreplace_darwin(
+                    Path("source"), Path("destination")
+                )
+
+    def test_linux_noreplace_uses_renameat2_flag_and_maps_errors(self) -> None:
+        renameat2 = Mock(return_value=0)
+        libc = SimpleNamespace(renameat2=renameat2)
+        with patch.object(
+            reranking_module.ctypes,
+            "CDLL",
+            return_value=libc,
+        ):
+            reranking_module._publish_noreplace_linux(Path("source"), Path("destination"))
+        renameat2.assert_called_once_with(-100, b"source", -100, b"destination", 1)
+
+        renameat2 = Mock(return_value=-1)
+        libc = SimpleNamespace(renameat2=renameat2)
+        with patch.object(
+            reranking_module.ctypes,
+            "CDLL",
+            return_value=libc,
+        ), patch.object(reranking_module.ctypes, "get_errno", return_value=errno.EEXIST):
+            with self.assertRaises(FileExistsError):
+                reranking_module._publish_noreplace_linux(
+                    Path("source"), Path("destination")
+                )
+
+    def test_windows_noreplace_uses_no_replace_flag_and_maps_errors(self) -> None:
+        move_file_ex = Mock(return_value=1)
+        kernel32 = SimpleNamespace(MoveFileExW=move_file_ex)
+        with patch.object(
+            reranking_module.ctypes,
+            "windll",
+            SimpleNamespace(kernel32=kernel32),
+            create=True,
+        ):
+            reranking_module._publish_noreplace_windows(
+                Path("source"), Path("destination")
+            )
+        move_file_ex.assert_called_once_with("source", "destination", 0)
+
+        for windows_error in (80, 183):
+            with self.subTest(windows_error=windows_error):
+                move_file_ex = Mock(return_value=0)
+                kernel32 = SimpleNamespace(MoveFileExW=move_file_ex)
+                with patch.object(
+                    reranking_module.ctypes,
+                    "windll",
+                    SimpleNamespace(kernel32=kernel32),
+                    create=True,
+                ), patch.object(
+                    reranking_module.ctypes,
+                    "get_last_error",
+                    return_value=windows_error,
+                    create=True,
+                ):
+                    with self.assertRaises(FileExistsError):
+                        reranking_module._publish_noreplace_windows(
+                            Path("source"), Path("destination")
+                        )
 
 
 if __name__ == "__main__":

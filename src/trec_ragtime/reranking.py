@@ -39,6 +39,15 @@ _BOUNDARIES = frozenset(
     ("paragraph_packed", "sentence_packed", "oversized_sentence_fallback")
 )
 _HASH_LENGTH = 32
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 4
+_WINDOWS_ERROR_FILE_EXISTS = 80
+_WINDOWS_ERROR_ALREADY_EXISTS = 183
+_WINDOWS_UNSUPPORTED_ERRORS = frozenset((1, 50, 120))
+_ENOTSUP = getattr(errno, "ENOTSUP", getattr(errno, "EOPNOTSUPP", 95))
+_POSIX_UNSUPPORTED_ERRORS = frozenset(
+    (errno.ENOSYS, _ENOTSUP, getattr(errno, "EOPNOTSUPP", _ENOTSUP))
+)
 
 
 def _non_blank(value: object, field_name: str, *, allow_newlines: bool = False) -> str:
@@ -269,6 +278,16 @@ class RerankedDocument:
         if self.aggregation != max_passage_v1:
             raise ValueError("unsupported passage aggregation")
 
+        if self.english_text is not None and self.report_text != self.english_text:
+            raise ValueError("report_text must match english_text when present")
+        if (
+            self.english_text is None
+            and self.source_language == "eng"
+            and self.canonical_text is not None
+            and self.report_text != self.canonical_text
+        ):
+            raise ValueError("English source report_text must match canonical_text")
+
         if not isinstance(self.passage_ids, tuple):
             raise ValueError("passage_ids must be a tuple")
         if not isinstance(self.passage_hashes, tuple):
@@ -331,8 +350,11 @@ class RerankedDocument:
             if self.representation == "report_text":
                 if self.language != "eng" or self.report_text != self.selected_text:
                     raise ValueError("report_text documents require exact English report text")
-            elif self.language is None or self.language != self.source_language:
-                raise ValueError("canonical documents require their source language")
+            else:
+                if self.selected_text != self.canonical_text:
+                    raise ValueError("canonical documents must select exact source text")
+                if self.language is None or self.language != self.source_language:
+                    raise ValueError("canonical documents require their source language")
             expected_source_hash = sha256_bytes(self.canonical_text)
             expected_representation_hash = sha256_bytes(self.selected_text)
             cursor = 0
@@ -391,21 +413,42 @@ class RerankedDocument:
             if self.passage_evidence or self.passage_ids or self.passage_hashes or self.passage_scores:
                 raise ValueError("unscored documents must not have passage evidence")
             if self.status == "unresolved":
-                if self.canonical_text is not None or self.selected_text is not None:
+                if (
+                    self.canonical_text is not None
+                    or self.selected_text is not None
+                    or self.language is not None
+                ):
                     raise ValueError("unresolved documents must not have selected text")
             elif self.status == "missing_representation":
+                if self.canonical_text is None:
+                    raise ValueError("missing representations require hydrated source text")
                 if self.selected_text is not None:
                     raise ValueError("missing representations must not have selected text")
-                if self.representation == "report_text" and self.language != "eng":
-                    raise ValueError("missing report representations require language='eng'")
+                if self.representation == "canonical":
+                    if self.language is not None:
+                        raise ValueError(
+                            "missing canonical representations must not have a selected language"
+                        )
+                else:
+                    if self.language != "eng":
+                        raise ValueError(
+                            "missing report representations require language='eng'"
+                        )
+                    if self.report_text is not None:
+                        raise ValueError(
+                            "missing report representations must not have report_text"
+                        )
             elif self.status == "no_passages":
                 if self.canonical_text is None or self.selected_text is None:
                     raise ValueError("no_passages documents require selected text")
                 if self.representation == "report_text":
                     if self.language != "eng" or self.report_text != self.selected_text:
                         raise ValueError("no_passages report text must be English and exact")
-                elif self.language is None or self.language != self.source_language:
-                    raise ValueError("no_passages canonical text requires source language")
+                else:
+                    if self.selected_text != self.canonical_text:
+                        raise ValueError("no_passages canonical text must be exact source text")
+                    if self.language is None or self.language != self.source_language:
+                        raise ValueError("no_passages canonical text requires source language")
 
     @property
     def winning_passage(self) -> PassageEvidence | None:
@@ -540,6 +583,8 @@ def _validate_reranking_result(result: RerankingResult) -> None:
         raise ValueError("result aggregation is invalid")
     if not isinstance(result.documents, tuple):
         raise ValueError("result documents must be a tuple")
+    document_ids: set[str] = set()
+    organizer_ranks: set[int] = set()
     for index, document in enumerate(result.documents, start=1):
         if not isinstance(document, RerankedDocument):
             raise ValueError("result documents must contain RerankedDocument values")
@@ -552,6 +597,12 @@ def _validate_reranking_result(result: RerankingResult) -> None:
             )
         except (AttributeError, TypeError, ValueError) as error:
             raise ValueError("result contains an invalid RerankedDocument") from error
+        if document.document_id in document_ids:
+            raise ValueError("result contains duplicate document IDs")
+        document_ids.add(document.document_id)
+        if document.organizer_rank in organizer_ranks:
+            raise ValueError("result contains duplicate organizer ranks")
+        organizer_ranks.add(document.organizer_rank)
         if document.reranked_rank != index:
             raise ValueError("reranked_rank values must exactly match tuple order")
         if document.topic_id != result.topic_id:
@@ -568,6 +619,25 @@ def _validate_reranking_result(result: RerankingResult) -> None:
             raise ValueError("document cache_key disagrees with result")
         if document.aggregation != result.aggregation:
             raise ValueError("document aggregation disagrees with result")
+    expected_order = tuple(
+        sorted(result.documents, key=_reranked_document_sort_key)
+    )
+    if expected_order != result.documents:
+        raise ValueError("result documents are not in deterministic reranked order")
+
+
+def _reranked_document_sort_key(
+    document: RerankedDocument,
+) -> tuple[int, float, int, str, bytes | None]:
+    if document.status == "scored":
+        return (
+            0,
+            -float(document.score),  # type: ignore[arg-type]
+            document.organizer_rank,
+            document.document_id,
+            document.winning_content_hash,
+        )
+    return (1, 0.0, document.organizer_rank, document.document_id, None)
 
 
 def _validate_search_rows(retrieval: RetrievalResult) -> tuple[tuple[SearchHit, RetrievedDocument], ...]:
@@ -963,20 +1033,9 @@ def rerank_retrieval(
         )
         for prepared in prepared_rows
     )
-    scored = sorted(
-        (document for document in reranked_documents if document.status == "scored"),
-        key=lambda document: (
-            -document.score,  # type: ignore[operator]
-            document.organizer_rank,
-            document.document_id,
-            document.winning_content_hash,  # type: ignore[arg-type]
-        ),
+    ordered_documents = tuple(
+        sorted(reranked_documents, key=_reranked_document_sort_key)
     )
-    unscored = sorted(
-        (document for document in reranked_documents if document.status != "scored"),
-        key=lambda document: (document.organizer_rank, document.document_id),
-    )
-    ordered_documents = tuple(scored + unscored)
     ranked_documents = tuple(
         replace(document, reranked_rank=index)
         for index, document in enumerate(ordered_documents, start=1)
@@ -1095,21 +1154,30 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _publish_noreplace(source: Path, destination: Path) -> None:
-    """Atomically publish a directory without ever replacing a destination."""
+def _unsupported_noreplace(message: str) -> None:
+    raise OSError(_ENOTSUP, message)
 
-    if not sys.platform.startswith("linux"):
-        raise OSError(
-            errno.ENOTSUP,
-            "atomic no-replace publication is unavailable on this platform",
+
+def _raise_posix_publish_error(error_number: int, destination: Path) -> None:
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number, os.strerror(error_number), str(destination)
         )
+    if error_number in _POSIX_UNSUPPORTED_ERRORS:
+        _unsupported_noreplace("atomic no-replace publication is unavailable")
+    raise OSError(error_number, os.strerror(error_number), str(destination))
+
+
+def _publish_noreplace_linux(source: Path, destination: Path) -> None:
+    """Publish with Linux renameat2(RENAME_NOREPLACE)."""
+
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
     except (AttributeError, OSError) as error:
         raise OSError(
-            errno.ENOTSUP,
-            "atomic no-replace publication is unavailable on this platform",
+            _ENOTSUP,
+            "atomic no-replace publication is unavailable on Linux",
         ) from error
     renameat2.argtypes = (
         ctypes.c_int,
@@ -1124,25 +1192,91 @@ def _publish_noreplace(source: Path, destination: Path) -> None:
         os.fsencode(source),
         -100,  # AT_FDCWD
         os.fsencode(destination),
-        1,  # RENAME_NOREPLACE
+        _RENAME_NOREPLACE,
     )
     if result == 0:
         return
-    error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise FileExistsError(
-            error_number, os.strerror(error_number), str(destination)
-        )
-    if error_number in {
-        errno.ENOSYS,
-        errno.ENOTSUP,
-        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
-    }:
+    _raise_posix_publish_error(ctypes.get_errno(), destination)
+
+
+def _publish_noreplace_darwin(source: Path, destination: Path) -> None:
+    """Publish with Darwin renamex_np(RENAME_EXCL)."""
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renamex_np = libc.renamex_np
+    except (AttributeError, OSError) as error:
         raise OSError(
-            errno.ENOTSUP,
-            "atomic no-replace publication is unavailable",
+            _ENOTSUP,
+            "atomic no-replace publication is unavailable on Darwin",
+        ) from error
+    renamex_np.argtypes = (
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renamex_np.restype = ctypes.c_int
+    result = renamex_np(
+        os.fsencode(source),
+        os.fsencode(destination),
+        _RENAME_EXCL,
+    )
+    if result == 0:
+        return
+    _raise_posix_publish_error(ctypes.get_errno(), destination)
+
+
+def _publish_noreplace_windows(source: Path, destination: Path) -> None:
+    """Publish with same-volume MoveFileExW without replacement flags."""
+
+    windll = getattr(ctypes, "windll", None)
+    kernel32 = getattr(windll, "kernel32", None)
+    move_file_ex = getattr(kernel32, "MoveFileExW", None)
+    if not callable(move_file_ex):
+        _unsupported_noreplace("MoveFileExW is unavailable on Windows")
+    move_file_ex.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+    )
+    move_file_ex.restype = ctypes.c_int
+    if move_file_ex(str(source), str(destination), 0):
+        return
+    get_last_error = getattr(ctypes, "get_last_error", None)
+    if not callable(get_last_error):
+        _unsupported_noreplace("Windows error reporting is unavailable")
+    error_number = get_last_error()
+    if error_number in {
+        _WINDOWS_ERROR_FILE_EXISTS,
+        _WINDOWS_ERROR_ALREADY_EXISTS,
+    }:
+        raise FileExistsError(
+            errno.EEXIST,
+            "destination already exists",
+            str(destination),
         )
-    raise OSError(error_number, os.strerror(error_number), str(destination))
+    if error_number in _WINDOWS_UNSUPPORTED_ERRORS:
+        _unsupported_noreplace("MoveFileExW no-replace publication is unavailable")
+    raise OSError(
+        error_number,
+        f"MoveFileExW failed with error {error_number}",
+        str(destination),
+    )
+
+
+def _publish_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without ever replacing a destination."""
+
+    if sys.platform.startswith("linux"):
+        _publish_noreplace_linux(source, destination)
+        return
+    if sys.platform == "darwin":
+        _publish_noreplace_darwin(source, destination)
+        return
+    if sys.platform.startswith("win"):
+        _publish_noreplace_windows(source, destination)
+        return
+    _unsupported_noreplace("atomic no-replace publication is unavailable on this platform")
 
 
 def write_reranking_artifact(
