@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
 import stat
 import tempfile
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
@@ -60,6 +62,9 @@ BASELINE_CONSTRUCTIONS = {
 
 class RetrievalImportError(RuntimeError):
     """Raised when an immutable run cannot be safely interpreted."""
+
+
+_MISSING_METADATA = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,9 +163,7 @@ def _read_jsonl(source: _SourceFile) -> Iterator[dict[str, Any]]:
 
 
 def _validate_cache_namespace(cache: RetrievalArtifactCache) -> None:
-    namespace = getattr(cache.store, "namespace", None)
-    if namespace != DEFAULT_CACHE_NAMESPACE:
-        raise RetrievalImportError("retrieval artifact cache namespace is not canonical")
+    _safe_cache_metadata(cache)
 
 
 def _validate_external_source(
@@ -542,19 +545,71 @@ def _preflight_manifest_path(path: Path, sources: Sequence[_SourceFile]) -> Path
 
 def _safe_cache_metadata(cache: RetrievalArtifactCache) -> dict[str, str]:
     try:
-        store_namespace = getattr(cache.store, "namespace", None)
+        store = cache.store
     except Exception:
         raise RetrievalImportError("artifact destination metadata is unsafe") from None
-    if store_namespace != DEFAULT_CACHE_NAMESPACE:
+
+    def read_attribute(field: str, *, required: bool) -> Any:
+        try:
+            return getattr(store, field)
+        except AttributeError:
+            try:
+                inspect.getattr_static(store, field)
+            except AttributeError:
+                if required:
+                    raise RetrievalImportError(
+                        "artifact destination metadata is unsafe"
+                    ) from None
+                return _MISSING_METADATA
+            except Exception:
+                raise RetrievalImportError(
+                    "artifact destination metadata is unsafe"
+                ) from None
+            # A declared descriptor that raises AttributeError is not the same
+            # as an absent optional field; reject it without exposing details.
+            raise RetrievalImportError(
+                "artifact destination metadata is unsafe"
+            ) from None
+        except Exception:
+            raise RetrievalImportError(
+                "artifact destination metadata is unsafe"
+            ) from None
+
+    store_namespace = read_attribute("namespace", required=True)
+    bucket_id = read_attribute("bucket_id", required=True)
+    prefix = read_attribute("prefix", required=True)
+    local_dir = read_attribute("local_dir", required=False)
+    if (
+        not isinstance(store_namespace, str)
+        or store_namespace != DEFAULT_CACHE_NAMESPACE
+        or not isinstance(bucket_id, str)
+        or not bucket_id
+        or not isinstance(prefix, str)
+        or local_dir is None
+    ):
         raise RetrievalImportError("artifact destination metadata is unsafe")
+
+    metadata_store = SimpleNamespace(
+        bucket_id=bucket_id,
+        prefix=prefix,
+    )
+    if local_dir is not _MISSING_METADATA:
+        metadata_store.local_dir = local_dir
     try:
-        output = sanitized_cache_configuration(store_namespace, cache.store)
+        output = sanitized_cache_configuration(store_namespace, metadata_store)
     except (TypeError, ValueError):
         raise RetrievalImportError("artifact destination metadata is unsafe") from None
+
+    if "local_dir" in output:
+        try:
+            local_path = Path(output["local_dir"])
+            if local_path.is_symlink() or not local_path.is_dir():
+                raise ValueError
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise RetrievalImportError("artifact destination metadata is unsafe") from None
     if output.get("namespace") != DEFAULT_CACHE_NAMESPACE:
         raise RetrievalImportError("artifact destination metadata is unsafe")
-    bucket_id = output.get("bucket_id")
-    if not isinstance(bucket_id, str) or not bucket_id:
+    if output.get("bucket_id") != bucket_id or "prefix" not in output:
         raise RetrievalImportError("artifact destination metadata is unsafe")
     return {
         key: output[key]
@@ -791,7 +846,6 @@ def import_retrieval_run(
 
     if not isinstance(cache, RetrievalArtifactCache):
         raise TypeError("cache must be a RetrievalArtifactCache")
-    _validate_cache_namespace(cache)
     destination_metadata = _safe_cache_metadata(cache)
     run = _run_directory(run_dir)
     base_url = _validate_base_url(base_url)

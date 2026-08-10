@@ -51,6 +51,49 @@ class MemoryArtifactStore:
         self.local.pop(object_key, None)
 
 
+class RaisingMetadataStore(MemoryArtifactStore):
+    def __init__(self, field: str) -> None:
+        self._raising_field = field
+        super().__init__()
+
+    def _metadata_value(self, field: str) -> str:
+        if self._raising_field == field:
+            raise RuntimeError("sensitive metadata property")
+        return self.__dict__.get(f"_{field}_value", "/tmp")
+
+    @property
+    def namespace(self) -> str:
+        return self._metadata_value("namespace")
+
+    @namespace.setter
+    def namespace(self, value: str) -> None:
+        self.__dict__["_namespace_value"] = value
+
+    @property
+    def bucket_id(self) -> str:
+        return self._metadata_value("bucket_id")
+
+    @bucket_id.setter
+    def bucket_id(self, value: str) -> None:
+        self.__dict__["_bucket_id_value"] = value
+
+    @property
+    def prefix(self) -> str:
+        return self._metadata_value("prefix")
+
+    @prefix.setter
+    def prefix(self, value: str) -> None:
+        self.__dict__["_prefix_value"] = value
+
+    @property
+    def local_dir(self) -> str:
+        return self._metadata_value("local_dir")
+
+    @local_dir.setter
+    def local_dir(self, value: str) -> None:
+        self.__dict__["_local_dir_value"] = value
+
+
 def _write_parquet(path: Path, rows: list[tuple[str, str, str | None, str | None]]) -> None:
     connection = duckdb.connect()
     try:
@@ -270,6 +313,7 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(configured_store.prefix, "")
         self.store.prefix = configured_store.prefix
         self.store.local_dir = self.root / "local-cache"
+        self.store.local_dir.mkdir()
 
         first = import_retrieval_run(
             run,
@@ -338,6 +382,99 @@ class RetrievalImportTests(unittest.TestCase):
                     field,
                     "owner/private-cache" if field == "bucket_id" else "retrieval-v1",
                 )
+
+    def test_prefix_must_be_present_string_before_any_import_work(self) -> None:
+        run = self._write_control_run()
+        cases: tuple[object, ...] = ("missing", None, 0)
+        for index, value in enumerate(cases):
+            with self.subTest(value=value):
+                store = MemoryArtifactStore()
+                if value == "missing":
+                    del store.prefix
+                else:
+                    store.prefix = value  # type: ignore[assignment]
+                cache = RetrievalArtifactCache(store, clock=lambda: 123.0)
+                output = self.root / f"missing-prefix-{index}.json"
+                with patch.object(
+                    self.corpus,
+                    "verify_integrity",
+                    side_effect=AssertionError("corpus must not be opened"),
+                ):
+                    with self.assertRaisesRegex(
+                        RetrievalImportError,
+                        "^artifact destination metadata is unsafe$",
+                    ):
+                        import_retrieval_run(
+                            run,
+                            corpus=self.corpus,
+                            cache=cache,
+                            manifest_path=output,
+                            base_url="https://organizer.example.test",
+                        )
+                self.assertEqual(store.objects, {})
+                self.assertFalse(output.exists())
+
+    def test_injected_local_dir_must_be_existing_private_directory(self) -> None:
+        run = self._write_control_run()
+        target = self.root / "local-target"
+        target.mkdir()
+        file_path = self.root / "local-file"
+        file_path.write_text("not a directory", encoding="utf-8")
+        symlink = self.root / "local-link"
+        symlink.symlink_to(target, target_is_directory=True)
+        broken = self.root / "local-broken-link"
+        broken.symlink_to(self.root / "does-not-exist", target_is_directory=True)
+        cases = (symlink, broken, file_path, self.root / "missing-local", "relative-local")
+        for index, value in enumerate(cases):
+            with self.subTest(value=value):
+                store = MemoryArtifactStore()
+                store.local_dir = value
+                cache = RetrievalArtifactCache(store, clock=lambda: 123.0)
+                output = self.root / f"invalid-local-dir-{index}.json"
+                with patch.object(
+                    self.corpus,
+                    "verify_integrity",
+                    side_effect=AssertionError("corpus must not be opened"),
+                ):
+                    with self.assertRaisesRegex(
+                        RetrievalImportError,
+                        "^artifact destination metadata is unsafe$",
+                    ):
+                        import_retrieval_run(
+                            run,
+                            corpus=self.corpus,
+                            cache=cache,
+                            manifest_path=output,
+                            base_url="https://organizer.example.test",
+                        )
+                self.assertEqual(store.objects, {})
+                self.assertFalse(output.exists())
+
+    def test_metadata_property_exceptions_are_sanitized_before_import_work(self) -> None:
+        run = self._write_control_run()
+        for index, field in enumerate(("namespace", "bucket_id", "prefix", "local_dir")):
+            with self.subTest(field=field):
+                store = RaisingMetadataStore(field)
+                cache = RetrievalArtifactCache(store, clock=lambda: 123.0)
+                output = self.root / f"raising-metadata-{index}.json"
+                with patch.object(
+                    self.corpus,
+                    "verify_integrity",
+                    side_effect=AssertionError("corpus must not be opened"),
+                ):
+                    with self.assertRaisesRegex(
+                        RetrievalImportError,
+                        "^artifact destination metadata is unsafe$",
+                    ):
+                        import_retrieval_run(
+                            run,
+                            corpus=self.corpus,
+                            cache=cache,
+                            manifest_path=output,
+                            base_url="https://organizer.example.test",
+                        )
+                self.assertEqual(store.objects, {})
+                self.assertFalse(output.exists())
 
     def test_c_imports_facet_hit_missing_from_fused_topics_and_is_idempotent(self) -> None:
         run = self._write_baseline_run()
