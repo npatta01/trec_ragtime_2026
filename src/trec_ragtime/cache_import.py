@@ -485,14 +485,14 @@ def import_sqlite_cache(
                         continue
                     try:
                         expected_value = validated.validator(validated.response)
-                        stored_at = cache.put(
+                        put_result = cache.put(
                             base_url=validated.base_url,
                             operation=validated.operation,
                             request=validated.request,
                             response=validated.response,
                             stored_at=validated.stored_at,
                         )
-                        if stored_at is None:
+                        if put_result is None:
                             raise CacheImportError(
                                 "destination artifact write failed"
                             )
@@ -510,7 +510,7 @@ def import_sqlite_cache(
                         )
                         if (
                             reread is None
-                            or reread.stored_at != stored_at
+                            or reread.stored_at != validated.stored_at
                             or reread.value != expected_value
                         ):
                             raise CacheImportError(

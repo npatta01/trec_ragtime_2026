@@ -281,9 +281,13 @@ access for that store instance, and leaves the live result usable as an
 uncached response. A cache miss is therefore normal after the breaker opens.
 L1 artifacts may be discarded and rebuilt from the private bucket; a malformed
 L1 candidate is repaired once from L2, and malformed or mismatched typed
-payloads are never accepted. Retrieval artifacts are eligible only for complete
-hydrated results without hydration failures. Runner checkpoints may include an
-optional artifact reference and omit it when best-effort storage is unavailable.
+payloads are never accepted. The adapters use a strict typed `msgspec`
+MessagePack envelope, enforce identity and domain validation, and admit writes
+only for fully validated successful results. Retrieval artifacts are eligible
+only for complete hydrated results without hydration failures. Runner
+checkpoints may include an optional artifact reference and omit it when
+best-effort storage is unavailable; a successful reference-less checkpoint is
+usable only in-process and is recomputed on resume or restart.
 The durable Hugging Face Bucket must remain private. The complete local corpus
 remains a separate revision-pinned DuckDB database and does not use
 per-document response caching.
@@ -360,7 +364,11 @@ namespace `ragtime2-2026-v1`, and the `pipeline`, `content`, and
 `huggingface_document` operations. Every accepted row is checked with the
 production endpoint validator, applies the 30-day Dataset Viewer TTL,
 preserves its finite `stored_at`, and is independently reread from the
-destination. Unsupported, malformed, and expired rows are counted as skipped.
+destination. Unsupported, malformed, and expired rows are counted as skipped;
+`write() is False`, an independent verification miss, or an independent
+verification mismatch is a strict migration failure and is never counted as an
+imported or verified row. The importer does not publish a successful manifest
+after any such failure.
 The manifest contains only source hash/size, destination bucket metadata, and
 sanitized counts; it contains no request text, response bodies, URLs with
 credentials, or tokens. The source database is never deleted or modified.

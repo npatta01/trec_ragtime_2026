@@ -10,6 +10,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from trec_ragtime.cache import ResponseCache
 from trec_ragtime.cache_import import CacheImportError, import_sqlite_cache
@@ -363,6 +364,26 @@ class CacheImportTestCase(unittest.TestCase):
         self.assertEqual(self.source.read_bytes(), before)
         self.assertFalse(self.manifest.exists())
         self.assertEqual(store.read_sources, ["remote"])
+
+    def test_verification_uses_source_timestamp_not_adapter_return_value(self) -> None:
+        self.source.unlink()
+        self._create_source([pipeline_row()])
+        cache, _store = self._cache()
+        original_put = cache.put
+
+        def put_with_different_success(**kwargs: Any) -> float | None:
+            result = original_put(**kwargs)
+            if result is None:
+                return None
+            return result + 1.0
+
+        before = self.source.read_bytes()
+        with patch.object(cache, "put", side_effect=put_with_different_success):
+            summary = import_sqlite_cache(self.source, cache, self.manifest)
+
+        self.assertEqual(summary.imported["pipeline"], 1)
+        self.assertEqual(summary.verified["pipeline"], 1)
+        self.assertEqual(self.source.read_bytes(), before)
 
     def test_source_is_opened_read_only_and_missing_source_does_not_get_created(self) -> None:
         self.source.unlink()
