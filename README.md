@@ -78,6 +78,105 @@ sops decrypt --output .env config/secrets.sops.env
 For an unshared local configuration, copy `.env.example` to `.env` and fill in
 the token. The plaintext `.env` file is ignored by Git.
 
+## Passage Reranking
+
+Passage reranking is a downstream, local-first layer over an existing
+`RetrievalResult`. The normal English report path selects each document's
+`report_text`: verified English machine translation for Spanish, Russian, and
+Chinese source documents, or the canonical text for an English source. Keep
+`representation="report_text"` explicit in report runs, then repeat with
+`representation="canonical"` when comparing multilingual source evidence.
+Documents that are unresolved or lack a report translation remain in the
+result with an explicit status; they are not silently dropped.
+
+The pinned local model is
+`BAAI/bge-reranker-v2-m3` at revision
+`953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`, using raw cross-encoder logits.
+Passage preparation uses the maintained LangChain `CharacterTextSplitter` and
+the pinned spaCy 3.8.0 pipelines (`en_core_web_sm`, `es_core_news_sm`,
+`ru_core_news_sm`, and `zh_core_web_sm`). Paragraphs and adjacent sentences
+are packed without reordering or whitespace normalization. The maintained
+`RecursiveCharacterTextSplitter` is used only when one individual sentence is
+over the model passage budget. Every passage retains exact Python character
+offsets, canonical/selected-representation SHA-256 hashes, content hashes,
+and stable lineage IDs; schema version 1 uses zero overlap.
+
+The primary runnable path is local and lazy-loads model weights only on the
+first score call:
+
+```python
+from trec_ragtime import (
+    ChunkerConfig,
+    LangChainPassageChunker,
+    LocalCrossEncoderConfig,
+    LocalCrossEncoderScorer,
+    rerank_retrieval,
+)
+
+chunker = LangChainPassageChunker(
+    ChunkerConfig(chunk_size=512, length_function=len)
+)
+scorer = LocalCrossEncoderScorer(
+    LocalCrossEncoderConfig(device="cpu")
+)
+report_result = rerank_retrieval(
+    retrieval,
+    topic_id="topic-1",
+    chunker=chunker,
+    scorer=scorer,
+    representation="report_text",
+)
+```
+
+Use `device="cuda"` for CUDA PyTorch, or the user-facing `device="rocm"`
+alias on ROCm builds; `rocm` is normalized to PyTorch's `cuda` device. The
+scorer fingerprint includes result-affecting model, tokenizer, device,
+precision, batching, query-format, and length policy, so changing one of
+these settings isolates its score cache.
+
+`PassageScoreCache` stores a complete per-query `dict[bytes, float]` union
+under a deterministic MessagePack envelope. It uses the future issue #12
+`ArtifactStoreLike` interface (`read_validated` and `write`) and an injected
+artifact-validation exception factory. This branch does not provide or
+import a concrete ArtifactStore. A cache hit returns only the requested
+passage hashes, while overlapping requests merge into one complete object;
+failed or partial scoring is never written.
+
+Flash is an optional transport for the same `PassageScorer` contract, not the
+default path. Install it separately with `uv sync --extra runpod`, then supply
+an explicit `RunpodFlashConfig` with a model policy, endpoint ID, bounded
+batch size, payload limit below 10 MB, concurrency, request timeout, worker
+count, and idle timeout. `FlashEndpointBatchRunner` is the separate existing
+`Endpoint(id=...)`/`run()`/`job.wait()` adapter; `build_flash_worker()` produces
+the class-style warm worker definition. Neither path claims a deployment, and
+this task provisions no Runpod worker.
+
+Offline reranking verification starts after decrypting `.env` and makes no
+organizer, Hugging Face, Runpod, or model-download calls:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env
+uv run python -m unittest tests.test_passage_reranking_integration -v
+uv run python -m unittest \
+  tests.test_passages \
+  tests.test_passage_scoring \
+  tests.test_passage_score_cache \
+  tests.test_reranking \
+  tests.test_flash_passage_scorer \
+  tests.test_passage_reranking_integration -v
+uv run python scripts/benchmark_passage_chunking.py
+uv run python -m unittest discover -s tests -v
+uv lock --check
+git diff --check
+```
+
+The following acceptance gates remain deferred: one real local batch with the
+pinned model and its large weight download; organizer-only versus canonical
+versus `report_text` ranking comparison; an ephemeral paid `flash dev`
+real-worker parity smoke; and L2/cross-machine score reuse after the issue #12
+ArtifactStore lands. Offline fakes and an in-memory Flash wire runner do not
+satisfy those gates.
+
 ## Hosted Retrieval Model
 
 The official participant endpoint currently uses
