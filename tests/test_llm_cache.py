@@ -70,6 +70,7 @@ def completion(content: str, *, completion_id: str) -> ChatCompletion:
             "object": "chat.completion",
             "usage": {"completion_tokens": 2, "prompt_tokens": 3, "total_tokens": 5},
             "provider_extension": {"token_label": "preserved"},
+            "provider_token_label": "preserved",
         }
     )
 
@@ -394,6 +395,18 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         self.assertEqual(self.store.read_validated_calls, [])
         self.assertEqual(self.store.write_calls, [])
 
+    def test_nonfinite_refresh_identity_fails_before_provider(self) -> None:
+        with self.assertRaisesRegex(ValueError, "finite"):
+            self.cached.create(
+                model="m",
+                messages=[],
+                temperature=float("nan"),
+                refresh=True,
+            )
+        self.assertEqual(self.client.chat.completions.calls, [])
+        self.assertEqual(self.store.read_validated_calls, [])
+        self.assertEqual(self.store.write_calls, [])
+
     def test_provider_error_propagates_without_write(self) -> None:
         self.client.chat.completions.responses = [RuntimeError("provider unavailable")]
         with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
@@ -434,6 +447,7 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         replayed = self.cached.create(model="m", messages=[])
         self.assertEqual(replayed.model_dump(mode="json"), live.model_dump(mode="json"))
         self.assertEqual(replayed.provider_extension, {"token_label": "preserved"})
+        self.assertEqual(replayed.provider_token_label, "preserved")
         self.assertEqual(len(self.client.chat.completions.calls), 1)
 
     def test_uncacheable_large_provider_integer_preserves_live_response(self) -> None:

@@ -319,6 +319,11 @@ For a LiteLLM deployment, set `provider_url` to that deployment's configured
 OpenAI-compatible `/v1` proxy URL; the proxy address is deployment-specific and
 the wrapper does not assume one.
 
+The decrypt-first workflow replaces the project `.env`, so provider-specific
+values are intentionally not listed in `.env.example`. Export them in the shell
+after decrypting `.env`, or inject them through another private runtime secret
+source.
+
 ```python
 import os
 
@@ -350,6 +355,8 @@ fresh response is still returned but the previous durable entry may remain
 readable. The OpenAI client's API key is never part of a cache key or stored
 payload; transport-only options such as
 `timeout`, `extra_headers`, and `extra_query` are also excluded from identity.
+Clients sharing a provider base URL and request identity also share entries;
+use a distinct `namespace=` when accounts or routing policies must be isolated.
 Top-level credential-shaped request fields are rejected before a provider call
 so they cannot be persisted accidentally. Nested structured request data is
 canonicalized as supplied, allowing tool schemas and provider extensions to

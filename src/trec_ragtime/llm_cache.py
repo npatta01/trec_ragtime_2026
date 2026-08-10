@@ -116,6 +116,8 @@ class CachedChatCompletions:
             if key not in _TRANSPORT_ONLY_FIELDS
         }
         if refresh:
+            # Refresh skips the read, so object-key construction performs the
+            # same complete identity validation before the provider call.
             self._cache.object_key(
                 base_url=base_url,
                 operation=LLM_CHAT_COMPLETIONS_OPERATION,
@@ -142,6 +144,8 @@ class CachedChatCompletions:
                 response=response.model_dump(mode="json"),
             )
         except (TypeError, ValueError, OverflowError):
+            # Provider responses may contain valid typed data outside this
+            # cache's canonical JSON/MessagePack range. Caching is best effort.
             pass
         return response
 
