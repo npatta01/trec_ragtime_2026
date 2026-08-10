@@ -13,7 +13,6 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
-from types import MappingProxyType
 from urllib.parse import urlsplit
 
 import msgspec
@@ -74,6 +73,36 @@ def _normalized_base_url(base_url: str) -> str:
     return normalized
 
 
+class FrozenDict(dict[str, Any]):
+    """A JSON/MessagePack/pickle-compatible recursively immutable mapping."""
+
+    __slots__ = ()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Bypass the blocked public mutators while constructing the value.
+        dict.__init__(self, *args, **kwargs)
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> None:
+        raise TypeError("frozen identity mappings cannot be mutated")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __ior__(self, other: Any) -> "FrozenDict":
+        raise TypeError("frozen identity mappings cannot be mutated")
+
+    def __reduce__(self) -> tuple[type["FrozenDict"], tuple[dict[str, Any]]]:
+        # Reconstruct through our constructor, which calls dict.__init__
+        # directly and therefore does not invoke blocked mutators.
+        return (FrozenDict, (dict(self),))
+
+
 def _canonical_json(value: Any) -> Any:
     """Canonicalize mappings while accepting immutable tuple/list fixtures."""
 
@@ -91,7 +120,7 @@ def _freeze_json(value: Any) -> Any:
 
     canonical = _canonical_json(value)
     if isinstance(canonical, dict):
-        return MappingProxyType(
+        return FrozenDict(
             {key: _freeze_json(nested) for key, nested in canonical.items()}
         )
     if isinstance(canonical, list):

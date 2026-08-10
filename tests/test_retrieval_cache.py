@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import dataclasses
+import json
+import pickle
 import unittest
 from typing import Any, Callable
 
@@ -183,6 +186,23 @@ class RetrievalCacheTestCase(unittest.TestCase):
         with self.assertRaises(TypeError):
             request.backend_policy["policy"]["strict"] = False
         self.assertEqual(before, (request.request_digest, request.retriever_fingerprint, request.object_key))
+
+    def test_identity_fields_remain_serializable_across_public_boundaries(self) -> None:
+        request = request_fixture(
+            query_context={"nested": {"ordered": ["a", "b"]}},
+            backend_policy={"policy": {"strict": True}},
+        )
+        before = (request.request_digest, request.retriever_fingerprint, request.object_key)
+        json.dumps(request.query_context)
+        json.dumps(request.backend_policy)
+        msgspec.msgpack.encode(request.query_context)
+        msgspec.msgpack.encode(request.backend_policy)
+        record = dataclasses.asdict(request)
+        json.dumps(record)
+        restored = pickle.loads(pickle.dumps(request))
+        self.assertEqual(before, (restored.request_digest, restored.retriever_fingerprint, restored.object_key))
+        with self.assertRaises(TypeError):
+            restored.query_context["nested"]["ordered"] += ("c",)
 
     def test_invalid_language_and_provenance_combinations_are_rejected(self) -> None:
         invalid_language = result_fixture(
