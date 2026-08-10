@@ -95,17 +95,6 @@ class RetrieverLike(Protocol):
         query_context: Mapping[str, object] | None = None,
     ) -> RetrievalResult | None: ...
 
-    def build_retrieval_identity(
-        self,
-        query: str,
-        *,
-        pipeline: str,
-        top_k: int | None,
-        max_content_fallbacks: int | None,
-        fallback_on_hf_error: bool,
-        query_context: Mapping[str, object] | None = None,
-    ) -> Any: ...
-
     @property
     def retrieval_corpus_identity(self) -> Mapping[str, Any]: ...
 
@@ -321,32 +310,9 @@ def _query_context(
     }
 
 
-def _build_retrieval_identity(
-    retriever: RetrieverLike,
-    *,
-    query: str,
-    query_context: Mapping[str, object],
-    top_k: int,
-) -> Any:
-    builder = getattr(retriever, "build_retrieval_identity", None)
-    if not callable(builder):
-        raise ValueError(
-            "retriever must expose build_retrieval_identity for artifact validation"
-        )
-    return builder(
-        query,
-        pipeline=PIPELINE,
-        top_k=top_k,
-        max_content_fallbacks=0,
-        fallback_on_hf_error=False,
-        query_context=query_context,
-    )
+def _fresh_reference_record(result: RetrievalResult) -> dict[str, object] | None:
+    """Serialize optional provenance from a typed fresh retrieval."""
 
-
-def _validate_result_reference(
-    result: RetrievalResult,
-    identity: Any,
-) -> dict[str, object] | None:
     if not result.fully_hydrated or result.hydration_failures:
         raise ValueError(
             "successful baseline retrieval is not completely hydrated"
@@ -357,20 +323,6 @@ def _validate_result_reference(
     if not isinstance(reference, RetrievalArtifactReference):
         raise ValueError(
             "successful baseline retrieval has an invalid RetrievalArtifactReference"
-        )
-    try:
-        matches = (
-            reference.object_key == identity.object_key
-            and reference.request_digest == identity.request_digest
-            and reference.retriever_fingerprint == identity.retriever_fingerprint
-        )
-    except AttributeError as exc:
-        raise ValueError(
-            "retriever identity is missing object key or digest fields"
-        ) from exc
-    if not matches:
-        raise ValueError(
-            "retrieval artifact reference does not match the exact query identity"
         )
     return reference.as_record()
 
@@ -412,7 +364,6 @@ def _query_record_from_result(
     duration_seconds: float,
     attempt: int,
     top_k: int,
-    identity: Any,
 ) -> dict[str, Any]:
     if result.query != query or result.pipeline != PIPELINE:
         raise ValueError("retrieval result does not match the query checkpoint")
@@ -433,7 +384,7 @@ def _query_record_from_result(
         "hit_count": len(hits),
         "hits": [hit.as_record() for hit in hits],
     }
-    retrieval_artifact = _validate_result_reference(result, identity)
+    retrieval_artifact = _fresh_reference_record(result)
     if retrieval_artifact is not None:
         record["retrieval_artifact"] = retrieval_artifact
     return record
@@ -448,12 +399,6 @@ def _run_query_task(
     started_at = _now()
     started = time.perf_counter()
     try:
-        identity = _build_retrieval_identity(
-            retriever,
-            query=task.query,
-            query_context=task.query_context,
-            top_k=top_k,
-        )
         result = retriever.retrieve(
             task.query,
             pipeline=PIPELINE,
@@ -489,7 +434,6 @@ def _run_query_task(
             duration_seconds=time.perf_counter() - started,
             attempt=task.attempt,
             top_k=top_k,
-            identity=identity,
         )
         return _QueryTaskResult(record=record, retrieval=result)
     except ValueError as exc:
@@ -613,13 +557,9 @@ def _load_cached_query_result(
             f"retrieval artifact reference mismatch for topic={record.get('topic_id')} "
             f"query_index={query_index}"
         )
-    if cached.query != query or cached.pipeline != PIPELINE:
-        raise ValueError("cache-only retrieval does not match the query checkpoint")
     cached_hits = [hit.as_record() for hit in cached.search_result.hits[:top_k]]
     if cached_hits != record.get("hits"):
         raise ValueError("cache-only retrieval hits disagree with the query checkpoint")
-    if cached.hydration_failures or not cached.fully_hydrated:
-        raise ValueError("cache-only retrieval artifact is not completely hydrated")
     return cached
 
 

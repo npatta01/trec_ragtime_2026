@@ -32,6 +32,7 @@ from trec_ragtime.query_baselines import (
     default_query_plan_path,
     fuse_ranked_hits,
     load_query_plans,
+    _load_cached_query_result,
     run_query_baseline,
 )
 
@@ -95,12 +96,15 @@ class FakeRetriever:
         *,
         corpus_revision: str = "test-revision",
         hydration_error: Exception | None = None,
+        identity_error: Exception | None = None,
     ) -> None:
         self.responses = responses
         self.corpus_revision = corpus_revision
         self.hydration_error = hydration_error
+        self.identity_error = identity_error
         self.calls: list[tuple[str, str, int | None, int | None, bool]] = []
         self.cached_calls: list[tuple[str, str, int | None, int | None, bool]] = []
+        self.identity_calls: list[str] = []
         self.contexts: list[dict[str, object] | None] = []
 
     @property
@@ -130,6 +134,9 @@ class FakeRetriever:
         fallback_on_hf_error: bool,
         query_context: dict[str, object] | None = None,
     ) -> SimpleNamespace:
+        self.identity_calls.append(query)
+        if self.identity_error is not None:
+            raise self.identity_error
         request_digest = hashlib.sha256(query.encode("utf-8")).digest()
         fingerprint = hashlib.sha256(b"baseline-test-retriever").digest()
         return SimpleNamespace(
@@ -488,7 +495,10 @@ class QueryBaselineTests(unittest.TestCase):
                 documents=result.documents,
                 missing_translation_ids=result.missing_translation_ids,
             )
-        retriever = FakeRetriever(responses)
+        retriever = FakeRetriever(
+            responses,
+            identity_error=ValueError("fresh retrieval must not build identity"),
+        )
 
         run_dir = run_query_baseline(
             self.plans_path,
@@ -507,6 +517,7 @@ class QueryBaselineTests(unittest.TestCase):
         self.assertEqual([topics[topic]["status"] for topic in self.expected_topic_ids], ["success", "success"])
         self.assertEqual([topics[topic]["candidate_count"] for topic in self.expected_topic_ids], [1, 1])
         self.assertEqual(retriever.cached_calls, [])
+        self.assertEqual(retriever.identity_calls, [])
         queries = [
             json.loads(line)
             for line in (run_dir / "queries.jsonl").read_text().splitlines()
@@ -1106,6 +1117,61 @@ class QueryBaselineTests(unittest.TestCase):
         ]
         self.assertEqual([topic["status"] for topic in topics], ["success", "success"])
         self.assertTrue(all("retrieval_artifact" in row for row in topics[0]["query_results"]))
+
+    def test_warm_reference_mismatch_is_rejected_before_topic_assembly(self) -> None:
+        cold = FakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+        run_dir = run_query_baseline(
+            self.plans_path,
+            baseline="b",
+            retriever=cold,
+            output_root=self.root / "runs",
+            run_id="warm-reference-mismatch",
+            expected_topic_ids=self.expected_topic_ids,
+            expected_plan_sha256=None,
+        )
+        rows = [
+            json.loads(line)
+            for line in (run_dir / "queries.jsonl").read_text().splitlines()
+        ]
+        expected = next(row for row in rows if row["query"] == "single zero")
+        mismatched = {**expected, "retrieval_artifact": {
+            **expected["retrieval_artifact"],
+            "stored_at": 456.0,
+        }}
+        warm = CacheOnlyFakeRetriever(
+            {
+                "single zero": _retrieval_result("single zero", ["doc-a"]),
+                "single one": _retrieval_result("single one", ["doc-b"]),
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "reference mismatch"):
+            _load_cached_query_result(
+                mismatched,
+                baseline="b",
+                plan_sha256=hashlib.sha256(self.plans_path.read_bytes()).hexdigest(),
+                retriever=warm,
+                top_k=100,
+                expected_query_index=1,
+            )
+        self.assertEqual(warm.calls, [])
+        self.assertEqual([call[0] for call in warm.cached_calls], ["single zero"])
+
+        matching = _load_cached_query_result(
+            expected,
+            baseline="b",
+            plan_sha256=hashlib.sha256(self.plans_path.read_bytes()).hexdigest(),
+            retriever=warm,
+            top_k=100,
+            expected_query_index=1,
+        )
+        self.assertEqual(matching.query, "single zero")
+        self.assertEqual(warm.calls, [])
 
     def test_warm_resume_uses_captured_identity_without_corpus_metadata(self) -> None:
         cold = FakeRetriever(
