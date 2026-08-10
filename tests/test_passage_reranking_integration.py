@@ -36,8 +36,14 @@ class ArtifactStoreFake:
 
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.read_calls: list[str] = []
         self.read_validated_calls: list[str] = []
         self.write_calls: list[tuple[str, bytes]] = []
+        self.evict_local_calls: list[str] = []
+
+    def read(self, key: str) -> bytes | None:
+        self.read_calls.append(key)
+        return self.objects.get(key)
 
     def read_validated(self, key: str, decoder: Callable[[bytes], Any]) -> Any | None:
         self.read_validated_calls.append(key)
@@ -48,6 +54,10 @@ class ArtifactStoreFake:
         self.write_calls.append((key, payload))
         self.objects[key] = payload
 
+    def evict_local(self, key: str) -> None:
+        self.evict_local_calls.append(key)
+        self.objects.pop(key, None)
+
 
 class FakeTokenizer:
     def __call__(self, query: str, passage: str, **kwargs: Any) -> dict[str, list[list[int]]]:
@@ -55,7 +65,11 @@ class FakeTokenizer:
 
 
 class FakeCrossEncoder:
+    def __init__(self) -> None:
+        self.predict_calls = 0
+
     def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+        self.predict_calls += 1
         return [_fake_score(passage) for _, passage in pairs]
 
 
@@ -172,21 +186,30 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             )
         )
 
-    def _local_scorer(self) -> LocalCrossEncoderScorer:
+    def _local_scorer(self) -> tuple[LocalCrossEncoderScorer, FakeCrossEncoder]:
         policy = LocalCrossEncoderConfig(
             batch_size=2,
             max_length=512,
             query_policy="integration-fake-v1",
         )
+        model = FakeCrossEncoder()
         return LocalCrossEncoderScorer(
             policy,
-            loader=lambda config: (FakeCrossEncoder(), FakeTokenizer()),
-        )
+            loader=lambda config: (model, FakeTokenizer()),
+        ), model
 
     def test_public_local_workflow_uses_real_chunking_cache_and_warm_reuse(self) -> None:
+        self.assertEqual(
+            {
+                name
+                for name in ("read", "read_validated", "write", "evict_local")
+                if callable(getattr(ArtifactStoreFake, name, None))
+            },
+            {"read", "read_validated", "write", "evict_local"},
+        )
         retrieval = _retrieval_fixture()
         chunker = self._chunker()
-        local = self._local_scorer()
+        local, model = self._local_scorer()
         store = ArtifactStoreFake()
         cache = PassageScoreCache(
             store,
@@ -204,6 +227,8 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             scorer=cached,
             representation="report_text",
         )
+        predict_calls_after_first = model.predict_calls
+        self.assertGreater(predict_calls_after_first, 0)
         writes_after_first = len(store.write_calls)
         second = rerank_retrieval(
             retrieval,
@@ -214,9 +239,26 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(first, second)
+        self.assertEqual(model.predict_calls, predict_calls_after_first)
         self.assertEqual(first.status_counts["scored"], 4)
         self.assertEqual(first.status_counts["missing_representation"], 1)
         self.assertEqual(first.status_counts["unresolved"], 1)
+        expected_statuses = {
+            "eng-1": "scored",
+            "spa-1": "scored",
+            "rus-1": "scored",
+            "zho-1": "scored",
+            "missing-translation": "missing_representation",
+            "unresolved": "unresolved",
+        }
+        self.assertEqual(
+            {document.document_id: document.status for document in first.documents},
+            expected_statuses,
+        )
+        self.assertEqual(
+            {document.document_id: document.status for document in second.documents},
+            expected_statuses,
+        )
         self.assertEqual(len(store.write_calls), writes_after_first)
         self.assertEqual(writes_after_first, 1)
         self.assertTrue(all(document.selected_text for document in first.documents if document.status == "scored"))
@@ -229,7 +271,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
     def test_canonical_multilingual_and_flash_wire_fake_have_identical_rankings(self) -> None:
         retrieval = _retrieval_fixture()
         chunker = self._chunker()
-        local = self._local_scorer()
+        local, _ = self._local_scorer()
         local_store = ArtifactStoreFake()
         local_cache = PassageScoreCache(
             local_store,

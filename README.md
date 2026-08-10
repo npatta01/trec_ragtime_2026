@@ -101,8 +101,10 @@ over the model passage budget. Every passage retains exact Python character
 offsets, canonical/selected-representation SHA-256 hashes, content hashes,
 and stable lineage IDs; schema version 1 uses zero overlap.
 
-The primary runnable path is local and lazy-loads model weights only on the
-first score call:
+The primary local path is lazy and loads model weights only on the first score
+call. The snippet below is a continuation from the hydrated `RetrievalResult`
+created in [Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration);
+`retrieval` is that existing value, so this is not a standalone script:
 
 ```python
 from trec_ragtime import (
@@ -135,12 +137,12 @@ precision, batching, query-format, and length policy, so changing one of
 these settings isolates its score cache.
 
 `PassageScoreCache` stores a complete per-query `dict[bytes, float]` union
-under a deterministic MessagePack envelope. It uses the future issue #12
-`ArtifactStoreLike` interface (`read_validated` and `write`) and an injected
-artifact-validation exception factory. This branch does not provide or
-import a concrete ArtifactStore. A cache hit returns only the requested
-passage hashes, while overlapping requests merge into one complete object;
-failed or partial scoring is never written.
+under a deterministic MessagePack envelope. It uses the issue #12
+`ArtifactStoreLike` interface (`read`, `read_validated`, `write`, and
+`evict_local`) and an injected artifact-validation exception factory. This
+branch does not provide or import a concrete ArtifactStore. A cache hit returns
+only the requested passage hashes, while overlapping requests merge into one
+complete object; failed or partial scoring is never written.
 
 Flash is an optional transport for the same `PassageScorer` contract, not the
 default path. Install it separately with `uv sync --extra runpod`, then supply
