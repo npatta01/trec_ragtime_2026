@@ -354,6 +354,46 @@ class RagtimeClientTests(unittest.TestCase):
         ), self.assertRaises(RagtimeConfigurationError):
             RagtimeClient.from_env(session=RecordingSession())
 
+    def test_from_env_rejects_legacy_settings_for_cache_opt_out_and_injected_cache(self) -> None:
+        cache, _ = make_cache()
+        for variable in ("RAGTIME_CACHE_PATH", "RAGTIME_CACHE_DIR"):
+            with self.subTest(variable=variable), patch.dict(
+                os.environ,
+                {
+                    "RAGTIME_BASE_URL": "https://api.example",
+                    "RAGTIME_BEARER_TOKEN": "secret",
+                    "RAGTIME_CACHE_PATH": "",
+                    "RAGTIME_CACHE_DIR": "",
+                    variable: "/tmp/legacy-cache",
+                },
+                clear=False,
+            ):
+                with self.assertRaises(RagtimeConfigurationError):
+                    RagtimeClient.from_env(
+                        use_cache=False,
+                        session=RecordingSession(),
+                    )
+                with self.assertRaises(RagtimeConfigurationError):
+                    RagtimeClient.from_env(
+                        cache=cache,
+                        session=RecordingSession(),
+                    )
+
+    def test_cache_opt_out_does_not_require_artifact_bucket_configuration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "RAGTIME_BASE_URL": "https://api.example",
+                "RAGTIME_BEARER_TOKEN": "secret",
+                "RAGTIME_CACHE_PATH": "",
+                "RAGTIME_CACHE_DIR": "",
+                "RAGTIME_HF_BUCKET_ID": "",
+            },
+            clear=False,
+        ), patch("trec_ragtime.client.ArtifactStore.from_env") as from_env:
+            RagtimeClient.from_env(use_cache=False, session=RecordingSession())
+        from_env.assert_not_called()
+
     def test_public_client_exposes_artifact_store_and_sanitized_configuration(self) -> None:
         cache, store = make_cache()
         client = RagtimeClient("https://api.example", "secret", cache=cache, use_cache=True)

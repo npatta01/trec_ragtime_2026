@@ -62,6 +62,15 @@ def _configuration_error(message: str) -> ArtifactStoreConfigurationError:
     return ArtifactStoreConfigurationError(message)
 
 
+def _legacy_cache_setting_name() -> str | None:
+    """Return the first removed SQLite setting that is still populated."""
+
+    for name in ("RAGTIME_CACHE_PATH", "RAGTIME_CACHE_DIR"):
+        if os.getenv(name, "").strip():
+            return name
+    return None
+
+
 class ArtifactStore:
     """Store immutable-ish artifacts in a private HF Bucket and L1 cache.
 
@@ -101,9 +110,7 @@ class ArtifactStore:
     def from_env(cls, **overrides: Any) -> "ArtifactStore":
         """Build a store from the locked environment configuration."""
 
-        legacy_path = os.getenv("RAGTIME_CACHE_PATH", "").strip()
-        legacy_dir = os.getenv("RAGTIME_CACHE_DIR", "").strip()
-        if legacy_path or legacy_dir:
+        if _legacy_cache_setting_name() is not None:
             raise _configuration_error(
                 "RAGTIME_CACHE_PATH and RAGTIME_CACHE_DIR are not supported by ArtifactStore; "
                 "use RAGTIME_ARTIFACT_CACHE_DIR"

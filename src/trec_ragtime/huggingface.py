@@ -14,7 +14,7 @@ from requests.adapters import HTTPAdapter
 from requests.auth import AuthBase
 from urllib3.util.retry import Retry
 
-from .artifact_store import ArtifactStore, ArtifactStoreLike
+from .artifact_store import ArtifactStore, ArtifactStoreLike, _legacy_cache_setting_name
 from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, ResponseCache
 from .models import (
     HuggingFaceDocument,
@@ -175,6 +175,11 @@ class HuggingFaceCorpus:
         )
         if not isinstance(use_cache, bool):
             raise HuggingFaceConfigurationError("use_cache must be a boolean")
+        legacy_setting = _legacy_cache_setting_name()
+        if legacy_setting is not None:
+            raise HuggingFaceConfigurationError(
+                f"{legacy_setting} is not supported; use RAGTIME_ARTIFACT_CACHE_DIR"
+            )
         normalized_base_url = base_url.strip().rstrip("/")
         parsed_url = urlsplit(normalized_base_url)
         if parsed_url.scheme != "https" or not parsed_url.netloc:

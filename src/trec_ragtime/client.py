@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 from requests_ratelimiter import LimiterMixin
 from urllib3.util.retry import Retry
 
-from .artifact_store import ArtifactStore, ArtifactStoreLike
+from .artifact_store import ArtifactStore, ArtifactStoreLike, _legacy_cache_setting_name
 from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, ResponseCache
 from .models import Document, PipelineResult, SearchHit
 
@@ -141,6 +141,11 @@ class RagtimeClient:
     ) -> None:
         if not isinstance(use_cache, bool):
             raise RagtimeConfigurationError("use_cache must be a boolean")
+        legacy_setting = _legacy_cache_setting_name()
+        if legacy_setting is not None:
+            raise RagtimeConfigurationError(
+                f"{legacy_setting} is not supported; use RAGTIME_ARTIFACT_CACHE_DIR"
+            )
         if not isinstance(allow_insecure_http, bool):
             raise RagtimeConfigurationError("allow_insecure_http must be a boolean")
         normalized_base_url = base_url.strip().rstrip("/")

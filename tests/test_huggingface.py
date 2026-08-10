@@ -349,6 +349,53 @@ class HuggingFaceCorpusTests(unittest.TestCase):
                 session=RecordingGetSession(FakeResponse(filter_payload(document_row("doc-1", "text")))),
             ).get_many(["doc-1"])
 
+    def test_legacy_settings_are_rejected_for_cache_opt_out_and_injected_cache(self) -> None:
+        for variable in ("RAGTIME_CACHE_PATH", "RAGTIME_CACHE_DIR"):
+            with self.subTest(variable=variable), patch.dict(
+                os.environ,
+                {
+                    "RAGTIME_CACHE_PATH": "",
+                    "RAGTIME_CACHE_DIR": "",
+                    variable: "/tmp/legacy-cache",
+                },
+                clear=False,
+            ):
+                opt_out_session = RecordingGetSession()
+                with self.assertRaises(HuggingFaceConfigurationError):
+                    HuggingFaceCorpus(
+                        splits=("eng",),
+                        use_cache=False,
+                        session=opt_out_session,
+                    )
+                self.assertEqual(opt_out_session.calls, [])
+
+                cache, _ = make_cache()
+                injected_session = RecordingGetSession()
+                with self.assertRaises(HuggingFaceConfigurationError):
+                    HuggingFaceCorpus(
+                        splits=("eng",),
+                        cache=cache,
+                        session=injected_session,
+                    )
+                self.assertEqual(injected_session.calls, [])
+
+    def test_cache_opt_out_does_not_require_artifact_bucket_configuration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "RAGTIME_CACHE_PATH": "",
+                "RAGTIME_CACHE_DIR": "",
+                "RAGTIME_HF_BUCKET_ID": "",
+            },
+            clear=False,
+        ), patch("trec_ragtime.huggingface.ArtifactStore.from_env") as from_env:
+            HuggingFaceCorpus(
+                splits=("eng",),
+                use_cache=False,
+                session=RecordingGetSession(),
+            )
+        from_env.assert_not_called()
+
     def test_malformed_l1_repairs_once_and_corrupt_l2_is_fatal(self) -> None:
         cache, store = make_cache()
         request = {
