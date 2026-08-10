@@ -162,8 +162,11 @@ The immutable policy records explicit tokenizer name/revision and the installed
 Sentence Transformers, Transformers, Tokenizers, and PyTorch versions. Policy
 construction fails closed if declared runtime metadata differs from the local
 environment. `CrossEncoderPairLengthFunction` uses the same query formatting
-and tokenizer identity as inference, so every emitted production passage fits
-the scorer's complete pair ceiling before prediction.
+and tokenizer identity as inference. It exposes a passage-only no-special-token
+length and a passage budget derived from the formatted query plus the
+tokenizer's official pair-special-token count for LangChain's additive packing.
+The complete pair length remains authoritative and is revalidated for every
+emitted passage before prediction.
 
 ### `passage_score_cache.py`
 

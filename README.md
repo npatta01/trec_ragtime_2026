@@ -104,8 +104,8 @@ offsets, canonical/selected-representation SHA-256 hashes, content hashes,
 and stable lineage IDs; schema version 1 uses zero overlap.
 
 The primary local path is complete and lazy: pinned tokenizer assets load when
-chunking first measures a query/passage pair, while model weights load only on
-the first score call. The snippet below is a continuation from the hydrated
+`ChunkerConfig` resolves the query-specific passage budget, while model weights
+load only on the first score call. The snippet below is a continuation from the hydrated
 `RetrievalResult` created in
 [Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration);
 `retrieval` is that existing value, so this is not a standalone script:
@@ -139,8 +139,10 @@ report_result = rerank_retrieval(
 ```
 
 `ChunkerConfig` automatically uses the pair-length callable's stable
-fingerprint. Keep this tokenizer-aware full-pair budget aligned with the scorer;
-a character-counting `len` budget can admit passages that overflow once the
+fingerprint, passage-only tokenizer length, and query/special-token-adjusted
+packing budget. It still validates every emitted chunk with the exact complete
+pair length. Keep this tokenizer-aware policy aligned with the scorer; a
+character-counting `len` budget can admit passages that overflow once the
 formatted query and tokenizer special tokens are included.
 
 Use `device="cuda"` for CUDA PyTorch, or the user-facing `device="rocm"`

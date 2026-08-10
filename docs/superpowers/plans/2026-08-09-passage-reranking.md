@@ -4,22 +4,25 @@
 
 - Objective and merge base remain unchanged: issue #15 on
   `codex/passage-reranking`, based on `72596ad` / `origin/codex/control-a-foundation`.
-- Tasks 1–6 are implemented and task-reviewed. The main implementation commits
+- Tasks 1–6 are implemented and task-reviewed. The implementation commits
   cover LangChain/spaCy passage lineage, local scoring, complete ArtifactStoreLike
   score maps, deterministic reranking artifacts, optional Flash transport, and
   public integration/documentation.
-- Final Sol standards/spec review requested four implementation fixes. Passage
-  configuration/runtime identity is fixed in `f841547`; pair-token and scorer
-  runtime identity is fixed in `945b304`; Flash startup/runtime/provisioning is
-  fixed in `604f4f4`. Public integration of those settled interfaces is in
-  progress.
-- Latest evidence before public re-integration: 26 passage tests, 22 scorer
-  tests, 64 Flash+scorer tests, 246 full repository tests, and the multilingual
-  benchmark are green. A real pinned-tokenizer-only CJK smoke proved 502
-  characters / 513 pair tokens become two exact passages with a 512-token
-  maximum; no model weights or inference were used.
-- Next action: finish exports/README/integration regression, run scoped Sol
-  re-review, then repeat focused, benchmark, full, lock, diff, and secret gates.
+- Task 7 integration and independent Sol standards/spec review are complete.
+  The final fix wave closed tokenizer/runtime identity, supported
+  SentenceTransformers module construction, additive passage budgeting with
+  exact full-pair validation, Flash lifecycle/provisioning, class-only worker
+  transport, and Transformers `BatchEncoding` compatibility. Both Sol review
+  axes approved the resulting branch with no open findings.
+- Final evidence: 151 focused tests and all 264 repository tests pass; all 22
+  multilingual benchmark passes are deterministic; lock, Ruff, changed-file
+  format, diff, export, secret-pattern, and ignored-environment checks pass. A
+  real pinned-tokenizer-only CJK smoke proved 502 contiguous Chinese characters
+  / 513 pair tokens become two exact adjacent passages (251 characters each,
+  262 pair tokens each) under the 512-token ceiling. No model weights or
+  inference were used.
+- Next action: hand off the clean local branch without push, pull request, or
+  deployment.
 - External gates remain deferred and must not be represented as complete: real
   model-weight inference, organizer/canonical/report ranking comparison, paid
   `flash dev`, and cross-machine reuse after issue #12 lands.
@@ -346,19 +349,19 @@
 - Consumes: the complete branch diff from `origin/codex/control-a-foundation` and issue #15/spec requirements.
 - Produces: a reviewed, verified branch with no unaddressed load-bearing findings.
 
-- [ ] **Step 1: Generate a complete branch review package**
+- [x] **Step 1: Generate a complete branch review package**
 
   Include commits, diff stat, full diff, issue #15 requirements, approved design, test/benchmark evidence, and any deferred task-review findings.
 
-- [ ] **Step 2: Dispatch Sol xhigh for independent spec and quality review**
+- [x] **Step 2: Dispatch Sol xhigh for independent spec and quality review**
 
   Require separate verdicts for boundary/offset lineage, dependency policy, scorer/cache integrity, deterministic ranking, local/Flash parity, transport safety, secret handling, regression risk, and verification sufficiency.
 
-- [ ] **Step 3: Dispatch one Luna xhigh fix wave if findings exist**
+- [x] **Step 3: Dispatch one Luna xhigh fix wave if findings exist**
 
   Give one worker the complete findings list and explicit affected-file ownership. Require failing regression tests before fixes, focused reruns, and a written fix report. Then ask Sol xhigh for one scoped re-review of that fix diff.
 
-- [ ] **Step 4: Run fresh final verification and inspect branch state**
+- [x] **Step 4: Run fresh final verification and inspect branch state**
 
   Re-run the complete Task 6 command sequence plus `git diff --check`, inspect `git status --short`, compare changed files to scope, and verify no secrets, logs, model weights, generated benchmark outputs, or unrelated artifacts are tracked.
 
