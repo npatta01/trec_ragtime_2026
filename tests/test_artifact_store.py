@@ -4,11 +4,14 @@ import hashlib
 import os
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import fsspec
+from fsspec.spec import AbstractFileSystem
 
 from trec_ragtime.artifact_store import (
     ArtifactStore,
@@ -93,6 +96,91 @@ class FakeSimpleCache:
         return FakeWriteFile(self, candidate, key)
 
 
+class PartialFailSimpleCache(FakeSimpleCache):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.partial_then_fail = True
+
+    def open(self, path: str, mode: str):
+        if "r" in mode and self.partial_then_fail:
+            candidate = Path(self.storage[-1]) / self._mapper(self._strip_protocol(path))
+            candidate.write_bytes(b"partial")
+            raise RuntimeError("download interrupted")
+        return super().open(path, mode)
+
+
+class BarrierWriteFile(FakeWriteFile):
+    def __enter__(self) -> "BarrierWriteFile":
+        self.fs.barrier.wait(timeout=2)
+        return self
+
+
+class BarrierSimpleCache(FakeSimpleCache):
+    def __init__(self, *args, barrier: threading.Barrier, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.barrier = barrier
+
+    def open(self, path: str, mode: str):
+        if "w" not in mode:
+            return super().open(path, mode)
+        self.open_calls.append((path, mode))
+        key = self._strip_protocol(path).removeprefix("buckets/")
+        candidate = Path(self.storage[-1]) / self._mapper(self._strip_protocol(path))
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        return BarrierWriteFile(self, candidate, key)
+
+
+class ActualSimpleCacheTarget(AbstractFileSystem):
+    """A target FS with direct get_file semantics and observable exists()."""
+
+    protocol = "hf"
+
+    def __init__(self, remote: dict[str, bytes], exists_calls: list[str]) -> None:
+        self.remote = remote
+        self.exists_calls = exists_calls
+        self.get_file_calls: list[tuple[str, str]] = []
+
+    @classmethod
+    def _strip_protocol(cls, path: str) -> str:
+        return path.removeprefix("hf://")
+
+    def exists(self, path: str, **kwargs) -> bool:
+        self.exists_calls.append(path)
+        raise AssertionError("authoritative paths-info hit must not call target exists")
+
+    def get_file(
+        self,
+        rpath: str,
+        lpath: str,
+        callback=None,
+        outfile=None,
+        **kwargs,
+    ) -> None:
+        self.get_file_calls.append((rpath, lpath))
+        key = rpath.removeprefix("buckets/")
+        payload = self.remote[key]
+        if outfile is None:
+            Path(lpath).write_bytes(payload)
+        else:
+            outfile.write(payload)
+
+
+class ActualSimpleCacheFactory:
+    def __init__(self, storage: Path, remote: dict[str, bytes], exists_calls: list[str]) -> None:
+        self.storage = storage
+        self.remote = remote
+        self.exists_calls = exists_calls
+        self.target: ActualSimpleCacheTarget | None = None
+
+    def __call__(self, protocol: str, **kwargs):
+        self.target = ActualSimpleCacheTarget(self.remote, self.exists_calls)
+        return fsspec.filesystem(
+            "simplecache",
+            fs=self.target,
+            cache_storage=str(self.storage),
+        )
+
+
 class FakeHfApi:
     def __init__(
         self,
@@ -148,6 +236,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
         paths_error: BaseException | None = None,
         download_error: BaseException | None = None,
         upload_error: BaseException | None = None,
+        filesystem_factory_override=None,
     ) -> ArtifactStore:
         def api_factory(**kwargs):
             self.api_constructed += 1
@@ -179,7 +268,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
             local_dir=self.local_dir,
             token=token,
             api_factory=api_factory,
-            filesystem_factory=fs_factory,
+            filesystem_factory=filesystem_factory_override or fs_factory,
         )
 
     def decoder(self, payload: bytes) -> bytes:
@@ -258,6 +347,49 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertFalse(candidate.exists())
         self.assertNotIn("secret-token", str(raised.exception))
 
+    def test_write_rejects_candidate_symlink_before_simplecache_open(self) -> None:
+        store = self.make_store()
+        sentinel = Path(self.tempdir.name) / "sentinel"
+        sentinel.write_bytes(b"do-not-overwrite")
+        candidate = store.local_candidate("object.mpk")
+        candidate.symlink_to(sentinel)
+
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("object.mpk", b"payload")
+        self.assertEqual(sentinel.read_bytes(), b"do-not-overwrite")
+        self.assertIsNone(self.fs)
+        self.assertFalse(self.remote.get("owner/bucket/foo/object.mpk") == b"payload")
+
+    def test_failed_simplecache_download_evicts_partial_candidate(self) -> None:
+        partial_fs: PartialFailSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal partial_fs
+            partial_fs = PartialFailSimpleCache(self.local_dir, self.remote)
+            return partial_fs
+
+        store = self.make_store(filesystem_factory_override=factory)
+        candidate = store.local_candidate("object.mpk")
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
+        self.assertFalse(candidate.exists())
+
+        assert partial_fs is not None
+        partial_fs.partial_then_fail = False
+        self.assertEqual(store.read("object.mpk"), b"remote")
+        assert self.api is not None
+        self.assertEqual(len(self.api.paths_calls), 2)
+
+    def test_actual_simplecache_hydration_does_not_call_target_exists(self) -> None:
+        exists_calls: list[str] = []
+        factory = ActualSimpleCacheFactory(self.local_dir, self.remote, exists_calls)
+        store = self.make_store(filesystem_factory_override=factory)
+
+        self.assertEqual(store.read("object.mpk"), b"remote")
+        self.assertEqual(exists_calls, [])
+        assert factory.target is not None
+        self.assertEqual(len(factory.target.get_file_calls), 1)
+
     def test_successful_write_uploads_and_retains_mode_0600_candidate(self) -> None:
         store = self.make_store()
         store.write("object.mpk", b"new-payload")
@@ -281,7 +413,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
                 filesystem_factory=lambda *args, **kwargs: None,
             )
 
-    def test_different_keys_can_overlap_and_duplicate_writes_are_last_writer_wins(self) -> None:
+    def test_duplicate_writes_are_sequential_last_writer_wins(self) -> None:
         store = self.make_store(prefix="")
         store.write("same.mpk", b"first")
         store.write("same.mpk", b"second")
@@ -290,6 +422,47 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(store.local_candidate("same.mpk").read_bytes(), b"second")
         self.assertEqual(store.local_candidate("other.mpk").read_bytes(), b"other")
         self.assertEqual(self.remote["owner/bucket/same.mpk"], b"second")
+
+    def test_different_key_writes_enter_simplecache_concurrently(self) -> None:
+        barrier = threading.Barrier(2)
+        fs: BarrierSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal fs
+            fs = BarrierSimpleCache(
+                self.local_dir,
+                self.remote,
+                barrier=barrier,
+            )
+            return fs
+
+        store = self.make_store(
+            prefix="",
+            filesystem_factory_override=factory,
+        )
+        store._verify_private_bucket()
+        store._get_filesystem()
+        failures: list[BaseException] = []
+
+        def write(key: str, payload: bytes) -> None:
+            try:
+                store.write(key, payload)
+            except BaseException as exc:  # pragma: no cover - assertion below
+                failures.append(exc)
+
+        first = threading.Thread(target=write, args=("first.mpk", b"first"))
+        second = threading.Thread(target=write, args=("second.mpk", b"second"))
+        first.start()
+        second.start()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(failures, [])
+        assert fs is not None
+        self.assertEqual(len(fs.open_calls), 2)
+        self.assertEqual(self.remote["owner/bucket/first.mpk"], b"first")
+        self.assertEqual(self.remote["owner/bucket/second.mpk"], b"second")
 
     def test_configuration_and_errors_never_expose_tokens(self) -> None:
         store = self.make_store(token="super-secret")

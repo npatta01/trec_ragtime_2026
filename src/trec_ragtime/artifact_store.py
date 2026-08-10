@@ -313,6 +313,21 @@ class ArtifactStore:
                 "failed to secure the local artifact cache candidate"
             ) from None
 
+    @staticmethod
+    def _check_candidate_before_write(candidate: Path) -> None:
+        """Reject a pre-existing unsafe path before simplecache opens it."""
+
+        try:
+            file_status = candidate.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise ArtifactStoreRemoteError("failed to inspect local artifact cache") from None
+        if stat.S_ISLNK(file_status.st_mode):
+            raise ArtifactStoreRemoteError("local artifact cache candidate is a symlink")
+        if not stat.S_ISREG(file_status.st_mode):
+            raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
+
     def _read_remote(self, object_key: str) -> bytes | None:
         full_key = self._full_object_key(object_key)
         self._verify_private_bucket()
@@ -329,16 +344,34 @@ class ArtifactStore:
 
         candidate = self.local_candidate(object_key)
         try:
-            with self._get_filesystem().open(self._remote_path(object_key), "rb") as handle:
-                payload = handle.read()
+            filesystem = self._get_filesystem()
+            hydrate = getattr(filesystem, "_get_cached_file_before_open", None)
+            if callable(hydrate):
+                # Stock simplecache._open() calls target.exists(), which is an
+                # unsafe miss classifier for HF Buckets.  Paths-info already
+                # proved the object exists, so invoke simplecache's hydration
+                # primitive directly and read its exact mapped candidate.
+                stripped_path = filesystem._strip_protocol(self._remote_path(object_key))
+                hydrate(stripped_path)
+                found, payload = self._read_local(candidate)
+                if not found:
+                    raise ArtifactStoreRemoteError(
+                        "artifact filesystem did not retain the local candidate"
+                    )
+            else:
+                with filesystem.open(self._remote_path(object_key), "rb") as handle:
+                    payload = handle.read()
+            if not isinstance(payload, (bytes, bytearray)):
+                raise ArtifactStoreRemoteError("Hugging Face artifact did not contain bytes")
+            self._secure_candidate(candidate)
+            return bytes(payload)
         except Exception:
+            # A failed hydration can leave a partial candidate behind.  Remove
+            # only this exact mapped path before exposing a sanitized failure.
+            self._remove_candidate(candidate)
             raise ArtifactStoreRemoteError(
                 "failed to download the Hugging Face artifact"
             ) from None
-        if not isinstance(payload, (bytes, bytearray)):
-            raise ArtifactStoreRemoteError("Hugging Face artifact did not contain bytes")
-        self._secure_candidate(candidate)
-        return bytes(payload)
 
     def read(self, object_key: str) -> bytes | None:
         """Read raw bytes, using L1 before the private HF Bucket."""
@@ -378,6 +411,7 @@ class ArtifactStore:
             raise _configuration_error("artifact payload must be bytes")
         self._verify_private_bucket()
         candidate = self.local_candidate(object_key)
+        self._check_candidate_before_write(candidate)
         try:
             with self._get_filesystem().open(self._remote_path(object_key), "wb") as handle:
                 handle.write(payload)
