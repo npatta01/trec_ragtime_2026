@@ -190,6 +190,20 @@ class RagtimeRetriever:
             "translation_splits": list(metadata.translation_splits),
         }
 
+    @property
+    def retrieval_corpus_identity(self) -> dict[str, Any]:
+        """Return the construction-captured identity without reopening the corpus.
+
+        Cache-enabled retrievers snapshot the complete corpus provenance while
+        the validated corpus is constructed.  Runner resume and cache-only
+        assembly use this seam so a warm path never consults ``metadata``
+        again.  Direct no-cache retrievers retain the explicit legacy lookup.
+        """
+
+        if self._retrieval_corpus_identity_snapshot is not None:
+            return copy.deepcopy(dict(self._retrieval_corpus_identity_snapshot))
+        return copy.deepcopy(dict(self._capture_retrieval_corpus_identity()))
+
     def _capture_retrieval_corpus_identity(self) -> Mapping[str, Any]:
         """Return corpus provenance without requiring a hydration lookup.
 

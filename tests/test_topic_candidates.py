@@ -239,6 +239,24 @@ class FakeRetriever:
             raise result
         return result  # type: ignore[return-value]
 
+    def build_retrieval_identity(
+        self,
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+        query_context: dict[str, object] | None = None,
+    ) -> SimpleNamespace:
+        request_digest = hashlib.sha256(query.encode("utf-8")).digest()
+        fingerprint = hashlib.sha256(b"control-a-test-retriever").digest()
+        return SimpleNamespace(
+            object_key=retrieval_object_key(fingerprint, request_digest),
+            request_digest=request_digest,
+            retriever_fingerprint=fingerprint,
+        )
+
 
 def make_retrieval_result(
     query: str,
@@ -463,6 +481,85 @@ class ControlARunnerTests(unittest.TestCase):
         self.assertNotIn("retrieval_artifact", statuses[1])
         self.assertEqual(
             statuses[0]["retrieval_artifact"]["cache_hit"], False
+        )
+
+    def test_incomplete_result_keeps_candidates_and_counts_without_reference(self) -> None:
+        unresolved = RetrievedDocument(
+            rank=1,
+            document_id="missing-doc",
+            score=0.2,
+            text=None,
+            url=None,
+            date=None,
+            language=None,
+            content_source=None,
+            content_local_cache_hit=None,
+        )
+        incomplete = RetrievalResult(
+            search_result=PipelineResult(
+                query="first problem",
+                pipeline="ragtime2",
+                hits=(SearchHit(rank=1, document_id="missing-doc", score=0.2),),
+                processed=True,
+                local_cache_hit=False,
+                remote_cached=False,
+                server_timestamp=None,
+                cache_stored_at=None,
+            ),
+            documents=(unresolved,),
+        )
+        retriever = FakeRetriever(
+            [incomplete, make_retrieval_result("second problem", ())]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="incomplete-preserved",
+        )
+
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["counts"]["failed_topics"], 0)
+        self.assertEqual(manifest["counts"]["candidates"], 1)
+        self.assertEqual(manifest["counts"]["unresolved_documents"], 1)
+        self.assertIsNone(manifest["topic_status"][0]["retrieval_artifact"])
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "candidates.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(candidates[0]["document_id"], "missing-doc")
+        self.assertFalse(candidates[0]["hydrated"])
+
+    def test_wrong_reference_is_rejected_before_control_a_success(self) -> None:
+        document = RetrievedDocument(
+            rank=1,
+            document_id="doc-first",
+            score=1.0,
+            text="text",
+            url=None,
+            date=None,
+            language="eng",
+            content_source="local_corpus",
+            content_local_cache_hit=True,
+        )
+        result = make_retrieval_result("not the requested query", (document,))
+        retriever = FakeRetriever(
+            [result, make_retrieval_result("second problem", ())]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="wrong-reference",
+        )
+
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["counts"]["failed_topics"], 1)
+        self.assertEqual(manifest["counts"]["candidates"], 0)
+        self.assertEqual(
+            manifest["topic_status"][0]["error"]["type"], "ValueError"
         )
 
     def test_runner_refuses_to_overwrite_existing_run(self) -> None:

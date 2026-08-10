@@ -306,13 +306,65 @@ def _candidate_record(
     return record
 
 
-def _artifact_reference_record(result: RetrievalResult) -> dict[str, object]:
-    """Return the persisted reference required for a successful topic."""
+def _build_retrieval_identity(
+    retriever: RetrieverLike,
+    *,
+    query: str,
+    top_k: int,
+) -> Any:
+    builder = getattr(retriever, "build_retrieval_identity", None)
+    if not callable(builder):
+        raise ValueError(
+            "retriever must expose build_retrieval_identity for artifact validation"
+        )
+    return builder(
+        query,
+        pipeline="ragtime2",
+        top_k=top_k,
+        max_content_fallbacks=0,
+        fallback_on_hf_error=False,
+        query_context={
+            "kind": "control_a",
+            "query_construction": "problem_only_v1",
+        },
+    )
 
+
+def _validated_reference(
+    result: RetrievalResult,
+    *,
+    retriever: RetrieverLike,
+    query: str,
+    top_k: int,
+) -> dict[str, object] | None:
+    """Validate the write-backed reference for a complete result.
+
+    Incomplete hydration is intentionally uncacheable, but remains a valid
+    Control-A candidate snapshot.  Complete results must carry the exact
+    identity returned by the retriever's persisted-write contract.
+    """
+
+    if not result.fully_hydrated or result.hydration_failures:
+        return None
     reference = result.retrieval_artifact
     if not isinstance(reference, RetrievalArtifactReference):
         raise ValueError(
-            "successful Control-A retrieval is missing a RetrievalArtifactReference"
+            "complete Control-A retrieval is missing a RetrievalArtifactReference"
+        )
+    identity = _build_retrieval_identity(retriever, query=query, top_k=top_k)
+    try:
+        matches = (
+            reference.object_key == identity.object_key
+            and reference.request_digest == identity.request_digest
+            and reference.retriever_fingerprint == identity.retriever_fingerprint
+        )
+    except AttributeError as exc:
+        raise ValueError(
+            "retriever identity is missing object key or digest fields"
+        ) from exc
+    if not matches:
+        raise ValueError(
+            "Control-A retrieval artifact reference does not match the exact query identity"
         )
     return reference.as_record()
 
@@ -367,7 +419,6 @@ def run_control_a(
                     "query_construction": "problem_only_v1",
                 },
             )
-            retrieval_artifact = _artifact_reference_record(result)
         except (RagtimeError, HuggingFaceError, ValueError) as exc:
             failed_topic_count += 1
             topic_status.append(
@@ -383,6 +434,24 @@ def run_control_a(
         unresolved_ids = list(result.unresolved_ids)
         unresolved_count += len(unresolved_ids)
         missing_translation_count += len(missing_translation_ids)
+        try:
+            retrieval_artifact = _validated_reference(
+                result,
+                retriever=retriever,
+                query=query,
+                top_k=top_k,
+            )
+        except ValueError as exc:
+            failed_topic_count += 1
+            topic_status.append(
+                {
+                    "error": {"type": type(exc).__name__},
+                    "missing_translation_ids": [],
+                    "topic_id": topic.topic_id,
+                    "unresolved_ids": [],
+                }
+            )
+            continue
         topic_status.append(
             {
                 "missing_translation_ids": sorted(missing_translation_ids),
