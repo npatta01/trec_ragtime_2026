@@ -82,6 +82,14 @@ from .passage_score_cache import (
     query_hash,
     score_object_key,
 )
+from .reranking import (
+    PassageEvidence,
+    RerankedDocument,
+    RerankingError,
+    RerankingResult,
+    max_passage_v1,
+    rerank_retrieval,
+)
 from .paths import (
     PROJECT_CACHE_DIR_ENV,
     default_project_cache_dir,
@@ -174,6 +182,7 @@ __all__ = [
     "Passage",
     "PassageChunker",
     "PassageChunkingError",
+    "PassageEvidence",
     "PassageScoreArtifactValidationError",
     "PassageScoreCache",
     "PassageScorer",
@@ -188,6 +197,9 @@ __all__ = [
     "RagtimeRetriever",
     "RetrievalResult",
     "RetrievedDocument",
+    "RerankedDocument",
+    "RerankingError",
+    "RerankingResult",
     "RunpodFlashConfig",
     "RunpodFlashPassageScorer",
     "Representation",
@@ -211,6 +223,8 @@ __all__ = [
     "encode_flash_response",
     "encode_score_map",
     "query_hash",
+    "max_passage_v1",
+    "rerank_retrieval",
     "score_object_key",
     "sha256_bytes",
     "validate_passage_scores",
