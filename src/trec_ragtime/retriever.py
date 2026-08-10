@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -498,6 +499,12 @@ class RagtimeRetriever:
             refresh=refresh or refresh_search,
         )
         hits = search_result.hits if top_k is None else search_result.hits[:top_k]
+        if top_k is not None:
+            # ``RetrievalResult`` is a one-to-one join between the ranked
+            # endpoint result and hydrated documents.  Keep the endpoint's
+            # metadata and opaque evidence while making the client-side depth
+            # truncation visible at that same domain boundary.
+            search_result = replace(search_result, hits=hits)
         hydration = self.enrich_documents(
             (hit.document_id for hit in hits),
             refresh_documents=refresh or refresh_documents,

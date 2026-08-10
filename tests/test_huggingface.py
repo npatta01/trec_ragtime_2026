@@ -1214,10 +1214,161 @@ class RagtimeRetrieverTests(unittest.TestCase):
         result = RagtimeRetriever(FakeRagtimeClient(search), corpus).retrieve(
             "query", top_k=2, refresh_search=True, refresh_documents=True
         )
-        self.assertIs(result.search_result, search)
+        self.assertIsNot(result.search_result, search)
+        self.assertEqual(result.search_result.query, search.query)
+        self.assertEqual(result.search_result.pipeline, search.pipeline)
+        self.assertEqual(result.search_result.processed, search.processed)
+        self.assertEqual(result.search_result.local_cache_hit, search.local_cache_hit)
+        self.assertEqual(result.search_result.remote_cached, search.remote_cached)
+        self.assertEqual(result.search_result.server_timestamp, search.server_timestamp)
+        self.assertEqual(result.search_result.cache_stored_at, search.cache_stored_at)
+        self.assertEqual(result.search_result.extra, search.extra)
+        self.assertEqual(result.search_result.hits, search.hits[:2])
         self.assertEqual([document.document_id for document in result.documents], ["doc-high", "doc-mid"])
         self.assertEqual([document.rank for document in result.documents], [1, 2])
         self.assertEqual([document.report_text for document in result.documents], ["highest", "middle"])
+
+    def test_top_k_truncates_search_result_before_retrieval_artifact_write(self) -> None:
+        store = MemoryArtifactStore()
+        search = PipelineResult(
+            query="query",
+            pipeline="ragtime2",
+            hits=tuple(
+                SearchHit(rank=rank, document_id=document_id, score=score)
+                for rank, (document_id, score) in enumerate(
+                    (("doc-high", 0.9), ("doc-mid", 0.8), ("doc-low", 0.7)),
+                    start=1,
+                )
+            ),
+            processed=True,
+            local_cache_hit=True,
+            remote_cached=False,
+            server_timestamp=123.0,
+            cache_stored_at=122.0,
+            extra={"organizer_metadata": {"request_id": "opaque"}},
+        )
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=tuple(
+                    hf_document(document_id, document_id)
+                    for document_id in ("doc-high", "doc-mid", "doc-low")
+                ),
+                unresolved_ids=(),
+                failures=(),
+            )
+        )
+        retriever = RagtimeRetriever(
+            FakeRagtimeClient(search),
+            corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        )
+
+        result = retriever.retrieve("query", top_k=1)
+
+        self.assertEqual(
+            [(hit.rank, hit.document_id, hit.score) for hit in result.search_result.hits],
+            [(1, "doc-high", 0.9)],
+        )
+        self.assertEqual(
+            [(document.rank, document.document_id, document.score) for document in result.documents],
+            [(1, "doc-high", 0.9)],
+        )
+        self.assertEqual(result.search_result.processed, search.processed)
+        self.assertEqual(result.search_result.local_cache_hit, search.local_cache_hit)
+        self.assertEqual(result.search_result.remote_cached, search.remote_cached)
+        self.assertEqual(result.search_result.server_timestamp, search.server_timestamp)
+        self.assertEqual(result.search_result.cache_stored_at, search.cache_stored_at)
+        self.assertEqual(result.search_result.extra, search.extra)
+        self.assertEqual(len(store.write_calls), 1)
+
+    def test_top_k_retrieval_artifact_l1_and_l2_hits_keep_aligned_runner_order(self) -> None:
+        store = MemoryArtifactStore()
+        search = pipeline_result(["doc-1", "doc-2", "doc-3", "doc-4"])
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=tuple(
+                    hf_document(document_id, document_id)
+                    for document_id in ("doc-1", "doc-2", "doc-3", "doc-4")
+                ),
+                unresolved_ids=(),
+                failures=(),
+            )
+        )
+        first = RagtimeRetriever(
+            FakeRagtimeClient(search),
+            corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        )
+
+        written = first.retrieve("query", top_k=2)
+
+        self.assertEqual([hit.document_id for hit in written.search_result.hits], ["doc-1", "doc-2"])
+        self.assertEqual([document.document_id for document in written.documents], ["doc-1", "doc-2"])
+        self.assertEqual([hit.rank for hit in written.search_result.hits], [1, 2])
+        self.assertEqual([document.rank for document in written.documents], [1, 2])
+        self.assertEqual([hit.score for hit in written.search_result.hits], [0.9, 0.8])
+        self.assertEqual([document.score for document in written.documents], [0.9, 0.8])
+
+        l1_client = FakeRagtimeClient(search)
+        l1_client.raise_on_search = True
+        l1_corpus = FakeCorpus(corpus.result)
+        l1_corpus.raise_on_access = True
+        l1 = RagtimeRetriever(
+            l1_client,
+            l1_corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        ).retrieve("query", top_k=2)
+        self.assertTrue(l1.retrieval_artifact.cache_hit)
+        self.assertEqual([document.document_id for document in l1.documents], ["doc-1", "doc-2"])
+
+        object_key = written.retrieval_artifact.object_key
+        store.local.clear()
+        self.assertIn(object_key, store.remote)
+        l2_client = FakeRagtimeClient(search)
+        l2_client.raise_on_search = True
+        l2_corpus = FakeCorpus(corpus.result)
+        l2_corpus.raise_on_access = True
+        l2 = RagtimeRetriever(
+            l2_client,
+            l2_corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        ).retrieve("query", top_k=2)
+        self.assertTrue(l2.retrieval_artifact.cache_hit)
+        self.assertEqual([document.document_id for document in l2.documents], ["doc-1", "doc-2"])
+        self.assertEqual([document.rank for document in l2.documents], [1, 2])
+        self.assertEqual([document.score for document in l2.documents], [0.9, 0.8])
+
+    def test_top_k_none_keeps_every_endpoint_hit_and_writes_complete_artifact(self) -> None:
+        store = MemoryArtifactStore()
+        document_ids = ["doc-1", "doc-2", "doc-3"]
+        search = pipeline_result(document_ids)
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=tuple(hf_document(document_id, document_id) for document_id in document_ids),
+                unresolved_ids=(),
+                failures=(),
+            )
+        )
+        result = RagtimeRetriever(
+            FakeRagtimeClient(search),
+            corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        ).retrieve("query", top_k=None)
+
+        self.assertIs(result.search_result, search)
+        self.assertEqual([hit.document_id for hit in result.search_result.hits], document_ids)
+        self.assertEqual([document.document_id for document in result.documents], document_ids)
+        self.assertEqual(len(store.write_calls), 1)
+
+    def test_top_k_zero_or_boolean_is_rejected_before_search(self) -> None:
+        for invalid_top_k in (0, True):
+            with self.subTest(top_k=invalid_top_k):
+                store = MemoryArtifactStore()
+                retriever, client, corpus = self._cached_retriever(store)
+                with self.assertRaises(ValueError):
+                    retriever.retrieve("query", top_k=invalid_top_k)
+                self.assertEqual(client.search_calls, [])
+                self.assertEqual(corpus.calls, [])
 
     def test_unresolved_documents_use_bounded_private_content_fallback(self) -> None:
         document_ids = [f"doc-{index}" for index in range(7)]
