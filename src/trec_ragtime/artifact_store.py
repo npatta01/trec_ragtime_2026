@@ -376,9 +376,6 @@ class ArtifactStore:
                 self._disable_remote()
                 return None
             return self._read_remote(object_key)
-        except ArtifactStoreRemoteError:
-            self._disable_remote()
-            return None
         if found:
             return cast(bytes, payload)
         return self._read_remote(object_key)
@@ -411,9 +408,6 @@ class ArtifactStore:
             except ArtifactValidationError:
                 self._best_effort_remove_candidate(candidate)
                 return None
-        except ArtifactStoreRemoteError:
-            self._disable_remote()
-            return None
         if found:
             try:
                 return decoder(cast(bytes, payload))

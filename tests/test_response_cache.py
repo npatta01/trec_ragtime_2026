@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import unittest
 from collections.abc import Callable
@@ -13,7 +12,6 @@ from trec_ragtime.artifact_store import (
     ArtifactValidationError,
 )
 from trec_ragtime.cache import (
-    CACHE_SCHEMA_VERSION,
     DEFAULT_CACHE_NAMESPACE,
     CacheEntry,
     ResponseCache,

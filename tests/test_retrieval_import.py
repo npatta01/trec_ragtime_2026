@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import duckdb
 
-from trec_ragtime.artifact_store import ArtifactStore, ArtifactValidationError
+from trec_ragtime.artifact_store import ArtifactStore
 from trec_ragtime.local_corpus import LocalCorpusIndex, build_from_parquet
 from trec_ragtime.retrieval_cache import RetrievalArtifactCache
 from trec_ragtime.retrieval_import import (
