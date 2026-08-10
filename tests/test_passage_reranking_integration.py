@@ -68,20 +68,72 @@ class ArtifactStoreFake:
 
 
 class FakeTokenizer:
+    QUERY_NO_SPECIAL_TOKENS = 6
+    PAIR_SPECIAL_TOKENS = 4
+    SINGLE_SEQUENCE_KWARGS = {
+        "add_special_tokens": False,
+        "truncation": False,
+        "return_length": True,
+    }
+    PAIR_LENGTH_KWARGS = {
+        "truncation": False,
+        "return_length": True,
+    }
+    PAIR_VALIDATION_KWARGS = {
+        "truncation": False,
+        "max_length": 512,
+        "return_length": True,
+    }
+
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+        self.special_token_calls: list[bool] = []
 
     @staticmethod
-    def pair_token_count(query: str, passage: str) -> int:
-        # Model one token per dense CJK character plus the five query terms and
-        # six framing/special tokens observed at this boundary.
-        return len(query.split()) + len(passage) + 6
+    def passage_no_special_token_count(passage: str) -> int:
+        if not passage:
+            return 0
+        if set(passage) == {"中"}:
+            return len(passage) + 1
+        return len(passage)
 
-    def __call__(
-        self, query: str, passage: str, **kwargs: Any
-    ) -> dict[str, list[list[int]]]:
-        self.calls.append((query, passage, kwargs))
-        return {"input_ids": [[1] * self.pair_token_count(query, passage)]}
+    @classmethod
+    def pair_token_count(cls, query: str, passage: str) -> int:
+        if query != _INTEGRATION_QUERY:
+            raise AssertionError(f"unexpected pair query: {query!r}")
+        if not passage:
+            return 8
+        return (
+            cls.QUERY_NO_SPECIAL_TOKENS
+            + cls.passage_no_special_token_count(passage)
+            + cls.PAIR_SPECIAL_TOKENS
+        )
+
+    def __call__(self, *texts: str, **kwargs: Any) -> dict[str, object]:
+        self.calls.append((texts, dict(kwargs)))
+        if len(texts) == 1:
+            if kwargs != self.SINGLE_SEQUENCE_KWARGS:
+                raise AssertionError(f"unexpected single-sequence kwargs: {kwargs!r}")
+            (text,) = texts
+            count = (
+                self.QUERY_NO_SPECIAL_TOKENS
+                if text == _INTEGRATION_QUERY
+                else self.passage_no_special_token_count(text)
+            )
+        elif len(texts) == 2:
+            if kwargs not in (self.PAIR_LENGTH_KWARGS, self.PAIR_VALIDATION_KWARGS):
+                raise AssertionError(f"unexpected pair kwargs: {kwargs!r}")
+            query, passage = texts
+            count = self.pair_token_count(query, passage)
+        else:
+            raise AssertionError(f"unexpected tokenizer arity: {len(texts)}")
+        return {"input_ids": list(range(count)), "length": [count]}
+
+    def num_special_tokens_to_add(self, pair: bool = False) -> int:
+        self.special_token_calls.append(pair)
+        if pair is not True:
+            raise AssertionError("only pair special-token counting is expected")
+        return self.PAIR_SPECIAL_TOKENS
 
 
 class FakeCrossEncoder:
@@ -455,6 +507,8 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
 
         self.assertLessEqual(len(selected_text), policy.max_length)
         self.assertEqual(pair_length(selected_text), 513)
+        self.assertEqual(pair_length.passage_length_function(selected_text), 503)
+        self.assertEqual(pair_length.max_passage_length, 502)
         passages = chunker.chunk(
             document_id="dense-cjk",
             canonical_text=selected_text,
@@ -464,7 +518,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             [(passage.start_char, passage.end_char) for passage in passages],
-            [(0, 501), (501, 502)],
+            [(0, 251), (251, 502)],
         )
         self.assertEqual("".join(passage.text for passage in passages), selected_text)
         self.assertTrue(
@@ -476,6 +530,15 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
                 for passage in passages
             )
         )
+        self.assertIn(
+            ((_INTEGRATION_QUERY,), FakeTokenizer.SINGLE_SEQUENCE_KWARGS),
+            tokenizer.calls,
+        )
+        self.assertIn(
+            ((selected_text,), FakeTokenizer.SINGLE_SEQUENCE_KWARGS),
+            tokenizer.calls,
+        )
+        self.assertEqual(tokenizer.special_token_calls, [True])
 
         store = ArtifactStoreFake()
         cache = PassageScoreCache(
@@ -523,7 +586,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
                 (evidence.start_char, evidence.end_char)
                 for evidence in document.passage_evidence
             ],
-            [(0, 501), (501, 502)],
+            [(0, 251), (251, 502)],
         )
         self.assertTrue(
             all(
