@@ -43,9 +43,10 @@ class MemoryArtifactStore:
         self.read_sources.append(source)
         return decoder(payload)
 
-    def write(self, object_key: str, payload: bytes) -> None:
+    def write(self, object_key: str, payload: bytes) -> bool:
         self.objects[object_key] = payload
         self.local[object_key] = payload
+        return True
 
     def evict_local(self, object_key: str) -> None:
         self.local.pop(object_key, None)
