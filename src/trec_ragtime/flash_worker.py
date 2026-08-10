@@ -201,7 +201,7 @@ class FlashPassageWorker:
 
         if loader is not None and not callable(loader):
             raise self._error("loader must be callable")
-        self._loader = loader or self._default_loader
+        self._loader = loader if loader is not None else self._default_loader
         self._load_lock = threading.Lock()
         self._model: object | None = None
         self._tokenizer: object | None = None
@@ -480,9 +480,9 @@ class FlashPassageWorker:
             if self._fingerprint is not None and self._fingerprint != fingerprint:
                 raise self._error("worker scorer fingerprint drift")
             model, tokenizer = self._ensure_loaded(config)
-            scores = self._score_rows(config, query, rows, model, tokenizer)
             self._model_config = config
             self._fingerprint = fingerprint
+            scores = self._score_rows(config, query, rows, model, tokenizer)
             return {
                 "schema_version": self._WIRE_SCHEMA_VERSION,
                 "scorer_fingerprint": fingerprint,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stderr, redirect_stdout
 import inspect
+from io import StringIO
 import math
 import sys
 import unittest
@@ -227,6 +229,17 @@ class FlashWireCodecTests(unittest.TestCase):
 
         self.assertEqual(decode_flash_request(payload)["model_config"]["schema_version"], 2)
 
+    def test_request_with_unpaired_surrogate_raises_flash_scoring_error(self) -> None:
+        config = LocalCrossEncoderConfig()
+
+        with self.assertRaises(FlashScoringError):
+            encode_flash_request(
+                "query",
+                ((sha256_bytes("text"), chr(0xD800)),),
+                model_config=_wire_model_config(config),
+                scorer_fingerprint=config.fingerprint,
+            )
+
 
 class RunpodFlashConfigTests(unittest.TestCase):
     def test_transport_settings_do_not_change_model_fingerprint(self) -> None:
@@ -264,6 +277,41 @@ class RunpodFlashConfigTests(unittest.TestCase):
 
 
 class RunpodFlashPassageScorerTests(unittest.TestCase):
+    def test_adapter_and_worker_failures_do_not_emit_sensitive_literals(self) -> None:
+        query = "query-sensitive-7f"
+        text = "passage-sensitive-8g"
+        content_hash = sha256_bytes(text).hex()
+        credential = "Bearer credential-sensitive-9h"
+        config = LocalCrossEncoderConfig()
+
+        class FailingRunner:
+            async def run_batch(self, payload: bytes) -> bytes:
+                raise RuntimeError(f"{query} {text} {content_hash} {credential}")
+
+        def failing_loader(model_config: object) -> object:
+            raise RuntimeError(f"{query} {text} {content_hash} {credential}")
+
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            scorer = RunpodFlashPassageScorer(
+                RunpodFlashConfig(endpoint_id="fake", model_config=config),
+                FailingRunner(),
+            )
+            try:
+                with self.assertRaises(FlashScoringError):
+                    scorer.score(query, (_passage(text),))
+            finally:
+                scorer.close()
+
+            worker = build_flash_worker(config)(loader=failing_loader)
+            with self.assertRaises(FlashScoringError):
+                worker.score(_request_for_config(config, query=query, text=text))
+
+        output = stdout.getvalue() + stderr.getvalue()
+        for sensitive in (query, text, content_hash, credential):
+            self.assertNotIn(sensitive, output)
+
     def test_batches_by_count_and_returns_exact_unique_hash_coverage(self) -> None:
         passages = (
             _passage("first", document_id="first"),
@@ -488,6 +536,60 @@ class StaticFlashWorkerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             worker.score(_request_for_config(drifted))
         self.assertEqual(len(loader.calls), 1)
+
+    def test_falsey_callable_loader_is_used(self) -> None:
+        policy = LocalCrossEncoderConfig()
+        model = FakeModel()
+        tokenizer = BatchEncodingTokenizer()
+
+        class FalseyLoader:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __bool__(self) -> bool:
+                return False
+
+            def __call__(self, config: object) -> tuple[FakeModel, BatchEncodingTokenizer]:
+                self.calls += 1
+                return model, tokenizer
+
+        loader = FalseyLoader()
+        default_model = FakeModel(multiplier=3.0)
+        default_tokenizer = BatchEncodingTokenizer()
+        with patch.object(
+            FlashPassageWorker,
+            "_default_loader",
+            return_value=(default_model, default_tokenizer),
+        ):
+            worker = build_flash_worker(policy)(loader=loader)
+            worker.score(_request_for_config(policy))
+
+        self.assertEqual(loader.calls, 1)
+        self.assertEqual(default_model.predict_calls, [])
+
+    def test_failed_prediction_binds_first_fingerprint_before_later_request(self) -> None:
+        policy_a = LocalCrossEncoderConfig(query_policy="policy-a")
+        policy_b = replace(policy_a, query_policy="policy-b")
+        tokenizer = BatchEncodingTokenizer()
+
+        class FailingModel(FakeModel):
+            def predict(
+                self, pairs: list[tuple[str, str]], **kwargs: object
+            ) -> list[float]:
+                self.predict_calls.append((pairs, kwargs))
+                raise RuntimeError("prediction failed")
+
+        model = FailingModel()
+        loader = CountingLoader(model, tokenizer)
+        worker = build_flash_worker(policy_a)(loader=loader)
+
+        with self.assertRaises(FlashScoringError):
+            worker.score(_request_for_config(policy_a))
+        with self.assertRaises(FlashScoringError):
+            worker.score(_request_for_config(policy_b))
+
+        self.assertEqual(len(loader.calls), 1)
+        self.assertEqual(len(model.predict_calls), 1)
 
     def test_worker_validates_exact_request_model_config_and_pair_ceiling(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=10)

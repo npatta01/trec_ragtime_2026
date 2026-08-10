@@ -250,7 +250,11 @@ def _request_rows(rows: object) -> list[dict[str, str]]:
         hash_hex = _hash_text_value(raw_hash)
         if not isinstance(text, str) or not text:
             raise FlashScoringError("request row text must be a non-empty string")
-        if bytes.fromhex(hash_hex) != sha256_bytes(text):
+        try:
+            expected_hash = sha256_bytes(text)
+        except UnicodeError as error:
+            raise FlashScoringError("request row text must be valid UTF-8") from error
+        if bytes.fromhex(hash_hex) != expected_hash:
             raise FlashScoringError("request hash does not match request text")
         if hash_hex in seen:
             raise FlashScoringError("request rows must have unique hashes")
