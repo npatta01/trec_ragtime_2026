@@ -62,7 +62,11 @@ parameters are passed to the live call but excluded from the response identity.
 API keys, authorization headers, bearer tokens, and other credential fields
 must never enter the identity, artifact payload, warning, or exception text.
 The existing recursive credential-field rejection remains active for request
-and response payloads.
+and response payloads. Extend it only with an exact allowlist for the OpenAI
+SDK's numeric usage-counter fields (`prompt_tokens`, `completion_tokens`,
+`total_tokens`, `cached_tokens`, `audio_tokens`, `reasoning_tokens`,
+`accepted_prediction_tokens`, and `rejected_prediction_tokens`). Do not allow
+arbitrary `*_token` or `*_tokens` names.
 
 Responses have no TTL. Manual `refresh=True` skips the read, performs one live
 call, and replaces the same exact entry after successful validation.
@@ -128,6 +132,8 @@ temporary artifact-store test seams. They prove:
 - malformed cached responses become safe misses;
 - artifact read/write failures preserve the valid live-call path;
 - request or response credential fields are rejected without leaking values;
+- known numeric OpenAI usage counters remain cacheable while unrecognized
+  token-bearing fields remain rejected;
 - API keys and authorization headers do not appear in object keys or stored
   payloads;
 - an L1 cache hit makes zero provider and zero HF network calls.
