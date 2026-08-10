@@ -10,7 +10,6 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-import spacy
 from langchain_text_splitters.character import (
     CharacterTextSplitter,
     RecursiveCharacterTextSplitter,
@@ -35,8 +34,11 @@ PACKAGE_NAMES = (
 )
 
 
-def char_length(text: str) -> int:
-    return len(text)
+class PairAwareCjkLength:
+    fingerprint = "benchmark-fake-cross-encoder-pair-v1"
+
+    def __call__(self, text: str) -> int:
+        return len(text) + 8
 
 
 def package_versions() -> dict[str, str]:
@@ -49,14 +51,15 @@ def package_versions() -> dict[str, str]:
 def required_model_versions(cases: list[dict[str, Any]]) -> dict[str, str]:
     versions: dict[str, str] = {}
     for pipeline_name in sorted({case["pipeline_name"] for case in cases}):
+        distribution_name = pipeline_name.replace("_", "-")
         try:
-            nlp = spacy.load(pipeline_name)
-        except (OSError, ImportError, ValueError) as error:
+            version = importlib.metadata.version(distribution_name)
+        except importlib.metadata.PackageNotFoundError as error:
             raise RuntimeError(
-                f"required spaCy model {pipeline_name!r} is unavailable; "
+                f"required spaCy model distribution {distribution_name!r} is unavailable; "
                 "install the locked project dependencies before benchmarking"
             ) from error
-        versions[pipeline_name] = str(nlp.meta.get("version", "unknown"))
+        versions[pipeline_name] = str(version)
     return versions
 
 
@@ -80,6 +83,10 @@ def _splitter_documents(splitter: Any, parent_text: str, stage: str) -> list[Any
 
 
 def verify_splitter_levels(case: dict[str, Any]) -> None:
+    if case.get("length_function_mode") != "boundary-only":
+        raise AssertionError(
+            f"{case['name']}: fixtures must explicitly declare boundary-only length"
+        )
     selected_text = case["selected_text"]
     chunk_size = case["chunk_size"]
     paragraph_splitter = CharacterTextSplitter(
@@ -90,7 +97,7 @@ def verify_splitter_levels(case: dict[str, Any]) -> None:
         chunk_overlap=0,
         add_start_index=True,
         chunk_size=chunk_size,
-        length_function=char_length,
+        length_function=len,
     )
     paragraph_documents = _splitter_documents(
         paragraph_splitter, selected_text, "paragraph"
@@ -102,10 +109,10 @@ def verify_splitter_levels(case: dict[str, Any]) -> None:
         chunk_overlap=0,
         add_start_index=True,
         chunk_size=chunk_size,
-        length_function=char_length,
+        length_function=len,
     )
     for paragraph in paragraph_documents:
-        if char_length(paragraph.page_content) <= chunk_size:
+        if len(paragraph.page_content) <= chunk_size:
             continue
         sentence_documents = _splitter_documents(
             sentence_splitter, paragraph.page_content, "sentence"
@@ -117,10 +124,10 @@ def verify_splitter_levels(case: dict[str, Any]) -> None:
             chunk_overlap=0,
             add_start_index=True,
             chunk_size=chunk_size,
-            length_function=char_length,
+            length_function=len,
         )
         for sentence in sentence_documents:
-            if char_length(sentence.page_content) > chunk_size:
+            if len(sentence.page_content) > chunk_size:
                 _splitter_documents(
                     recursive_splitter, sentence.page_content, "recursive sentence"
                 )
@@ -165,8 +172,7 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
             LangChainPassageChunker(
                 ChunkerConfig(
                     chunk_size=case["chunk_size"],
-                    length_function=char_length,
-                    length_function_fingerprint=case["length_function_fingerprint"],
+                    length_function=len,
                     pipeline_name=case["pipeline_name"],
                 )
             ),
@@ -184,7 +190,7 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
             tuple(span) for span in case["expected_spans"]
         ]:
             raise AssertionError(f"{case['name']}: literal fixture span mismatch")
-        if any(char_length(p.text) > case["chunk_size"] for p in passages):
+        if any(len(p.text) > case["chunk_size"] for p in passages):
             raise AssertionError(f"{case['name']}: configured ceiling exceeded")
         records.append(
             json.dumps(
@@ -201,6 +207,36 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
     return records, passage_count, time.perf_counter() - started
 
 
+def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
+    text = "第一二三四五六七八九十。"
+    length_function = PairAwareCjkLength()
+    chunk_size = 16
+    if len(text) > chunk_size or length_function(text) <= chunk_size:
+        raise AssertionError("pair-aware fixture must fit by characters but exceed by pairs")
+    chunker = LangChainPassageChunker(
+        ChunkerConfig(
+            chunk_size=chunk_size,
+            length_function=length_function,
+            pipeline_name="zh_core_web_sm",
+        )
+    )
+    passages = chunker.chunk(
+        document_id="benchmark-pair-aware-cjk",
+        canonical_text=text,
+        selected_text=text,
+        representation="canonical",
+        language="zho",
+    )
+    validate_passages(text, passages)
+    if not all(length_function(passage.text) <= chunk_size for passage in passages):
+        raise AssertionError("pair-aware fixture exceeded its configured ceiling")
+    if not all(
+        passage.boundary == "oversized_sentence_fallback" for passage in passages
+    ):
+        raise AssertionError("pair-aware fixture did not use sentence fallback")
+    return tuple((passage.start_char, passage.end_char, passage.text) for passage in passages)
+
+
 def main() -> int:
     cases = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["cases"]
     startup_started = time.perf_counter()
@@ -210,10 +246,15 @@ def main() -> int:
     second_records, second_passages, second_seconds = run_once(cases)
     if first_records != second_records or first_passages != second_passages:
         raise AssertionError("two benchmark runs produced different passage records")
+    first_pair_record = verify_pair_aware_case()
+    second_pair_record = verify_pair_aware_case()
+    if first_pair_record != second_pair_record:
+        raise AssertionError("pair-aware benchmark runs produced different passage records")
 
     print("package_versions=" + json.dumps(package_versions(), sort_keys=True))
     print("spacy_model_versions=" + json.dumps(models, sort_keys=True))
     print(f"fixture_cases={len(cases)}")
+    print("fixture_length_function=explicit builtin len (boundary-only; not model-safe)")
     print(f"passes={len(cases) * 2}")
     print("failures=0")
     print(f"startup_seconds={startup_seconds:.6f}")
@@ -222,6 +263,8 @@ def main() -> int:
     print(f"documents_per_second={len(cases) / first_seconds:.3f}")
     print(f"passages={first_passages}")
     print(f"passages_per_second={first_passages / first_seconds:.3f}")
+    print("pair_aware_fake_ceiling=true")
+    print(f"pair_aware_passages={len(first_pair_record)}")
     print("deterministic_records=true")
     return 0
 

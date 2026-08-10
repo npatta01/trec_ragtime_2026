@@ -9,7 +9,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 68]
       ]
@@ -23,7 +23,7 @@
       "language": "spa",
       "pipeline_name": "es_core_news_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 33]
       ]
@@ -37,7 +37,7 @@
       "language": "rus",
       "pipeline_name": "ru_core_news_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 39]
       ]
@@ -51,7 +51,7 @@
       "language": "zho",
       "pipeline_name": "zh_core_web_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 10]
       ]
@@ -65,7 +65,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 42]
       ]
@@ -79,7 +79,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 37]
       ]
@@ -93,7 +93,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 23]
       ]
@@ -107,7 +107,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 1000,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 6]
       ]
@@ -121,7 +121,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 16,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 14],
         [14, 28],
@@ -138,7 +138,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 37,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 37],
         [37, 53]
@@ -153,7 +153,7 @@
       "language": "eng",
       "pipeline_name": "en_core_web_sm",
       "chunk_size": 51,
-      "length_function_fingerprint": "chars-v1",
+      "length_function_mode": "boundary-only",
       "expected_spans": [
         [0, 51],
         [51, 72]

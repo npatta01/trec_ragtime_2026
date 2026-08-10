@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import re
 import warnings
 from dataclasses import dataclass, field, replace
@@ -27,6 +28,8 @@ _PIPELINES_BY_LANGUAGE: Mapping[str, str] = {
     "zho": "zh_core_web_sm",
 }
 _DEFAULT_LENGTH_FUNCTION_FINGERPRINT = "builtin:len"
+_LANGCHAIN_SPLITTERS_DISTRIBUTION = "langchain-text-splitters"
+_SPACY_DISTRIBUTION = "spacy"
 _PINNED_PIPELINE_MAPPING_ID = ";".join(
     f"{language}={pipeline}" for language, pipeline in _PIPELINES_BY_LANGUAGE.items()
 )
@@ -259,21 +262,67 @@ def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
         raise PassageValidationError("passages do not fully reconstruct selected_text")
 
 
+def _pipeline_distribution_name(pipeline_name: str) -> str:
+    return pipeline_name.replace("_", "-")
+
+
+def _required_distribution_names(pipeline_name: str | None) -> tuple[str, ...]:
+    selected_pipelines = (
+        (pipeline_name,)
+        if pipeline_name is not None
+        else tuple(_PIPELINES_BY_LANGUAGE.values())
+    )
+    return (
+        _LANGCHAIN_SPLITTERS_DISTRIBUTION,
+        _SPACY_DISTRIBUTION,
+        *tuple(_pipeline_distribution_name(name) for name in selected_pipelines),
+    )
+
+
+def _runtime_distribution_versions(pipeline_name: str | None) -> tuple[str, ...]:
+    versions: list[str] = []
+    for distribution_name in _required_distribution_names(pipeline_name):
+        try:
+            version = importlib.metadata.version(distribution_name)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise PassageValidationError(
+                f"required runtime distribution {distribution_name!r} is unavailable; "
+                "cannot create a safe passage chunker fingerprint"
+            ) from error
+        if not isinstance(version, str) or not version.strip():
+            raise PassageValidationError(
+                f"required runtime distribution {distribution_name!r} has no stable version"
+            )
+        versions.append(f"{distribution_name}={version}")
+    return tuple(versions)
+
+
 def _default_fingerprint(config: "ChunkerConfig") -> str:
     material = "|".join(
         (
-            "passages-v1",
+            "passages-v2",
             f"chunk_size={config.chunk_size}",
             f"length_function={config.resolved_length_function_fingerprint}",
             f"pipeline={config.pipeline_name or 'language-map'}",
             f"pinned_mapping={_PINNED_PIPELINE_MAPPING_ID}",
+            f"runtime_distributions={';'.join(_runtime_distribution_versions(config.pipeline_name))}",
             f"max_length={config.max_length}",
             f"chunk_overlap={config.chunk_overlap}",
             f"overlap_chars={config.overlap_chars}",
             f"overlap_tokens={config.overlap_tokens}",
         )
     )
-    return "langchain-spacy-v1/" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return "langchain-spacy-v2/" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _compose_fingerprint(base: str, caller_fingerprint: str | None) -> str:
+    if caller_fingerprint is None:
+        return base
+    composed = f"{base}/caller/{caller_fingerprint}"
+    if len(composed) > 256:
+        composed = f"{base}/caller/{hashlib.sha256(caller_fingerprint.encode('utf-8')).hexdigest()}"
+    _validate_fingerprint(composed)
+    return composed
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +330,7 @@ class ChunkerConfig:
     """Immutable chunking settings shared by all maintained splitter stages."""
 
     chunk_size: int = 512
-    length_function: Callable[[str], int] = len
+    length_function: Callable[[str], int] | None = None
     length_function_fingerprint: str | None = None
     pipeline_name: str | None = None
     fingerprint: str | None = None
@@ -297,20 +346,34 @@ class ChunkerConfig:
             raise PassageValidationError("chunk_size must be an integer")
         if self.chunk_size <= 0:
             raise PassageValidationError("chunk_size must be positive")
+        if self.length_function is None:
+            raise PassageValidationError(
+                "length_function is required; pass len explicitly for boundary-only chunking"
+            )
         if not callable(self.length_function):
             raise PassageValidationError("length_function must be callable")
         if self.length_function_fingerprint is not None:
             _validate_fingerprint(self.length_function_fingerprint)
-        elif self.length_function is len:
-            object.__setattr__(
-                self,
-                "_resolved_length_function_fingerprint",
-                _DEFAULT_LENGTH_FUNCTION_FINGERPRINT,
-            )
         else:
-            raise PassageValidationError(
-                "custom length_function requires length_function_fingerprint"
-            )
+            callable_fingerprint = getattr(self.length_function, "fingerprint", None)
+            if isinstance(callable_fingerprint, str) and callable_fingerprint.strip():
+                _validate_fingerprint(callable_fingerprint)
+                object.__setattr__(
+                    self,
+                    "_resolved_length_function_fingerprint",
+                    callable_fingerprint,
+                )
+            elif self.length_function is len:
+                object.__setattr__(
+                    self,
+                    "_resolved_length_function_fingerprint",
+                    _DEFAULT_LENGTH_FUNCTION_FINGERPRINT,
+                )
+            else:
+                raise PassageValidationError(
+                    "custom length_function requires length_function_fingerprint or a "
+                    "stable nonblank .fingerprint"
+                )
         if self.length_function_fingerprint is not None:
             object.__setattr__(
                 self,
@@ -339,7 +402,7 @@ class ChunkerConfig:
         object.__setattr__(
             self,
             "_resolved_fingerprint",
-            self.fingerprint or _default_fingerprint(self),
+            _compose_fingerprint(_default_fingerprint(self), self.fingerprint),
         )
 
     @property
@@ -400,7 +463,7 @@ class LangChainPassageChunker:
         if config is None:
             config = ChunkerConfig(
                 chunk_size=512 if chunk_size is None else chunk_size,
-                length_function=len if length_function is None else length_function,
+                length_function=length_function,
                 length_function_fingerprint=length_function_fingerprint,
                 pipeline_name=pipeline_name,
                 fingerprint=fingerprint,

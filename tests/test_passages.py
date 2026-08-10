@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import subprocess
 import sys
@@ -33,6 +34,39 @@ def char_length(text: str) -> int:
     return len(text)
 
 
+class FingerprintedLength:
+    fingerprint = "fake-pair-v1"
+
+    def __call__(self, text: str) -> int:
+        return len(text)
+
+
+class PairAwareCjkLength:
+    fingerprint = "fake-cross-encoder-pair-v1"
+
+    def __call__(self, text: str) -> int:
+        return len(text) + 8
+
+
+RUNTIME_DISTRIBUTION_VERSIONS = {
+    "langchain-text-splitters": "1.1.2",
+    "spacy": "3.8.15",
+    "en-core-web-sm": "3.8.0",
+    "es-core-news-sm": "3.8.0",
+    "ru-core-news-sm": "3.8.0",
+    "zh-core-web-sm": "3.8.0",
+}
+
+
+def fake_distribution_version(overrides: dict[str, str] | None = None):
+    versions = {**RUNTIME_DISTRIBUTION_VERSIONS, **(overrides or {})}
+
+    def version(name: str) -> str:
+        return versions[name]
+
+    return version
+
+
 class PassageValidationTests(unittest.TestCase):
     def test_importing_passages_does_not_eagerly_import_scorer_stack(self) -> None:
         code = """
@@ -52,6 +86,25 @@ assert 'transformers' not in sys.modules
     def test_zero_chunk_size_reaches_strict_config_validation(self) -> None:
         with self.assertRaises(PassageValidationError):
             LangChainPassageChunker(chunk_size=0)
+
+    def test_chunker_requires_an_explicit_length_function(self) -> None:
+        with self.assertRaisesRegex(PassageValidationError, "length_function is required"):
+            ChunkerConfig()
+        with self.assertRaisesRegex(PassageValidationError, "length_function is required"):
+            LangChainPassageChunker()
+
+    def test_explicit_builtin_len_is_allowed_for_boundary_chunking(self) -> None:
+        config = ChunkerConfig(length_function=len)
+
+        self.assertEqual(config.resolved_length_function_fingerprint, "builtin:len")
+
+    def test_callable_fingerprint_is_used_when_explicit_identity_is_omitted(self) -> None:
+        config = ChunkerConfig(length_function=FingerprintedLength())
+
+        self.assertEqual(
+            config.resolved_length_function_fingerprint,
+            "fake-pair-v1",
+        )
 
     def test_custom_length_function_requires_a_stable_identity(self) -> None:
         with self.assertRaises(PassageValidationError):
@@ -82,6 +135,64 @@ assert 'transformers' not in sys.modules
             base.resolved_fingerprint,
             replace(base, length_function_fingerprint="chars-v2").resolved_fingerprint,
         )
+
+    def test_chunker_fingerprint_composes_caller_namespace_with_runtime_identity(self) -> None:
+        base = ChunkerConfig(length_function=len)
+        namespaced = ChunkerConfig(length_function=len, fingerprint="caller-v1")
+
+        self.assertNotEqual(base.resolved_fingerprint, namespaced.resolved_fingerprint)
+        self.assertIn(base.resolved_fingerprint, namespaced.resolved_fingerprint)
+        self.assertIn("caller-v1", namespaced.resolved_fingerprint)
+        self.assertNotEqual(
+            namespaced.resolved_fingerprint,
+            replace(namespaced, chunk_size=namespaced.chunk_size + 1).resolved_fingerprint,
+        )
+
+    def test_chunker_fingerprint_rotates_for_every_selected_runtime_distribution(self) -> None:
+        distributions = tuple(RUNTIME_DISTRIBUTION_VERSIONS)
+        with patch.object(
+            importlib.metadata,
+            "version",
+            side_effect=fake_distribution_version(),
+        ):
+            baseline = ChunkerConfig(length_function=len)
+
+        for distribution in distributions:
+            with self.subTest(distribution=distribution):
+                with patch.object(
+                    importlib.metadata,
+                    "version",
+                    side_effect=fake_distribution_version(
+                        {distribution: f"{RUNTIME_DISTRIBUTION_VERSIONS[distribution]}+changed"}
+                    ),
+                ):
+                    changed = ChunkerConfig(length_function=len)
+                self.assertNotEqual(baseline.resolved_fingerprint, changed.resolved_fingerprint)
+
+    def test_custom_pipeline_identity_uses_its_distribution_version(self) -> None:
+        calls: list[str] = []
+
+        def version(name: str) -> str:
+            calls.append(name)
+            return "test-version"
+
+        with patch.object(importlib.metadata, "version", side_effect=version):
+            ChunkerConfig(length_function=len, pipeline_name="custom_pipeline")
+
+        self.assertEqual(
+            calls,
+            ["langchain-text-splitters", "spacy", "custom-pipeline"],
+        )
+
+    def test_missing_runtime_distribution_identity_fails_during_config_creation(self) -> None:
+        def missing_spacy(name: str) -> str:
+            if name == "spacy":
+                raise importlib.metadata.PackageNotFoundError(name)
+            return RUNTIME_DISTRIBUTION_VERSIONS[name]
+
+        with patch.object(importlib.metadata, "version", side_effect=missing_spacy):
+            with self.assertRaisesRegex(PassageValidationError, "spacy"):
+                ChunkerConfig(length_function=len, fingerprint="caller-v1")
 
     def test_validate_passages_rejects_whitespace_stripping_at_reconstruction(self) -> None:
         selected_text, passages = _packed_passages()
@@ -207,8 +318,7 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                 chunker = LangChainPassageChunker(
                     ChunkerConfig(
                         chunk_size=case["chunk_size"],
-                        length_function=char_length,
-                        length_function_fingerprint=case["length_function_fingerprint"],
+                        length_function=len,
                         pipeline_name=case["pipeline_name"],
                     )
                 )
@@ -255,8 +365,7 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                 chunker = LangChainPassageChunker(
                     ChunkerConfig(
                         chunk_size=case["chunk_size"],
-                        length_function=char_length,
-                        length_function_fingerprint=case["length_function_fingerprint"],
+                        length_function=len,
                         pipeline_name=case["pipeline_name"],
                     )
                 )
@@ -403,6 +512,33 @@ class LangChainPassageChunkerTests(unittest.TestCase):
                 representation="canonical",
                 language="eng",
             )
+
+    def test_pair_aware_cjk_length_forces_sentence_fallback_under_its_ceiling(self) -> None:
+        text = "第一二三四五六七八九十。"
+        length_function = PairAwareCjkLength()
+        self.assertLessEqual(len(text), 16)
+        self.assertGreater(length_function(text), 16)
+        chunker = LangChainPassageChunker(
+            ChunkerConfig(chunk_size=16, length_function=length_function)
+        )
+
+        passages = chunker.chunk(
+            document_id="doc-pair-aware-cjk",
+            canonical_text=text,
+            selected_text=text,
+            representation="canonical",
+            language="zho",
+        )
+
+        self.assertTrue(passages)
+        self.assertTrue(
+            all(length_function(passage.text) <= 16 for passage in passages)
+        )
+        self.assertTrue(
+            all(passage.boundary == "oversized_sentence_fallback" for passage in passages)
+        )
+        self.assertEqual("".join(passage.text for passage in passages), text)
+        validate_passages(text, passages)
 
     def test_passage_ids_are_stable_across_subprocesses(self) -> None:
         text = "Stable sentence."
