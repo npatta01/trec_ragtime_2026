@@ -232,13 +232,13 @@ public [Hugging Face corpus](https://huggingface.co/datasets/trec-ragtime/ragtim
 from trec_ragtime import RagtimeRetriever
 
 with RagtimeRetriever.from_env() as retriever:
-    result = retriever.retrieve(
+    retrieval = retriever.retrieve(
         "health benefits of Nordic walking",
         pipeline="ragtime2%100",
         top_k=None,
     )
 
-for document in result.documents:
+for document in retrieval.documents:
     print(
         document.rank,
         document.document_id,
