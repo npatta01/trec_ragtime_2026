@@ -5,13 +5,13 @@ import contextlib
 import gc
 import inspect
 import io
-import json
 import logging
 import linecache
 import math
 import pickle
 import sys
 import textwrap
+import time
 import threading
 import types
 import unittest
@@ -217,6 +217,57 @@ class FlashWireCodecTests(unittest.TestCase):
 
 
 class RunpodFlashConfigTests(unittest.TestCase):
+    def test_effective_policy_carries_full_local_identity_and_normalizes_aliases(self) -> None:
+        policy = LocalCrossEncoderConfig()
+        config = RunpodFlashConfig(
+            endpoint_id="endpoint-a",
+            model_config=policy,
+            tokenizer_name="custom/tokenizer",
+            tokenizer_revision="tokenizer-revision",
+            sentence_transformers_version=policy.sentence_transformers_version,
+            transformers_version=policy.transformers_version,
+            tokenizers_version=policy.tokenizers_version,
+            torch_version=policy.torch_version,
+            device="rocm",
+            precision="fp32",
+        )
+
+        effective = config.effective_model_config
+
+        self.assertEqual(effective.tokenizer_name, "custom/tokenizer")
+        self.assertEqual(effective.tokenizer_revision, "tokenizer-revision")
+        self.assertEqual(effective.sentence_transformers_version, policy.sentence_transformers_version)
+        self.assertEqual(effective.transformers_version, policy.transformers_version)
+        self.assertEqual(effective.tokenizers_version, policy.tokenizers_version)
+        self.assertEqual(effective.torch_version, policy.torch_version)
+        self.assertEqual(effective.effective_device, "cuda")
+        self.assertEqual(effective.effective_precision, "float32")
+
+        equivalent = replace(config, device="cuda", precision="float32")
+        self.assertEqual(config.fingerprint, equivalent.fingerprint)
+
+    def test_worker_name_and_gpu_are_validated_but_transport_only(self) -> None:
+        base = RunpodFlashConfig(
+            endpoint_id="endpoint-a",
+            worker_name="passage-worker",
+            gpu="ADA_24",
+            workers=2,
+            idle_timeout=90.0,
+        )
+        transport_variant = replace(
+            base,
+            endpoint_id="endpoint-b",
+            worker_name="other-worker",
+            gpu="AMPERE_48",
+            workers=5,
+            idle_timeout=300.0,
+        )
+
+        self.assertEqual(base.fingerprint, transport_variant.fingerprint)
+        for field_name in ("worker_name", "gpu"):
+            with self.subTest(field_name=field_name), self.assertRaises(ValueError):
+                RunpodFlashConfig(endpoint_id="endpoint-a", **{field_name: "bad\nvalue"})
+
     def test_result_fingerprint_excludes_transport_only_settings(self) -> None:
         policy = LocalCrossEncoderConfig(
             batch_size=2,
@@ -450,6 +501,59 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             with self.assertRaises(FlashScoringError):
                 _EventLoopBridge()
 
+        self.assertEqual(
+            existing_loop_threads,
+            {
+                thread.ident
+                for thread in threading.enumerate()
+                if thread.name == "trec-ragtime-flash-loop" and thread.is_alive()
+            },
+        )
+
+    def test_bridge_startup_timeout_stops_a_late_created_loop_within_a_bound(self) -> None:
+        existing_loop_threads = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "trec-ragtime-flash-loop" and thread.is_alive()
+        }
+        loop_created = threading.Event()
+        created_loop: list[asyncio.AbstractEventLoop] = []
+        constructor_errors: list[BaseException] = []
+        original_new_event_loop = asyncio.new_event_loop
+
+        def delayed_new_event_loop() -> asyncio.AbstractEventLoop:
+            time.sleep(0.05)
+            loop = original_new_event_loop()
+            created_loop.append(loop)
+            loop_created.set()
+            return loop
+
+        def construct() -> None:
+            try:
+                _EventLoopBridge(startup_timeout=0.001)
+            except BaseException as error:
+                constructor_errors.append(error)
+
+        constructor_thread = threading.Thread(target=construct)
+        with patch(
+            "trec_ragtime.flash_passage_scorer.asyncio.new_event_loop",
+            side_effect=delayed_new_event_loop,
+        ):
+            constructor_thread.start()
+            self.assertTrue(loop_created.wait(0.5))
+            try:
+                constructor_thread.join(0.5)
+                self.assertFalse(
+                    constructor_thread.is_alive(),
+                    "startup timeout left the bridge constructor blocked",
+                )
+            finally:
+                if created_loop and not created_loop[0].is_closed():
+                    created_loop[0].call_soon_threadsafe(created_loop[0].stop)
+                constructor_thread.join(1.0)
+
+        self.assertEqual(len(constructor_errors), 1)
+        self.assertIsInstance(constructor_errors[0], FlashScoringError)
         self.assertEqual(
             existing_loop_threads,
             {
@@ -834,6 +938,120 @@ class EndpointRunnerTests(unittest.TestCase):
 
 
 class FlashWorkerTests(unittest.TestCase):
+    def test_endpoint_style_decorator_receives_resolved_provisioning_policy_without_calling_it(self) -> None:
+        policy = LocalCrossEncoderConfig(query_policy="endpoint-style-decorator")
+        config = RunpodFlashConfig(
+            endpoint_id="endpoint-id",
+            model_config=policy,
+            worker_name="passage-worker",
+            gpu="ADA_24",
+            workers=3,
+            idle_timeout=77.0,
+        )
+        endpoint_calls: list[dict[str, object]] = []
+        deployment_calls: list[str] = []
+
+        def endpoint_factory(**kwargs: object) -> Callable[[type[Any]], type[Any]]:
+            endpoint_calls.append(kwargs)
+
+            def decorate(worker_class: type[Any]) -> type[Any]:
+                deployment_calls.append("decorate")
+                return worker_class
+
+            return decorate
+
+        Worker = build_flash_worker(
+            config,
+            endpoint_factory=endpoint_factory,
+            gpu_resolver=lambda gpu: f"resolved:{gpu}",
+        )
+
+        self.assertEqual(
+            endpoint_calls,
+            [
+                {
+                    "name": "passage-worker",
+                    "gpu": "resolved:ADA_24",
+                    "workers": 3,
+                    "idle_timeout": 77.0,
+                    "dependencies": [
+                        f"sentence-transformers=={policy.sentence_transformers_version}",
+                        f"transformers=={policy.transformers_version}",
+                        f"tokenizers=={policy.tokenizers_version}",
+                        f"torch=={policy.torch_version}",
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(deployment_calls, ["decorate"])
+        self.assertEqual(Worker.__name__, "FlashPassageWorker")
+
+    def test_raw_worker_build_does_not_resolve_gpu_or_provision(self) -> None:
+        config = RunpodFlashConfig(endpoint_id="endpoint-id", gpu="AMPERE_24")
+        resolver_calls: list[str] = []
+
+        Worker = build_flash_worker(
+            config,
+            gpu_resolver=lambda gpu: resolver_calls.append(gpu) or "resolved",
+        )
+
+        self.assertEqual(resolver_calls, [])
+        self.assertEqual(Worker.__name__, "FlashPassageWorker")
+
+    def test_worker_source_is_stable_for_normalized_runtime_aliases_and_pins_tokenizer(self) -> None:
+        base = LocalCrossEncoderConfig(
+            tokenizer_name="custom/tokenizer",
+            tokenizer_revision="tokenizer-revision",
+            device="cuda",
+            precision="float32",
+            query_policy="normalized-worker-source",
+        )
+        rocm = replace(base, device="rocm", precision="fp32")
+
+        first = build_flash_worker(rocm)
+        second = build_flash_worker(base)
+        source = inspect.getsource(first)
+
+        self.assertIs(first, second)
+        self.assertIn('"tokenizer_name":"custom/tokenizer"', source)
+        self.assertIn('"tokenizer_revision":"tokenizer-revision"', source)
+        self.assertIn(f'"transformers_version":"{base.transformers_version}"', source)
+        self.assertIn(f'"tokenizers_version":"{base.tokenizers_version}"', source)
+        self.assertIn(f'"torch_version":"{base.torch_version}"', source)
+        self.assertIn('"device":"cuda"', source)
+        self.assertIn('"precision":"float32"', source)
+        self.assertNotIn('"device":"rocm"', source)
+        self.assertNotIn('"precision":"fp32"', source)
+
+    def test_worker_rejects_patched_runtime_metadata_before_loader_or_reporting_client_fingerprint(self) -> None:
+        policy = LocalCrossEncoderConfig(query_policy="worker-runtime-drift")
+        Worker = build_flash_worker(policy)
+        loader_calls: list[LocalCrossEncoderConfig] = []
+
+        def version_for(distribution: str) -> str:
+            versions = {
+                "sentence-transformers": policy.sentence_transformers_version,
+                "transformers": policy.transformers_version,
+                "tokenizers": policy.tokenizers_version,
+                "torch": f"drifted-{policy.torch_version}",
+            }
+            return versions[distribution]
+
+        with patch(
+            "trec_ragtime.passage_scoring.importlib.metadata.version",
+            side_effect=version_for,
+        ):
+            with self.assertRaisesRegex(ValueError, "torch_version"):
+                Worker(
+                    loader=lambda config: loader_calls.append(config)
+                    or (
+                        types.SimpleNamespace(predict=lambda *args, **kwargs: [1.0]),
+                        lambda *args, **kwargs: {"input_ids": [[1, 2]]},
+                    )
+                )
+
+        self.assertEqual(loader_calls, [])
+
     def test_generated_worker_has_one_public_kwargs_endpoint_and_fake_decorator_executes_it(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=100, query_format="Q: {query}")
         captured: dict[str, Any] = {}

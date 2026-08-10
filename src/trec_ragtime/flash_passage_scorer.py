@@ -28,6 +28,9 @@ DEFAULT_FLASH_CONCURRENCY = 4
 DEFAULT_FLASH_REQUEST_TIMEOUT = 60.0
 DEFAULT_FLASH_IDLE_TIMEOUT = 300.0
 _BRIDGE_CLEANUP_GRACE_SECONDS = 0.5
+_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS = 0.5
+DEFAULT_FLASH_WORKER_NAME = "trec-ragtime-passage-scorer"
+DEFAULT_FLASH_GPU = "AMPERE_24"
 
 
 class FlashScoringError(PassageScoringError):
@@ -258,7 +261,12 @@ def _effective_model_config(config: "RunpodFlashConfig") -> LocalCrossEncoderCon
     for field_name in (
         "model_name",
         "revision",
+        "tokenizer_name",
+        "tokenizer_revision",
         "sentence_transformers_version",
+        "transformers_version",
+        "tokenizers_version",
+        "torch_version",
         "device",
         "precision",
         "max_length",
@@ -287,9 +295,16 @@ class RunpodFlashConfig:
     request_timeout: float = DEFAULT_FLASH_REQUEST_TIMEOUT
     workers: int = 1
     idle_timeout: float = DEFAULT_FLASH_IDLE_TIMEOUT
+    worker_name: str = DEFAULT_FLASH_WORKER_NAME
+    gpu: str = DEFAULT_FLASH_GPU
     model_name: str | None = None
     revision: str | None = None
+    tokenizer_name: str | None = None
+    tokenizer_revision: str | None = None
     sentence_transformers_version: str | None = None
+    transformers_version: str | None = None
+    tokenizers_version: str | None = None
+    torch_version: str | None = None
     device: str | None = None
     precision: str | None = None
     max_length: int | None = None
@@ -321,16 +336,27 @@ class RunpodFlashConfig:
             if not math.isfinite(float(value)) or float(value) <= 0:
                 raise ValueError(f"{field_name} must be a positive finite number")
         for field_name in (
+            "worker_name",
+            "gpu",
             "model_name",
             "revision",
+            "tokenizer_name",
+            "tokenizer_revision",
             "sentence_transformers_version",
+            "transformers_version",
+            "tokenizers_version",
+            "torch_version",
             "device",
             "precision",
             "query_format",
             "query_policy",
         ):
             value = getattr(self, field_name)
-            if value is not None and (not isinstance(value, str) or not value.strip()):
+            if value is not None and (
+                not isinstance(value, str)
+                or not value.strip()
+                or any(character in value for character in "\r\n")
+            ):
                 raise ValueError(f"{field_name} must be a non-blank string when provided")
         if self.max_length is not None and (
             isinstance(self.max_length, bool)
@@ -370,27 +396,41 @@ class _EventLoopBridge:
 
     def __init__(self, *, startup_timeout: float = 5.0) -> None:
         self._ready = threading.Event()
+        self._stop_requested = threading.Event()
+        self._loop_start_lock = threading.Lock()
         self._closed = False
         self._startup_error: BaseException | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread = threading.Thread(
             target=self._run,
             name="trec-ragtime-flash-loop",
-            daemon=False,
+            # A loop blocked inside a broken event-loop factory must not keep
+            # the host process alive after bounded startup cleanup fails.
+            # Normal close still joins this thread deterministically.
+            daemon=True,
         )
         self._thread.start()
         if not self._ready.wait(startup_timeout):
             self._closed = True
-            self._thread.join()
+            self._request_stop()
+            self._thread.join(_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS)
+            if self._thread.is_alive():
+                raise FlashScoringError("Flash event-loop thread did not stop after startup timeout")
             raise FlashScoringError("Flash event-loop thread did not start")
         if self._startup_error is not None:
             error = self._startup_error
             self._closed = True
-            self._thread.join()
+            self._request_stop()
+            self._thread.join(_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS)
+            if self._thread.is_alive():
+                raise FlashScoringError("Flash event-loop thread failed to stop after startup error")
             raise FlashScoringError("Flash event-loop thread failed to start") from error
         if self._loop is None:
             self._closed = True
-            self._thread.join()
+            self._request_stop()
+            self._thread.join(_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS)
+            if self._thread.is_alive():
+                raise FlashScoringError("Flash event-loop thread failed to stop after startup")
             raise FlashScoringError("Flash event-loop thread did not publish a loop")
 
     def _run(self) -> None:
@@ -401,12 +441,29 @@ class _EventLoopBridge:
             self._ready.set()
             return
         asyncio.set_event_loop(loop)
-        self._loop = loop
+        with self._loop_start_lock:
+            self._loop = loop
+            stop_requested = self._stop_requested.is_set()
         self._ready.set()
+        if stop_requested:
+            self._quiesce_loop(loop)
+            return
         try:
             loop.run_forever()
         finally:
             self._quiesce_loop(loop)
+
+    def _request_stop(self) -> None:
+        self._stop_requested.set()
+        with self._loop_start_lock:
+            loop = self._loop
+            if loop is not None and not loop.is_closed():
+                try:
+                    # Scheduling stop is safe before run_forever starts and
+                    # closes the race between the startup check and loop run.
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
 
     @staticmethod
     def _quiesce_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -492,9 +549,7 @@ class _EventLoopBridge:
         self._closed = True
         if threading.current_thread() is self._thread:
             raise FlashScoringError("cannot close the Flash event loop from its own thread")
-        loop = self._loop
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
+        self._request_stop()
         self._thread.join()
 
     def __enter__(self) -> "_EventLoopBridge":

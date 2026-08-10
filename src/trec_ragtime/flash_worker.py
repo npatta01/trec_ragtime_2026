@@ -18,10 +18,73 @@ _WORKER_CLASS_CACHE: dict[str, type[Any]] = {}
 _WORKER_MODULE_CACHE: dict[str, ModuleType] = {}
 
 
+def _resolve_gpu(gpu_name: str) -> object:
+    """Resolve a maintained Flash GPU group or type only when decoration is requested."""
+
+    try:
+        from runpod_flash import GpuGroup, GpuType
+    except ImportError as error:
+        raise RuntimeError(
+            "Runpod Flash is required to decorate a worker; inject a GPU resolver for offline use"
+        ) from error
+
+    for gpu_enum in (GpuGroup, GpuType):
+        try:
+            return getattr(gpu_enum, gpu_name)
+        except AttributeError:
+            continue
+    raise ValueError(f"unknown Runpod Flash GPU group or type: {gpu_name!r}")
+
+
+def _pinned_dependencies(config: object) -> list[str]:
+    return [
+        f"sentence-transformers=={config.sentence_transformers_version}",
+        f"transformers=={config.transformers_version}",
+        f"tokenizers=={config.tokenizers_version}",
+        f"torch=={config.torch_version}",
+    ]
+
+
+def _uses_endpoint_style(endpoint_factory: Callable[..., object]) -> bool:
+    import inspect
+
+    try:
+        parameters = inspect.signature(endpoint_factory).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    return "name" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+def _decorate_worker(
+    endpoint_factory: Callable[..., object],
+    worker_class: type[Any],
+    endpoint_kwargs: dict[str, object],
+) -> type[Any]:
+    """Apply an Endpoint-style factory, retaining the pre-existing test seam."""
+
+    endpoint_style = _uses_endpoint_style(endpoint_factory)
+    if not endpoint_style:
+        # Compatibility for the original class-only injection seam.  The real
+        # Flash path always receives the exact Endpoint constructor kwargs.
+        decorated = endpoint_factory(worker_class)
+    else:
+        decorator = endpoint_factory(**endpoint_kwargs)
+        if not callable(decorator):
+            raise TypeError("Flash endpoint factory must return a class decorator")
+        decorated = decorator(worker_class)
+    if not isinstance(decorated, type):
+        raise TypeError("Flash endpoint decorator must return a worker class")
+    return decorated
+
+
 def build_flash_worker(
     config: object | None = None,
     *,
-    endpoint_factory: Callable[[type[Any]], type[Any]] | None = None,
+    endpoint_factory: Callable[..., object] | None = None,
+    gpu_resolver: Callable[[str], object] | None = None,
 ) -> type[Any]:
     """Build or lazily decorate a source-stable class-style Flash worker.
 
@@ -51,15 +114,20 @@ def build_flash_worker(
 
     model_config = {
         "batch_size": effective_config.batch_size,
-        "device": effective_config.device,
+        "device": effective_config.effective_device,
         "max_length": effective_config.max_length,
         "model_name": effective_config.model_name,
-        "precision": effective_config.precision,
+        "precision": effective_config.effective_precision,
         "query_format": effective_config.query_format,
         "query_policy": effective_config.query_policy,
         "revision": effective_config.revision,
         "schema_version": effective_config.schema_version,
         "sentence_transformers_version": effective_config.sentence_transformers_version,
+        "tokenizer_name": effective_config.tokenizer_name,
+        "tokenizer_revision": effective_config.tokenizer_revision,
+        "transformers_version": effective_config.transformers_version,
+        "tokenizers_version": effective_config.tokenizers_version,
+        "torch_version": effective_config.torch_version,
     }
     model_literal = json.dumps(
         model_config,
@@ -212,7 +280,36 @@ def build_flash_worker(
             _WORKER_MODULE_CACHE[source_digest] = module
             _WORKER_CLASS_CACHE[source_digest] = worker_class
     if endpoint_factory is not None:
-        return endpoint_factory(worker_class)
+        from .flash_passage_scorer import (
+            DEFAULT_FLASH_GPU,
+            DEFAULT_FLASH_IDLE_TIMEOUT,
+            DEFAULT_FLASH_WORKER_NAME,
+        )
+
+        if isinstance(config, RunpodFlashConfig):
+            worker_name = config.worker_name
+            gpu_name = config.gpu
+            workers = config.workers
+            idle_timeout = config.idle_timeout
+        else:
+            worker_name = DEFAULT_FLASH_WORKER_NAME
+            gpu_name = DEFAULT_FLASH_GPU
+            workers = 1
+            idle_timeout = DEFAULT_FLASH_IDLE_TIMEOUT
+        if not _uses_endpoint_style(endpoint_factory):
+            return _decorate_worker(endpoint_factory, worker_class, {})
+        resolve_gpu = gpu_resolver or _resolve_gpu
+        return _decorate_worker(
+            endpoint_factory,
+            worker_class,
+            {
+                "name": worker_name,
+                "gpu": resolve_gpu(gpu_name),
+                "workers": workers,
+                "idle_timeout": idle_timeout,
+                "dependencies": _pinned_dependencies(effective_config),
+            },
+        )
     return worker_class
 
 
