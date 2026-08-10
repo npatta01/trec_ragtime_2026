@@ -442,6 +442,31 @@ class HuggingFaceCorpusTests(unittest.TestCase):
         self.assertEqual(write_result.documents[0].text, "text")
         self.assertIsNone(write_result.documents[0].cache_stored_at)
 
+    def test_thrown_cache_read_failure_does_not_abort_viewer_request(self) -> None:
+        cache, store = make_cache()
+        store.read_error = OSError("cache read failed")
+        result = HuggingFaceCorpus(
+            splits=("eng",), cache=cache,
+            session=RecordingGetSession(
+                FakeResponse(filter_payload(document_row("doc-1", "text")))
+            ),
+        ).get_many(["doc-1"])
+
+        self.assertEqual(result.documents[0].text, "text")
+
+    def test_thrown_cache_write_failure_does_not_abort_viewer_request(self) -> None:
+        cache, store = make_cache()
+        store.write_error = OSError("cache write failed")
+        result = HuggingFaceCorpus(
+            splits=("eng",), cache=cache,
+            session=RecordingGetSession(
+                FakeResponse(filter_payload(document_row("doc-1", "text")))
+            ),
+        ).get_many(["doc-1"])
+
+        self.assertEqual(result.documents[0].text, "text")
+        self.assertIsNone(result.documents[0].cache_stored_at)
+
     def test_legacy_settings_are_rejected_for_cache_opt_out_and_injected_cache(self) -> None:
         for variable in ("RAGTIME_CACHE_PATH", "RAGTIME_CACHE_DIR"):
             with self.subTest(variable=variable), patch.dict(

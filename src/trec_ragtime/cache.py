@@ -486,15 +486,18 @@ class ResponseCache:
         )
         normalized_operation = _validate_operation(operation)
         object_key = response_object_key(normalized_operation, expected_request_digest)
-        entry = self.store.read_validated(
-            object_key,
-            self._decoder(
-                expected_base_url_digest=expected_base_url_digest,
-                expected_request_digest=expected_request_digest,
-                operation=normalized_operation,
-                validator=validator,
-            ),
-        )
+        try:
+            entry = self.store.read_validated(
+                object_key,
+                self._decoder(
+                    expected_base_url_digest=expected_base_url_digest,
+                    expected_request_digest=expected_request_digest,
+                    operation=normalized_operation,
+                    validator=validator,
+                ),
+            )
+        except (OSError, ArtifactStoreRemoteError):
+            return None
         if entry is None:
             return None
         if ttl_seconds is not None:
@@ -538,11 +541,14 @@ class ResponseCache:
             payload=canonical_response,
         )
         encoded = msgspec.msgpack.encode(envelope)
-        stored = self.store.write(
-            response_object_key(normalized_operation, expected_request_digest),
-            encoded,
-        )
-        return timestamp if stored else None
+        try:
+            stored = self.store.write(
+                response_object_key(normalized_operation, expected_request_digest),
+                encoded,
+            )
+        except (OSError, ArtifactStoreRemoteError):
+            return None
+        return timestamp if stored is True else None
 
     def evict_local(
         self,

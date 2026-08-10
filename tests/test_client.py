@@ -316,6 +316,27 @@ class RagtimeClientTests(unittest.TestCase):
         self.assertFalse(result.local_cache_hit)
         self.assertEqual(len(session.calls), 1)
 
+    def test_thrown_cache_read_failure_is_a_miss_and_live_request_still_runs(self) -> None:
+        cache, store = make_cache()
+        store.read_error = OSError("cache unavailable")
+        session = RecordingSession(FakeResponse(pipeline_payload()))
+
+        result = self.make_client(session, cache=cache).search("query")
+
+        self.assertFalse(result.local_cache_hit)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_thrown_cache_write_failure_keeps_fully_validated_live_result(self) -> None:
+        cache, store = make_cache()
+        store.write_error = OSError("disk full")
+
+        result = self.make_client(
+            RecordingSession(FakeResponse(pipeline_payload())), cache=cache
+        ).search("query")
+
+        self.assertFalse(result.local_cache_hit)
+        self.assertIsNone(result.cache_stored_at)
+
     def test_malformed_l1_repairs_once_before_one_upstream_request(self) -> None:
         cache, store = make_cache()
         request = {"pipeline": "ragtime2", "query": "query"}

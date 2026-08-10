@@ -8,7 +8,10 @@ from typing import Any
 
 import msgspec
 
-from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.artifact_store import (
+    ArtifactStoreRemoteError,
+    ArtifactValidationError,
+)
 from trec_ragtime.cache import (
     CACHE_SCHEMA_VERSION,
     DEFAULT_CACHE_NAMESPACE,
@@ -40,12 +43,16 @@ class MemoryArtifactStore:
         self.remote: dict[str, bytes] = {}
         self.read_validated_calls: list[str] = []
         self.write_calls: list[tuple[str, bytes]] = []
-        self.write_result = True
+        self.read_error: BaseException | None = None
+        self.write_error: BaseException | None = None
+        self.write_result: Any = True
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], Any]
     ) -> Any | None:
         self.read_validated_calls.append(object_key)
+        if self.read_error is not None:
+            raise self.read_error
         payload = self.local.get(object_key)
         if payload is not None:
             try:
@@ -60,9 +67,11 @@ class MemoryArtifactStore:
         return value
 
     def write(self, object_key: str, payload: bytes) -> bool:
+        if self.write_error is not None:
+            raise self.write_error
         self.write_calls.append((object_key, payload))
-        if not self.write_result:
-            return False
+        if self.write_result is not True:
+            return self.write_result
         self.local[object_key] = payload
         self.remote[object_key] = payload
         return True
@@ -147,6 +156,44 @@ class ResponseCacheTestCase(unittest.TestCase):
         self.assertIsNone(stored_at)
         self.assertEqual(len(self.store.write_calls), 1)
         self.assertEqual(self.store.local, {})
+
+    def test_put_requires_exact_true_write_result(self) -> None:
+        self.store.write_result = 1
+
+        stored_at = self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            response=self.response,
+            stored_at=100.0,
+        )
+
+        self.assertIsNone(stored_at)
+        self.assertEqual(self.store.local, {})
+
+    def test_artifact_store_remote_errors_degrade_to_cache_miss_or_write_failure(self) -> None:
+        self.store.read_error = ArtifactStoreRemoteError("remote unavailable")
+        self.assertIsNone(
+            self.cache.get(
+                base_url=self.base_url,
+                operation=self.operation,
+                request=self.request,
+                ttl_seconds=None,
+                validator=self.valid_response,
+            )
+        )
+
+        self.store.read_error = None
+        self.store.write_error = ArtifactStoreRemoteError("remote unavailable")
+        self.assertIsNone(
+            self.cache.put(
+                base_url=self.base_url,
+                operation=self.operation,
+                request=self.request,
+                response=self.response,
+                stored_at=100.0,
+            )
+        )
 
     def test_request_key_is_stable_for_recursively_reordered_mappings(self) -> None:
         reordered = {
