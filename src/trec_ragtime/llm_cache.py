@@ -49,7 +49,13 @@ class CachedChatCompletions:
             for key, value in request.items()
             if key not in _TRANSPORT_ONLY_FIELDS
         }
-        if not refresh:
+        if refresh:
+            self._cache.object_key(
+                base_url=self._base_url,
+                operation=LLM_CHAT_COMPLETIONS_OPERATION,
+                request=identity,
+            )
+        else:
             hit = self._cache.get(
                 base_url=self._base_url,
                 operation=LLM_CHAT_COMPLETIONS_OPERATION,

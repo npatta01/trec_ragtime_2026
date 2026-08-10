@@ -225,6 +225,18 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         self.assertEqual(self.store.read_validated_calls, [])
         self.assertEqual(self.store.write_calls, [])
 
+    def test_invalid_refresh_request_fails_before_provider(self) -> None:
+        with self.assertRaises((TypeError, ValueError)):
+            self.cached.create(
+                model="m",
+                messages=[],
+                api_key="sentinel-secret",
+                refresh=True,
+            )
+        self.assertEqual(len(self.client.chat.completions.calls), 0)
+        self.assertEqual(self.store.read_validated_calls, [])
+        self.assertEqual(self.store.write_calls, [])
+
     def test_provider_error_propagates_without_write(self) -> None:
         self.client.chat.completions.responses = [RuntimeError("provider unavailable")]
         with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
