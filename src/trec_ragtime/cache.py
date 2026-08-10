@@ -416,6 +416,17 @@ class ResponseCache:
                 canonical_payload = canonicalize_json(envelope.payload)
                 if not isinstance(canonical_payload, dict):
                     raise TypeError("cached payload must be an object")
+                canonical_envelope = ResponseEnvelope(
+                    schema_version=envelope.schema_version,
+                    namespace=envelope.namespace,
+                    operation=envelope.operation,
+                    base_url_digest=envelope.base_url_digest,
+                    request_digest=envelope.request_digest,
+                    stored_at=stored_at,
+                    payload=canonical_payload,
+                )
+                if msgspec.msgpack.encode(canonical_envelope) != payload:
+                    raise ValueError("cached response wire encoding is not canonical")
                 validator(canonical_payload)
             except Exception:
                 # Domain validators deliberately have no cache-specific

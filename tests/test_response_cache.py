@@ -270,6 +270,130 @@ class ResponseCacheTestCase(unittest.TestCase):
                 validator=self.valid_response,
             )
 
+    def test_reordered_top_level_map_is_rejected_as_noncanonical(self) -> None:
+        self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            response=self.response,
+            stored_at=100.0,
+        )
+        key = self.object_key()
+        original = self.store.remote[key]
+        decoded = msgspec.msgpack.decode(original)
+        reordered = {field: decoded[field] for field in reversed(tuple(decoded))}
+        reordered_wire = msgspec.msgpack.encode(reordered)
+        self.assertNotEqual(reordered_wire, original)
+        self.store.remote[key] = reordered_wire
+        self.store.local.clear()
+
+        with self.assertRaises(ArtifactValidationError):
+            self.cache.get(
+                base_url=self.base_url,
+                operation=self.operation,
+                request=self.request,
+                ttl_seconds=None,
+                validator=self.valid_response,
+            )
+
+    def test_duplicate_top_level_map_key_is_rejected(self) -> None:
+        self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            response=self.response,
+            stored_at=100.0,
+        )
+        key = self.object_key()
+        original = self.store.remote[key]
+        self.assertEqual(original[0], 0x87)
+        duplicate_payload = {"scores": {"doc-2": 0.8}, "query": "duplicate"}
+        duplicate_wire = (
+            bytes([original[0] + 1])
+            + original[1:]
+            + msgspec.msgpack.encode("payload")
+            + msgspec.msgpack.encode(duplicate_payload)
+        )
+        self.store.remote[key] = duplicate_wire
+        self.store.local.clear()
+
+        with self.assertRaises(ArtifactValidationError):
+            self.cache.get(
+                base_url=self.base_url,
+                operation=self.operation,
+                request=self.request,
+                ttl_seconds=None,
+                validator=self.valid_response,
+            )
+
+    def test_duplicate_nested_payload_map_key_is_rejected(self) -> None:
+        self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            response=self.response,
+            stored_at=100.0,
+        )
+        key = self.object_key()
+        original = self.store.remote[key]
+        canonical_payload = msgspec.msgpack.encode(
+            {"query": "hello", "scores": {"doc-1": 0.9}}
+        )
+        scores_map = msgspec.msgpack.encode({"doc-1": 0.9})
+        duplicate_scores_map = (
+            b"\x82"
+            + msgspec.msgpack.encode("doc-1")
+            + msgspec.msgpack.encode(0.9)
+            + msgspec.msgpack.encode("doc-1")
+            + msgspec.msgpack.encode(0.7)
+        )
+        self.assertIn(canonical_payload, original)
+        self.assertIn(scores_map, canonical_payload)
+        modified_payload = canonical_payload.replace(
+            scores_map, duplicate_scores_map, 1
+        )
+        modified_wire = original.replace(canonical_payload, modified_payload, 1)
+        self.assertNotEqual(modified_wire, original)
+        self.store.remote[key] = modified_wire
+        self.store.local.clear()
+
+        with self.assertRaises(ArtifactValidationError):
+            self.cache.get(
+                base_url=self.base_url,
+                operation=self.operation,
+                request=self.request,
+                ttl_seconds=None,
+                validator=self.valid_response,
+            )
+
+    def test_noncanonical_scalar_encoding_is_rejected(self) -> None:
+        self.cache.put(
+            base_url=self.base_url,
+            operation=self.operation,
+            request=self.request,
+            response=self.response,
+            stored_at=100.0,
+        )
+        key = self.object_key()
+        original = self.store.remote[key]
+        schema_field = msgspec.msgpack.encode("schema_version")
+        canonical_pair = schema_field + b"\x01"
+        noncanonical_pair = schema_field + b"\xcc\x01"
+        self.assertIn(canonical_pair, original)
+        noncanonical_wire = original.replace(canonical_pair, noncanonical_pair, 1)
+        self.assertNotEqual(noncanonical_wire, original)
+        self.store.remote[key] = noncanonical_wire
+        self.store.local.clear()
+
+        with self.assertRaises(ArtifactValidationError):
+            self.cache.get(
+                base_url=self.base_url,
+                operation=self.operation,
+                request=self.request,
+                ttl_seconds=None,
+                validator=self.valid_response,
+            )
+
     def test_wrong_identity_fields_are_fatal(self) -> None:
         self.cache.put(
             base_url=self.base_url,
