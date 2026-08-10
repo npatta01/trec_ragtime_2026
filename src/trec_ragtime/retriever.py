@@ -504,7 +504,11 @@ class RagtimeRetriever:
             # endpoint result and hydrated documents.  Keep the endpoint's
             # metadata and opaque evidence while making the client-side depth
             # truncation visible at that same domain boundary.
-            search_result = replace(search_result, hits=hits)
+            search_result = replace(
+                search_result,
+                hits=hits,
+                extra=copy.deepcopy(search_result.extra),
+            )
         hydration = self.enrich_documents(
             (hit.document_id for hit in hits),
             refresh_documents=refresh or refresh_documents,

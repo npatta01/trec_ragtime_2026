@@ -1281,6 +1281,49 @@ class RagtimeRetrieverTests(unittest.TestCase):
         self.assertEqual(result.search_result.extra, search.extra)
         self.assertEqual(len(store.write_calls), 1)
 
+    def test_top_k_search_result_extra_is_mutation_isolated_from_endpoint_result(self) -> None:
+        search = PipelineResult(
+            query="query",
+            pipeline="ragtime2",
+            hits=(
+                SearchHit(rank=1, document_id="doc-1", score=0.9),
+                SearchHit(rank=2, document_id="doc-2", score=0.8),
+            ),
+            processed=True,
+            local_cache_hit=True,
+            remote_cached=False,
+            server_timestamp=123.0,
+            cache_stored_at=122.0,
+            extra={"nested": {"labels": ["endpoint"]}},
+        )
+        corpus = FakeCorpus(
+            HydrationResult(
+                documents=(
+                    hf_document("doc-1", "one"),
+                    hf_document("doc-2", "two"),
+                ),
+                unresolved_ids=(),
+                failures=(),
+            )
+        )
+
+        result = RagtimeRetriever(FakeRagtimeClient(search), corpus).retrieve(
+            "query", top_k=1
+        )
+
+        self.assertIsNot(result.search_result.extra, search.extra)
+        self.assertIsNot(
+            result.search_result.extra["nested"], search.extra["nested"]
+        )
+        result.search_result.extra["nested"]["labels"].append("returned")
+        result.search_result.extra["new"] = {"owned": True}
+        self.assertEqual(search.extra, {"nested": {"labels": ["endpoint"]}})
+        search.extra["nested"]["labels"].append("caller")
+        self.assertEqual(
+            result.search_result.extra,
+            {"nested": {"labels": ["endpoint", "returned"]}, "new": {"owned": True}},
+        )
+
     def test_top_k_retrieval_artifact_l1_and_l2_hits_keep_aligned_runner_order(self) -> None:
         store = MemoryArtifactStore()
         search = pipeline_result(["doc-1", "doc-2", "doc-3", "doc-4"])
