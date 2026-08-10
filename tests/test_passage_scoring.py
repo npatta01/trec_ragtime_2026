@@ -10,14 +10,13 @@ from dataclasses import FrozenInstanceError, is_dataclass, replace
 from typing import Any
 from unittest.mock import patch
 
-from trec_ragtime.passages import ChunkerConfig, Passage, sha256_bytes
+from trec_ragtime.passages import Passage, sha256_bytes
 from trec_ragtime.passage_scoring import (
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_REVISION,
     CrossEncoderPairLengthFunction,
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
-    PassageScoreValidationError,
     PassageScoringError,
     validate_passage_scores,
 )
@@ -27,24 +26,35 @@ def _passage(
     text: str,
     *,
     document_id: str = "doc",
-    passage_id: bytes | None = None,
+    representation: str = "canonical",
+    language: str = "eng",
+    start_char: int = 0,
+    end_char: int | None = None,
+    boundary: str = "sentence",
 ) -> Passage:
+    if end_char is None:
+        end_char = start_char + len(text)
     return Passage(
         document_id=document_id,
-        source_content_hash=sha256_bytes(text),
-        representation="canonical",
-        representation_hash=sha256_bytes(text),
-        language="eng",
-        chunk_index=0,
-        passage_id=passage_id or sha256_bytes(f"passage:{document_id}:{text}"),
+        representation=representation,  # type: ignore[arg-type]
+        language=language,
         text=text,
-        start_char=0,
-        end_char=len(text),
-        boundary="paragraph_packed",
-        previous_passage_id=None,
-        next_passage_id=None,
+        start_char=start_char,
+        end_char=end_char,
         content_hash=sha256_bytes(text),
-        chunker_fingerprint="test-chunker-v1",
+        boundary=boundary,  # type: ignore[arg-type]
+    )
+
+
+def _config(**kwargs: Any) -> LocalCrossEncoderConfig:
+    return LocalCrossEncoderConfig(
+        sentence_transformers_version=importlib.metadata.version(
+            "sentence-transformers"
+        ),
+        transformers_version=importlib.metadata.version("transformers"),
+        tokenizers_version=importlib.metadata.version("tokenizers"),
+        torch_version=importlib.metadata.version("torch"),
+        **kwargs,
     )
 
 
@@ -176,7 +186,7 @@ class PassageScoreValidatorTests(unittest.TestCase):
         )
         for scores in cases:
             with self.subTest(scores=scores):
-                with self.assertRaises(PassageScoreValidationError):
+                with self.assertRaises(PassageScoringError):
                     validate_passage_scores((first, second), scores)
 
         self.assertEqual(expected, {first.content_hash, second.content_hash})
@@ -187,7 +197,7 @@ class PassageScoreValidatorTests(unittest.TestCase):
 
         for value in invalid_values:
             with self.subTest(value=value):
-                with self.assertRaises(PassageScoreValidationError):
+                with self.assertRaises(PassageScoringError):
                     validate_passage_scores((passage,), {passage.content_hash: value})
 
 
@@ -325,17 +335,10 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
         pair_length = length_function("中文")
         self.assertEqual(pair_length, 17)
         self.assertGreater(pair_length, config.max_length)
+        self.assertEqual(length_function.max_length, config.max_length)
+        self.assertEqual(length_function.max_passage_length, 2)
         self.assertEqual(
             length_function.fingerprint, length_function.length_function_fingerprint
-        )
-        chunker_config = ChunkerConfig(
-            chunk_size=config.max_length,
-            length_function=length_function,
-            length_function_fingerprint=length_function.fingerprint,
-        )
-        self.assertEqual(
-            chunker_config.resolved_length_function_fingerprint,
-            length_function.fingerprint,
         )
         self.assertEqual(
             tokenizer.calls,
@@ -395,15 +398,6 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             ],
         )
         self.assertEqual(tokenizer.special_token_calls, [True])
-
-        chunker_config = ChunkerConfig(
-            chunk_size=length_function.max_passage_length,
-            length_function=length_function.passage_length_function,
-        )
-        self.assertEqual(
-            chunker_config.resolved_length_function_fingerprint,
-            length_function.passage_length_function.fingerprint,
-        )
 
     def test_splitter_budget_matches_reviewed_pinned_tokenizer_shape(self) -> None:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -591,6 +585,22 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
 
 
 class LocalCrossEncoderScorerTests(unittest.TestCase):
+    def test_score_deduplicates_equal_content_and_returns_finite_float_map(self) -> None:
+        first = _passage("same", start_char=0, end_char=4)
+        repeated = _passage("same", start_char=5, end_char=9)
+        other = _passage("other", start_char=10, end_char=15)
+        model = RecordingModel({"same": 2.5, "other": -1})
+        scorer = LocalCrossEncoderScorer(
+            _config(batch_size=2),
+            loader=lambda _: (model, RecordingTokenizer()),
+        )
+
+        scores = scorer.score("exact query", (first, repeated, other))
+
+        self.assertEqual(scores, {first.content_hash: 2.5, other.content_hash: -1.0})
+        self.assertEqual(len(model.predict_calls), 1)
+        self.assertTrue(all(type(value) is float for value in scores.values()))
+
     def test_runtime_metadata_drift_fails_before_custom_loader(self) -> None:
         config = LocalCrossEncoderConfig(**_runtime_versions())
         load_calls = 0
@@ -970,7 +980,7 @@ assert 'torch' not in sys.modules
 
         self.assertEqual(model.predict_calls, [])
 
-    def test_contradictory_duplicate_hash_text_or_lineage_is_rejected(self) -> None:
+    def test_contradictory_duplicate_hash_text_is_rejected(self) -> None:
         original = _passage("same", document_id="original")
         contradictory_text = object.__new__(Passage)
         for field in original.__slots__:
@@ -991,14 +1001,6 @@ assert 'torch' not in sys.modules
         scorer = LocalCrossEncoderScorer(loader=loader)
         with self.assertRaises(PassageScoringError):
             scorer.score("query", (original, contradictory_text))
-        self.assertEqual(load_calls, 0)
-
-        same_id_different_document = replace(original, document_id="different-document")
-        object.__setattr__(
-            same_id_different_document, "passage_id", original.passage_id
-        )
-        with self.assertRaises(PassageScoringError):
-            scorer.score("query", (original, same_id_different_document))
         self.assertEqual(load_calls, 0)
 
 

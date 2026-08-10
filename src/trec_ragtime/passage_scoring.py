@@ -50,8 +50,10 @@ class PassageScoringError(ValueError):
     """Raised when a query, passage, tokenizer, model, or score is invalid."""
 
 
-class PassageScoreValidationError(PassageScoringError):
-    """Raised when a score mapping does not exactly validate."""
+# Kept as an identity alias for the package-level import until downstream
+# cache/transport modules complete their same-task migration.  There is only
+# one scoring exception and all validation raises it directly.
+PassageScoreValidationError = PassageScoringError
 
 
 def _installed_runtime_version(distribution: str) -> str:
@@ -274,72 +276,49 @@ class PassageScorer(Protocol):
 
 def _validate_hash(value: object, field_name: str) -> bytes:
     if not isinstance(value, bytes) or len(value) != _HASH_LENGTH:
-        raise PassageScoreValidationError(f"{field_name} must be exactly 32 bytes")
+        raise PassageScoringError(f"{field_name} must be exactly 32 bytes")
     return value
 
 
-def _passage_lineage(passage: Passage) -> tuple[object, ...]:
-    return (
-        passage.document_id,
-        passage.representation,
-        passage.representation_hash,
-        passage.start_char,
-        passage.end_char,
-        passage.chunk_index,
-        passage.passage_id,
-    )
-
-
-def _unique_passages(passages: Sequence[Passage]) -> tuple[tuple[bytes, str], ...]:
+def _unique_passages(passages: Sequence[Passage]) -> dict[bytes, str]:
     if isinstance(passages, (str, bytes, bytearray)) or not isinstance(
         passages, Sequence
     ):
         raise PassageScoringError("passages must be a sequence of Passage objects")
 
-    unique: dict[bytes, tuple[str, tuple[object, ...]]] = {}
+    unique: dict[bytes, str] = {}
     for passage in passages:
         if not isinstance(passage, Passage):
             raise PassageScoringError("passages must contain Passage objects")
         content_hash = _validate_hash(passage.content_hash, "content_hash")
-        _validate_hash(passage.passage_id, "passage_id")
         if not isinstance(passage.text, str) or not passage.text:
             raise PassageScoringError("passage text must not be empty")
         if content_hash != sha256_bytes(passage.text):
             raise PassageScoringError("content_hash does not match passage text")
-        lineage = _passage_lineage(passage)
         previous = unique.get(content_hash)
         if previous is None:
-            unique[content_hash] = (passage.text, lineage)
+            unique[content_hash] = passage.text
             continue
-        previous_text, previous_lineage = previous
-        if passage.text != previous_text:
+        if passage.text != previous:
             raise PassageScoringError(
                 "a content hash maps to contradictory passage text"
             )
-        if (
-            passage.passage_id == cast(bytes, previous_lineage[-1])
-            and lineage != previous_lineage
-        ):
-            raise PassageScoringError(
-                "a content hash maps to contradictory passage lineage"
-            )
-
-    return tuple((content_hash, text) for content_hash, (text, _) in unique.items())
+    return unique
 
 
 def _normalize_score(value: object, *, key: object) -> float:
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
-        raise PassageScoreValidationError(
+        raise PassageScoringError(
             f"score for key {key!r} must be a non-Boolean numeric value"
         )
     try:
         normalized = float(value)
     except (OverflowError, TypeError, ValueError) as error:
-        raise PassageScoreValidationError(
+        raise PassageScoringError(
             "score could not be normalized to float"
         ) from error
     if not math.isfinite(normalized):
-        raise PassageScoreValidationError("scores must be finite")
+        raise PassageScoringError("scores must be finite")
     return normalized
 
 
@@ -351,19 +330,19 @@ def validate_passage_scores(
 
     requested = _unique_passages(passages)
     if not isinstance(scores, Mapping):
-        raise PassageScoreValidationError("scores must be a mapping")
+        raise PassageScoringError("scores must be a mapping")
 
     normalized: dict[bytes, float] = {}
     for key, value in scores.items():
         content_hash = _validate_hash(key, "score key")
         normalized[content_hash] = _normalize_score(value, key=key)
 
-    expected_keys = {content_hash for content_hash, _ in requested}
+    expected_keys = set(requested)
     actual_keys = set(normalized)
     if actual_keys != expected_keys:
         missing = expected_keys - actual_keys
         extra = actual_keys - expected_keys
-        raise PassageScoreValidationError(
+        raise PassageScoringError(
             f"score coverage mismatch (missing={len(missing)}, extra={len(extra)})"
         )
     return {key: normalized[key] for key in sorted(normalized)}
@@ -617,6 +596,12 @@ class CrossEncoderPairLengthFunction:
         return self._query
 
     @property
+    def max_length(self) -> int:
+        """Return the configured complete query/passage pair ceiling."""
+
+        return self._config.max_length
+
+    @property
     def formatted_query(self) -> str:
         """Return the formatted query passed to the tokenizer."""
 
@@ -624,13 +609,13 @@ class CrossEncoderPairLengthFunction:
 
     @property
     def fingerprint(self) -> str:
-        """Return the stable identity suitable for ChunkerConfig."""
+        """Return the stable identity consumed by PassageChunker."""
 
         return self._fingerprint
 
     @property
     def length_function_fingerprint(self) -> str:
-        """Alias usable as ChunkerConfig.length_function_fingerprint."""
+        """Return the pair-length identity for structural consumers."""
 
         return self._fingerprint
 
@@ -851,7 +836,7 @@ class LocalCrossEncoderScorer:
         if not unique:
             return {}
 
-        pairs = tuple((formatted_query, text) for _, text in unique)
+        pairs = tuple((formatted_query, text) for text in unique.values())
         model, tokenizer = self._ensure_loaded()
         self._tokenize_pairs(tokenizer, pairs)
 
@@ -883,7 +868,9 @@ class LocalCrossEncoderScorer:
 
         raw_mapping = {
             content_hash: raw_score
-            for (content_hash, _), raw_score in zip(unique, raw_scores, strict=True)
+            for (content_hash, _), raw_score in zip(
+                unique.items(), raw_scores, strict=True
+            )
         }
         return validate_passage_scores(passages, raw_mapping)
 
@@ -901,7 +888,6 @@ __all__ = [
     "CrossEncoderPairLengthFunction",
     "LocalCrossEncoderConfig",
     "LocalCrossEncoderScorer",
-    "PassageScoreValidationError",
     "PassageScorer",
     "PassageScoringError",
     "validate_passage_scores",
