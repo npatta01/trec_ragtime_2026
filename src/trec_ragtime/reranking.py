@@ -168,7 +168,9 @@ def rerank_retrieval(
                 language=language,
             )
         except Exception as error:
-            raise RerankingError("chunker failed for a selected representation") from error
+            raise RerankingError(
+                "chunker failed for a selected representation"
+            ) from error
         if (
             passages is None
             or isinstance(passages, (str, bytes, bytearray))
@@ -211,9 +213,7 @@ def rerank_retrieval(
     status_documents: list[RerankedDocument] = []
     for document, status, passages in prepared:
         if status is not None:
-            status_documents.append(
-                RerankedDocument(document, None, (), 0, status)
-            )
+            status_documents.append(RerankedDocument(document, None, (), 0, status))
             continue
         evidence_by_location: dict[tuple[str, int, int], PassageEvidence] = {}
         for passage in passages:

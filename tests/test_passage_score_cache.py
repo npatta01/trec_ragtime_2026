@@ -205,9 +205,7 @@ print(encode_score_map(scores).hex())
         scorer = RecordingScorer()
 
         with self.assertRaises(PassageScoreArtifactValidationError):
-            _cache(store, scorer).score(
-                "q", (_report_passage("x"),)
-            )
+            _cache(store, scorer).score("q", (_report_passage("x"),))
 
         self.assertEqual(store.read_validated_calls, [])
         self.assertEqual(scorer.calls, [])

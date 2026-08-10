@@ -260,7 +260,10 @@ class PassageChunkerTests(unittest.TestCase):
                 )
                 pair_length = FixturePairLength(case)
                 self.assertTrue(
-                    all(pair_length(passage.text) <= pair_length.max_length for passage in passages)
+                    all(
+                        pair_length(passage.text) <= pair_length.max_length
+                        for passage in passages
+                    )
                 )
 
     def test_overlap_intersections_are_complete_sentence_units(self) -> None:
@@ -276,7 +279,10 @@ class PassageChunkerTests(unittest.TestCase):
             overlap = (start, end)
             overlaps.append(overlap)
             self.assertIn(overlap, sentence_spans)
-            self.assertEqual(selected_text[start:end], case["sentences"][sentence_spans.index(overlap)])
+            self.assertEqual(
+                selected_text[start:end],
+                case["sentences"][sentence_spans.index(overlap)],
+            )
         self.assertEqual(overlaps, sentence_spans)
 
     def test_repeated_text_keeps_distinct_intervals_with_equal_hashes(self) -> None:

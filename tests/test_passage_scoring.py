@@ -585,7 +585,9 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
 
 
 class LocalCrossEncoderScorerTests(unittest.TestCase):
-    def test_score_deduplicates_equal_content_and_returns_finite_float_map(self) -> None:
+    def test_score_deduplicates_equal_content_and_returns_finite_float_map(
+        self,
+    ) -> None:
         first = _passage("same", start_char=0, end_char=4)
         repeated = _passage("same", start_char=5, end_char=9)
         other = _passage("other", start_char=10, end_char=15)

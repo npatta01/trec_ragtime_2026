@@ -99,9 +99,7 @@ class FlashPassageWorker:
                 if field_name is None:
                     continue
                 if field_name != "query" or format_spec or conversion:
-                    raise cls._error(
-                        "query_format may contain only the {query} field"
-                    )
+                    raise cls._error("query_format may contain only the {query} field")
                 fields.append(field_name)
         except (IndexError, ValueError) as error:
             raise cls._error(
@@ -431,7 +429,9 @@ class FlashPassageWorker:
                 )
                 length = cls._token_length(encoded)
             except Exception as error:
-                raise cls._error("tokenizer failed while validating a passage pair") from error
+                raise cls._error(
+                    "tokenizer failed while validating a passage pair"
+                ) from error
             if length > config["max_length"]:
                 raise cls._error("tokenizer pair overflowed max_length")
 
@@ -577,7 +577,9 @@ def build_flash_worker(
 ) -> type[FlashPassageWorker]:
     """Return the static worker and optionally apply a lazy Flash decorator."""
 
-    model_config, worker_name, gpu_name, workers, idle_timeout = _effective_config(config)
+    model_config, worker_name, gpu_name, workers, idle_timeout = _effective_config(
+        config
+    )
     from .flash_passage_scorer import FlashScoringError
 
     FlashPassageWorker._ERROR = FlashScoringError

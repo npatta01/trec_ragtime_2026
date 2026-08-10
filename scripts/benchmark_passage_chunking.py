@@ -96,9 +96,7 @@ def required_model_versions(cases: list[dict[str, Any]]) -> dict[str, str]:
             )
 
     versions: dict[str, str] = {}
-    for pipeline_name in sorted(
-        {str(case["pipeline_name"]) for case in cases}
-    ):
+    for pipeline_name in sorted({str(case["pipeline_name"]) for case in cases}):
         distribution_name = pipeline_name.replace("_", "-")
         try:
             version = importlib.metadata.version(distribution_name)
@@ -316,7 +314,10 @@ def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
 
     text = "中" * 502
     pair_length = PairAwareCjkLength()
-    if len(text) > pair_length.max_length or pair_length(text) <= pair_length.max_length:
+    if (
+        len(text) > pair_length.max_length
+        or pair_length(text) <= pair_length.max_length
+    ):
         raise AssertionError(
             "pair-aware fixture must fit by characters but exceed by pairs"
         )
@@ -381,9 +382,7 @@ def main() -> int:
         )
     oversized_sentence_rcts_only = verify_multi_sentence_guard()
 
-    oversized_cases = [
-        case for case in cases if case["name"] == "oversized_sentence"
-    ]
+    oversized_cases = [case for case in cases if case["name"] == "oversized_sentence"]
     if len(oversized_cases) != 1:
         raise AssertionError("fixture must contain one oversized_sentence case")
 
@@ -394,10 +393,7 @@ def main() -> int:
     print("failures=0")
     print("full_source_coverage=true")
     print("sentence_only_overlap=true")
-    print(
-        "oversized_sentence_rcts_only="
-        + str(oversized_sentence_rcts_only).lower()
-    )
+    print("oversized_sentence_rcts_only=" + str(oversized_sentence_rcts_only).lower())
     print("pair_ceiling=true")
     print("deterministic_records=true")
     print("pair_aware_model_loader_calls=0")

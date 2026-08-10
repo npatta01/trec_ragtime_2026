@@ -8,26 +8,27 @@ import trec_ragtime
 from trec_ragtime import (
     CachedPassageScorer,
     CrossEncoderPairLengthFunction,
-    FlashEndpointBatchRunner,
-    FlashPassageWorker,
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
-    Passage,
     PassageChunker,
-    PassageChunkingError,
-    PassageEvidence,
     PassageScoreCache,
     RerankedDocument,
-    RerankingResult,
     RunpodFlashConfig,
     RunpodFlashPassageScorer,
-    build_flash_worker,
     rerank_retrieval,
     sha256_bytes,
     validate_passages,
 )
-from trec_ragtime.flash_passage_scorer import decode_flash_request, encode_flash_response
-from trec_ragtime.models import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
+from trec_ragtime.flash_passage_scorer import (
+    decode_flash_request,
+    encode_flash_response,
+)
+from trec_ragtime.models import (
+    PipelineResult,
+    RetrievalResult,
+    RetrievedDocument,
+    SearchHit,
+)
 
 
 _INTEGRATION_QUERY = "shared evidence and practical outcomes"
@@ -454,9 +455,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
         public_exports = set(trec_ragtime.__all__)
         self.assertEqual(len(trec_ragtime.__all__), len(public_exports))
         self.assertTrue(_SUPPORTED_BASELINE_PUBLIC_EXPORTS <= public_exports)
-        self.assertTrue(
-            _DELETED_ISSUE15_PUBLIC_EXPORTS.isdisjoint(public_exports)
-        )
+        self.assertTrue(_DELETED_ISSUE15_PUBLIC_EXPORTS.isdisjoint(public_exports))
         for deleted_name in _DELETED_ISSUE15_PUBLIC_EXPORTS:
             self.assertFalse(hasattr(trec_ragtime, deleted_name), deleted_name)
 
@@ -505,10 +504,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             {row.document.document_id for row in first.documents},
         )
         self.assertEqual(
-            {
-                row.document.document_id: row.status
-                for row in first.documents
-            },
+            {row.document.document_id: row.status for row in first.documents},
             {
                 "eng-1": "scored",
                 "spa-1": "scored",
@@ -519,10 +515,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             },
         )
         self.assertTrue(
-            all(
-                row.status == "scored" or not row.evidence
-                for row in first.documents
-            )
+            all(row.status == "scored" or not row.evidence for row in first.documents)
         )
 
         for row in first.documents:
@@ -615,14 +608,8 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [
-                _winning_content_hash(row)
-                for row in canonical_result.documents
-            ],
-            [
-                _winning_content_hash(row)
-                for row in flash_result.documents
-            ],
+            [_winning_content_hash(row) for row in canonical_result.documents],
+            [_winning_content_hash(row) for row in flash_result.documents],
         )
 
     def test_contiguous_cjk_stays_within_exact_pair_budget(self) -> None:
@@ -655,10 +642,7 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             ["oversized_sentence", "oversized_sentence"],
         )
         self.assertTrue(
-            all(
-                pair_length(passage.text) <= policy.max_length
-                for passage in passages
-            )
+            all(pair_length(passage.text) <= policy.max_length for passage in passages)
         )
         self.assertIn(
             ((_INTEGRATION_QUERY,), FakeTokenizer.SINGLE_SEQUENCE_KWARGS),

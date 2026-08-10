@@ -10,7 +10,6 @@ import unittest
 from collections import UserDict
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
 from unittest.mock import patch
 
 from trec_ragtime.flash_passage_scorer import (
@@ -86,7 +85,9 @@ class BatchEncodingTokenizer:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
         self.overflow_text = overflow_text
 
-    def __call__(self, query: str, text: str, **kwargs: object) -> UserDict[str, object]:
+    def __call__(
+        self, query: str, text: str, **kwargs: object
+    ) -> UserDict[str, object]:
         self.calls.append((query, text, kwargs))
         length = 100 if text == self.overflow_text else len(query) + len(text)
         return UserDict(
@@ -104,9 +105,7 @@ class FakeModel:
         self.multiplier = multiplier
         self.predict_calls: list[tuple[list[tuple[str, str]], dict[str, object]]] = []
 
-    def predict(
-        self, pairs: list[tuple[str, str]], **kwargs: object
-    ) -> list[float]:
+    def predict(self, pairs: list[tuple[str, str]], **kwargs: object) -> list[float]:
         self.predict_calls.append((pairs, kwargs))
         return [self.multiplier * float(len(text)) for _, text in pairs]
 
@@ -208,9 +207,7 @@ class FlashWireCodecTests(unittest.TestCase):
             )
         with self.assertRaises(FlashScoringError):
             decode_flash_request(
-                request.replace(
-                    sha256_bytes("text").hex().encode(), b"bad"
-                )
+                request.replace(sha256_bytes("text").hex().encode(), b"bad")
             )
         with self.assertRaises(FlashScoringError):
             decode_flash_response(
@@ -227,7 +224,9 @@ class FlashWireCodecTests(unittest.TestCase):
             scorer_fingerprint=config.fingerprint,
         )
 
-        self.assertEqual(decode_flash_request(payload)["model_config"]["schema_version"], 2)
+        self.assertEqual(
+            decode_flash_request(payload)["model_config"]["schema_version"], 2
+        )
 
     def test_request_with_unpaired_surrogate_raises_flash_scoring_error(self) -> None:
         config = LocalCrossEncoderConfig()
@@ -267,7 +266,9 @@ class RunpodFlashConfigTests(unittest.TestCase):
         self.assertEqual(base.fingerprint, policy.fingerprint)
         self.assertEqual(base.fingerprint, transport_variant.fingerprint)
         self.assertEqual(base.effective_model_config, policy)
-        self.assertNotEqual(base.fingerprint, replace(base, precision="float16").fingerprint)
+        self.assertNotEqual(
+            base.fingerprint, replace(base, precision="float16").fingerprint
+        )
 
     def test_transport_values_are_validated_without_runpod_imports(self) -> None:
         with self.assertRaises(ValueError):
@@ -429,7 +430,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 )
                 self.addCleanup(scorer.close)
                 with self.assertRaises(FlashScoringError):
-                    scorer.score("query", (passage, _passage("second", document_id="2")))
+                    scorer.score(
+                        "query", (passage, _passage("second", document_id="2"))
+                    )
 
     def test_endpoint_object_can_be_injected_and_is_run_then_waited(self) -> None:
         calls: list[tuple[str, object]] = []
@@ -549,7 +552,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
             def __bool__(self) -> bool:
                 return False
 
-            def __call__(self, config: object) -> tuple[FakeModel, BatchEncodingTokenizer]:
+            def __call__(
+                self, config: object
+            ) -> tuple[FakeModel, BatchEncodingTokenizer]:
                 self.calls += 1
                 return model, tokenizer
 
@@ -567,7 +572,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
         self.assertEqual(loader.calls, 1)
         self.assertEqual(default_model.predict_calls, [])
 
-    def test_failed_prediction_binds_first_fingerprint_before_later_request(self) -> None:
+    def test_failed_prediction_binds_first_fingerprint_before_later_request(
+        self,
+    ) -> None:
         policy_a = LocalCrossEncoderConfig(query_policy="policy-a")
         policy_b = replace(policy_a, query_policy="policy-b")
         tokenizer = BatchEncodingTokenizer()
@@ -602,20 +609,16 @@ class StaticFlashWorkerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             worker.score({**request, "scorer_fingerprint": "wrong"})
         with self.assertRaises(FlashScoringError):
-            worker.score(
-                _request_for_config(
-                    policy, text="overflow"
-                )
-            )
+            worker.score(_request_for_config(policy, text="overflow"))
         self.assertEqual(len(loader.calls), 1)
 
-    def test_worker_accepts_batch_encoding_mapping_and_returns_finite_hash_scores(self) -> None:
+    def test_worker_accepts_batch_encoding_mapping_and_returns_finite_hash_scores(
+        self,
+    ) -> None:
         policy = LocalCrossEncoderConfig(batch_size=2, max_length=100)
         model = FakeModel(multiplier=2.0)
         tokenizer = BatchEncodingTokenizer()
-        worker = build_flash_worker(policy)(
-            loader=CountingLoader(model, tokenizer)
-        )
+        worker = build_flash_worker(policy)(loader=CountingLoader(model, tokenizer))
         response = worker.score(
             {
                 **_request_for_config(policy),
@@ -688,7 +691,9 @@ class FlashDecorationTests(unittest.TestCase):
         )
         calls: list[object] = []
 
-        def endpoint_factory(**kwargs: object) -> Callable[[type[object]], type[object]]:
+        def endpoint_factory(
+            **kwargs: object,
+        ) -> Callable[[type[object]], type[object]]:
             calls.append(kwargs)
 
             def decorate(worker: type[object]) -> type[object]:

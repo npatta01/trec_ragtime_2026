@@ -219,9 +219,7 @@ class PassageScoreCache:
 
         self._store = store
         self._scorer = scorer
-        self._scorer_fingerprint = _non_blank(
-            scorer_fingerprint, "scorer_fingerprint"
-        )
+        self._scorer_fingerprint = _non_blank(scorer_fingerprint, "scorer_fingerprint")
         self._chunker_fingerprint = _non_blank(
             chunker_fingerprint, "chunker_fingerprint"
         )
@@ -297,8 +295,7 @@ class PassageScoreCache:
             prior_scores = decode_score_map(payload)
 
         return {
-            content_hash: prior_scores[content_hash]
-            for content_hash, _ in requested
+            content_hash: prior_scores[content_hash] for content_hash, _ in requested
         }
 
 

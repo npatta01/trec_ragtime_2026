@@ -308,9 +308,7 @@ def _normalize_score(value: object, *, key: object) -> float:
     try:
         normalized = float(value)
     except (OverflowError, TypeError, ValueError) as error:
-        raise PassageScoringError(
-            "score could not be normalized to float"
-        ) from error
+        raise PassageScoringError("score could not be normalized to float") from error
     if not math.isfinite(normalized):
         raise PassageScoringError("scores must be finite")
     return normalized

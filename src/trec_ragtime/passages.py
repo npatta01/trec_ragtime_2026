@@ -21,8 +21,7 @@ _PIPELINES_BY_LANGUAGE: Mapping[str, str] = {
     "zho": "zh_core_web_sm",
 }
 _PINNED_PIPELINE_MAPPING = ";".join(
-    f"{language}={pipeline}"
-    for language, pipeline in _PIPELINES_BY_LANGUAGE.items()
+    f"{language}={pipeline}" for language, pipeline in _PIPELINES_BY_LANGUAGE.items()
 )
 
 
@@ -97,7 +96,9 @@ class Passage:
         ):
             raise PassageChunkingError("content_hash does not match text")
         if not isinstance(self.boundary, str) or self.boundary not in _BOUNDARIES:
-            raise PassageChunkingError("boundary must be sentence or oversized_sentence")
+            raise PassageChunkingError(
+                "boundary must be sentence or oversized_sentence"
+            )
 
 
 def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
@@ -123,7 +124,9 @@ def validate_passages(selected_text: str, passages: Sequence[Passage]) -> None:
         if selected_text[passage.start_char : passage.end_char] != passage.text:
             raise PassageChunkingError("passage text does not match its source slice")
         if passage.content_hash != sha256_bytes(passage.text):
-            raise PassageChunkingError("passage content hash does not match passage text")
+            raise PassageChunkingError(
+                "passage content hash does not match passage text"
+            )
         if passage.start_char > covered_end:
             raise PassageChunkingError("passage intervals contain a gap")
         covered_end = max(covered_end, passage.end_char)
@@ -226,9 +229,9 @@ class PassageChunker:
         )
         self._pair_length = pair_length
         self._overlap_tokens = overlap_tokens
-        self._fingerprint = "langchain-spacy-v1/" + sha256_bytes(
-            fingerprint_material
-        ).hex()
+        self._fingerprint = (
+            "langchain-spacy-v1/" + sha256_bytes(fingerprint_material).hex()
+        )
         self._sentence_splitters: dict[str, object] = {}
 
     @property
@@ -281,7 +284,9 @@ class PassageChunker:
                 add_start_index=True,
             )
         except Exception as error:
-            raise PassageChunkingError("recursive sentence splitter is unavailable") from error
+            raise PassageChunkingError(
+                "recursive sentence splitter is unavailable"
+            ) from error
 
     @staticmethod
     def _spacy_sentence_units(splitter: object, parent_text: str) -> tuple[_Span, ...]:
@@ -326,16 +331,13 @@ class PassageChunker:
             if first.start_char <= previous_start:
                 continue
             end = first.end_char
-            if (
-                end > previous_end
-                and parent_text[first.start_char:end] == content
-            ):
+            if end > previous_end and parent_text[first.start_char : end] == content:
                 return _Span(content, first.start_char, end)
             for later in sentence_units[start_index + 1 :]:
                 end = later.end_char
                 if end <= previous_end:
                     continue
-                if parent_text[first.start_char:end] == content:
+                if parent_text[first.start_char : end] == content:
                     return _Span(content, first.start_char, end)
         return None
 
@@ -357,7 +359,9 @@ class PassageChunker:
             content = getattr(document, "page_content", None)
             metadata = getattr(document, "metadata", None)
             if not isinstance(content, str) or not content:
-                raise PassageChunkingError(f"{parent_name} splitter returned empty text")
+                raise PassageChunkingError(
+                    f"{parent_name} splitter returned empty text"
+                )
             if not isinstance(metadata, dict) or "start_index" not in metadata:
                 raise PassageChunkingError(
                     f"{parent_name} splitter did not return start_index metadata"
@@ -470,7 +474,10 @@ class PassageChunker:
             raise PassageChunkingError("canonical_text must not be empty")
         if not isinstance(selected_text, str) or not selected_text:
             raise PassageChunkingError("selected_text must not be empty")
-        if not isinstance(representation, str) or representation not in _REPRESENTATIONS:
+        if (
+            not isinstance(representation, str)
+            or representation not in _REPRESENTATIONS
+        ):
             raise PassageChunkingError(
                 "representation must be canonical or report_text"
             )

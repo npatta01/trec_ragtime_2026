@@ -17,7 +17,6 @@ from trec_ragtime.reranking import (
     RerankedDocument,
     RerankingError,
     RerankingResult,
-    max_passage_v1,
     rerank_retrieval,
 )
 
@@ -115,8 +114,7 @@ class RecordingScorer:
         requested = tuple(passages)
         self.calls.append((query, requested))
         return {
-            passage.content_hash: self.scores[passage.text]
-            for passage in requested
+            passage.content_hash: self.scores[passage.text] for passage in requested
         }
 
 
@@ -274,7 +272,9 @@ class RerankingTests(unittest.TestCase):
             with self.subTest(record=record):
                 self.assertTrue(is_dataclass(record))
                 self.assertIsInstance(record.__slots__, tuple)
-                self.assertEqual(tuple(field.name for field in fields(record)), expected_fields)
+                self.assertEqual(
+                    tuple(field.name for field in fields(record)), expected_fields
+                )
                 self.assertIsNot(record.__setattr__, object.__setattr__)
 
         result = rerank_retrieval(
@@ -477,7 +477,9 @@ class RerankingTests(unittest.TestCase):
         )
         self.assertEqual([passage.text for passage in scorer.calls[0][1]], ["same."])
 
-    def test_scorer_receives_first_seen_content_hashes_once_across_documents(self) -> None:
+    def test_scorer_receives_first_seen_content_hashes_once_across_documents(
+        self,
+    ) -> None:
         retrieval = _retrieval(
             (
                 _document("doc-b", rank=2, score=0.4, text="shared"),
@@ -488,15 +490,15 @@ class RerankingTests(unittest.TestCase):
 
         rerank_retrieval(
             retrieval,
-            chunker=RecordingChunker(
-                {"doc-a": (("shared", 0, 6), ("other", 7, 12))}
-            ),
+            chunker=RecordingChunker({"doc-a": (("shared", 0, 6), ("other", 7, 12))}),
             scorer=scorer,
             representation="canonical",
         )
 
         self.assertEqual(len(scorer.calls), 1)
-        self.assertEqual([passage.text for passage in scorer.calls[0][1]], ["shared", "other"])
+        self.assertEqual(
+            [passage.text for passage in scorer.calls[0][1]], ["shared", "other"]
+        )
 
     def test_document_ties_use_organizer_rank_then_document_id(self) -> None:
         retrieval = _retrieval(
