@@ -29,7 +29,7 @@ DEFAULT_QUERY_POLICY = "literal-v1"
 _HASH_LENGTH = 32
 _FINGERPRINT_PREFIX = "local-cross-encoder-v2/"
 _PAIR_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-pair-length-v1/"
-_PASSAGE_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-passage-length-v1/"
+_PASSAGE_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-passage-length-v2/"
 _RUNTIME_DISTRIBUTIONS = (
     ("sentence_transformers_version", "sentence-transformers"),
     ("transformers_version", "transformers"),
@@ -488,6 +488,36 @@ def _token_length(encoded: object) -> int:
     return length
 
 
+def _reported_token_length(encoded: object) -> int:
+    """Validate one tokenizer ``return_length`` result against ``input_ids``."""
+
+    input_ids_length = _token_length(encoded)
+    encoded_mapping = cast(Mapping[str, object], encoded)
+    reported = _as_sequence(encoded_mapping.get("length"))
+    if isinstance(reported, bool):
+        raise PassageScoringError("tokenizer returned a malformed length")
+    if isinstance(reported, int):
+        length = reported
+    elif isinstance(reported, Sequence) and not isinstance(
+        reported, (str, bytes, bytearray)
+    ):
+        values = list(reported)
+        if (
+            len(values) != 1
+            or isinstance(values[0], bool)
+            or not isinstance(values[0], int)
+        ):
+            raise PassageScoringError("tokenizer returned a malformed length")
+        length = values[0]
+    else:
+        raise PassageScoringError("tokenizer did not return a valid length")
+    if length < 0 or length != input_ids_length:
+        raise PassageScoringError(
+            "tokenizer length does not match the returned input_ids"
+        )
+    return length
+
+
 class _PassageLengthFunction:
     """Stable additive passage-length view over one pair-length callable."""
 
@@ -496,7 +526,7 @@ class _PassageLengthFunction:
     def __init__(self, owner: "CrossEncoderPairLengthFunction") -> None:
         material = msgspec.msgpack.encode(
             (
-                "cross-encoder-passage-length-v1",
+                "cross-encoder-passage-length-v2",
                 owner.fingerprint,
             )
         )
@@ -531,7 +561,7 @@ class CrossEncoderPairLengthFunction:
         "_loader",
         "_load_lock",
         "_tokenizer",
-        "_empty_passage_pair_length",
+        "_pair_token_overhead_value",
         "_passage_length_function",
         "_fingerprint",
     )
@@ -568,7 +598,7 @@ class CrossEncoderPairLengthFunction:
         self._loader = tokenizer_loader or loader or _default_tokenizer_loader
         self._load_lock = threading.Lock()
         self._tokenizer: Any | None = None
-        self._empty_passage_pair_length: int | None = None
+        self._pair_token_overhead_value: int | None = None
         self._fingerprint = (
             _PAIR_LENGTH_FINGERPRINT_PREFIX + hashlib.sha256(material).hexdigest()
         )
@@ -612,22 +642,72 @@ class CrossEncoderPairLengthFunction:
 
     @property
     def max_passage_length(self) -> int:
-        """Return the budget after the exact formatted-query pair overhead."""
+        """Return the budget after query tokens and pair special tokens."""
 
-        budget = self._config.max_length - self._empty_pair_length()
+        budget = self._config.max_length - self._pair_token_overhead()
         if budget <= 0:
             raise PassageScoringError(
                 "max_length leaves no positive passage token budget"
             )
         return budget
 
-    def _empty_pair_length(self) -> int:
-        if self._empty_passage_pair_length is None:
-            self._empty_passage_pair_length = self("")
-        return self._empty_passage_pair_length
+    def _single_sequence_length(self, text: str) -> int:
+        tokenizer = self._ensure_tokenizer()
+        try:
+            encoded = tokenizer(
+                text,
+                add_special_tokens=False,
+                truncation=False,
+                return_length=True,
+            )
+        except PassageScoringError:
+            raise
+        except Exception as error:
+            raise PassageScoringError(
+                "tokenizer failed while counting a single sequence"
+            ) from error
+        return _reported_token_length(encoded)
+
+    def _pair_token_overhead(self) -> int:
+        if self._pair_token_overhead_value is not None:
+            return self._pair_token_overhead_value
+
+        query_length = self._single_sequence_length(self._formatted_query)
+        if query_length <= 0:
+            raise PassageScoringError(
+                "formatted query must have a positive no-special token length"
+            )
+        tokenizer = self._ensure_tokenizer()
+        special_token_counter = getattr(tokenizer, "num_special_tokens_to_add", None)
+        if not callable(special_token_counter):
+            raise PassageScoringError(
+                "tokenizer must expose num_special_tokens_to_add(pair=True)"
+            )
+        try:
+            special_tokens = special_token_counter(pair=True)
+        except Exception as error:
+            raise PassageScoringError(
+                "tokenizer failed while counting pair special tokens"
+            ) from error
+        if (
+            isinstance(special_tokens, bool)
+            or not isinstance(special_tokens, int)
+            or special_tokens < 0
+        ):
+            raise PassageScoringError(
+                "tokenizer returned an invalid pair special-token count"
+            )
+
+        overhead = query_length + special_tokens
+        if overhead <= 0:
+            raise PassageScoringError("formatted query pair overhead must be positive")
+        self._pair_token_overhead_value = overhead
+        return overhead
 
     def _passage_length(self, passage: str) -> int:
-        return self(passage) - self._empty_pair_length()
+        if not isinstance(passage, str):
+            raise PassageScoringError("passage must be a string")
+        return self._single_sequence_length(passage)
 
     def _ensure_tokenizer(self) -> Any:
         if self._tokenizer is not None:
@@ -666,10 +746,7 @@ class CrossEncoderPairLengthFunction:
             raise PassageScoringError(
                 "tokenizer failed while counting a passage pair"
             ) from error
-        length = _token_length(encoded)
-        if passage == "":
-            self._empty_passage_pair_length = length
-        return length
+        return _token_length(encoded)
 
 
 def _prediction_values(result: object, expected_count: int) -> list[object]:

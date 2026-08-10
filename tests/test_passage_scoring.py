@@ -78,17 +78,62 @@ class RecordingModel:
 
 class PairCountingTokenizer:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.calls: list[tuple[str, str | None, dict[str, Any]]] = []
+        self.special_token_calls: list[bool] = []
 
     def __call__(
-        self, query: str, passage: str, **kwargs: Any
-    ) -> dict[str, list[list[int]]]:
+        self, query: str, passage: str | None = None, **kwargs: Any
+    ) -> dict[str, object]:
         self.calls.append((query, passage, kwargs))
-        query_tokens = sum(2 if character == "你" else 1 for character in query)
-        passage_tokens = sum(2 if character == "中" else 1 for character in passage)
-        # Three explicit special tokens model a complete cross-encoder pair.
-        count = 3 + query_tokens + passage_tokens
-        return {"input_ids": [list(range(count))]}
+        query_tokens = sum(2 if character in {"你", "中"} else 1 for character in query)
+        if passage is None:
+            count = query_tokens
+        else:
+            passage_tokens = sum(2 if character == "中" else 1 for character in passage)
+            # Three explicit special tokens model a complete cross-encoder pair.
+            count = 3 + query_tokens + passage_tokens
+        return {"input_ids": list(range(count)), "length": [count]}
+
+    def num_special_tokens_to_add(self, pair: bool = False) -> int:
+        self.special_token_calls.append(pair)
+        return 3 if pair else 2
+
+
+class ReviewedPinnedTokenizer:
+    """Offline shape matching the reviewed pinned-tokenizer reproduction."""
+
+    QUERY = "shared evidence and practical outcomes"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+        self.special_token_calls: list[bool] = []
+
+    def __call__(self, *texts: str, **kwargs: Any) -> dict[str, object]:
+        self.calls.append((texts, kwargs))
+        if len(texts) == 2:
+            query, passage = texts
+            if query != self.QUERY:
+                raise AssertionError(f"unexpected pair query: {query!r}")
+            count = 8 if not passage else len(passage) + 11
+        elif len(texts) == 1:
+            (text,) = texts
+            if kwargs.get("add_special_tokens") is not False:
+                raise AssertionError("single-sequence counting must disable specials")
+            if text == self.QUERY:
+                count = 6
+            elif not text:
+                count = 0
+            elif set(text) == {"中"}:
+                count = len(text) + 1
+            else:
+                raise AssertionError(f"unexpected single sequence: {text!r}")
+        else:
+            raise AssertionError(f"unexpected tokenizer arity: {len(texts)}")
+        return {"input_ids": list(range(count)), "length": [count]}
+
+    def num_special_tokens_to_add(self, pair: bool = False) -> int:
+        self.special_token_calls.append(pair)
+        return 4 if pair else 2
 
 
 def _runtime_versions() -> dict[str, str]:
@@ -296,11 +341,20 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             tokenizer.calls,
             [
                 ("Q: exact 你", "中文", {"truncation": False, "return_length": True}),
-                ("Q: exact 你", "", {"truncation": False, "return_length": True}),
+                (
+                    "Q: exact 你",
+                    None,
+                    {
+                        "add_special_tokens": False,
+                        "truncation": False,
+                        "return_length": True,
+                    },
+                ),
             ],
         )
+        self.assertEqual(tokenizer.special_token_calls, [True])
 
-    def test_splitter_budget_is_additive_and_uses_exact_empty_pair_overhead(
+    def test_splitter_budget_uses_official_passage_only_tokenization(
         self,
     ) -> None:
         config = LocalCrossEncoderConfig(max_length=16, query_format="Q: {query}")
@@ -321,12 +375,26 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             [
                 ("Q: exact 你", "", {"truncation": False, "return_length": True}),
                 (
-                    "Q: exact 你",
                     "中文",
-                    {"truncation": False, "return_length": True},
+                    None,
+                    {
+                        "add_special_tokens": False,
+                        "truncation": False,
+                        "return_length": True,
+                    },
+                ),
+                (
+                    "Q: exact 你",
+                    None,
+                    {
+                        "add_special_tokens": False,
+                        "truncation": False,
+                        "return_length": True,
+                    },
                 ),
             ],
         )
+        self.assertEqual(tokenizer.special_token_calls, [True])
 
         chunker_config = ChunkerConfig(
             chunk_size=length_function.max_passage_length,
@@ -337,18 +405,111 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             length_function.passage_length_function.fingerprint,
         )
 
-    def test_splitter_budget_matches_reviewed_pinned_query_case(self) -> None:
+    def test_splitter_budget_matches_reviewed_pinned_tokenizer_shape(self) -> None:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
         config = LocalCrossEncoderConfig(max_length=512)
+        tokenizer = ReviewedPinnedTokenizer()
         length_function = CrossEncoderPairLengthFunction(
             config,
-            "exact 你",
-            tokenizer_loader=lambda _: PairCountingTokenizer(),
+            ReviewedPinnedTokenizer.QUERY,
+            tokenizer_loader=lambda _: tokenizer,
         )
+        passage = "中" * 502
 
-        self.assertEqual(length_function(""), 11)
-        self.assertEqual(length_function.max_passage_length, 501)
+        self.assertEqual(length_function(passage), 513)
+        self.assertEqual(length_function(""), 8)
+        self.assertEqual(length_function.passage_length_function("中"), 2)
+        self.assertEqual(
+            length_function.passage_length_function("中" * 501),
+            length_function.max_passage_length,
+        )
+        self.assertEqual(length_function.passage_length_function(passage), 503)
+        self.assertEqual(length_function.max_passage_length, 502)
         self.assertGreater(length_function.max_passage_length, 0)
         self.assertLessEqual(length_function.max_passage_length, config.max_length)
+
+        splitter = RecursiveCharacterTextSplitter(
+            separators=[" ", ""],
+            keep_separator="end",
+            strip_whitespace=False,
+            chunk_overlap=0,
+            chunk_size=length_function.max_passage_length,
+            length_function=length_function.passage_length_function,
+        )
+        chunks = splitter.split_text(passage)
+
+        self.assertEqual([len(chunk) for chunk in chunks], [251, 251])
+        self.assertTrue(
+            all(length_function(chunk) <= config.max_length for chunk in chunks)
+        )
+        self.assertIn(
+            (
+                (ReviewedPinnedTokenizer.QUERY,),
+                {
+                    "add_special_tokens": False,
+                    "truncation": False,
+                    "return_length": True,
+                },
+            ),
+            tokenizer.calls,
+        )
+        self.assertIn(
+            (
+                (passage,),
+                {
+                    "add_special_tokens": False,
+                    "truncation": False,
+                    "return_length": True,
+                },
+            ),
+            tokenizer.calls,
+        )
+        self.assertEqual(tokenizer.special_token_calls, [True])
+
+    def test_splitter_budget_rejects_invalid_special_token_api_results(self) -> None:
+        config = LocalCrossEncoderConfig(max_length=16)
+        invalid_results: tuple[object, ...] = (None, True, -1, 1.5)
+
+        for invalid_result in invalid_results:
+            with self.subTest(invalid_result=invalid_result):
+                tokenizer = PairCountingTokenizer()
+                if invalid_result is None:
+                    tokenizer.num_special_tokens_to_add = None  # type: ignore[method-assign,assignment]
+                else:
+                    tokenizer.num_special_tokens_to_add = (  # type: ignore[method-assign]
+                        lambda pair, value=invalid_result: value
+                    )
+                length_function = CrossEncoderPairLengthFunction(
+                    config,
+                    "exact 你",
+                    tokenizer_loader=lambda _, value=tokenizer: value,
+                )
+
+                with self.assertRaises(PassageScoringError):
+                    _ = length_function.max_passage_length
+
+    def test_splitter_budget_rejects_malformed_query_token_length(self) -> None:
+        class MismatchedLengthTokenizer(PairCountingTokenizer):
+            def __call__(
+                self,
+                query: str,
+                passage: str | None = None,
+                **kwargs: Any,
+            ) -> dict[str, object]:
+                encoded = super().__call__(query, passage, **kwargs)
+                if passage is None:
+                    encoded["length"] = [999]
+                return encoded
+
+        length_function = CrossEncoderPairLengthFunction(
+            LocalCrossEncoderConfig(max_length=16),
+            "exact 你",
+            tokenizer_loader=lambda _: MismatchedLengthTokenizer(),
+        )
+
+        with self.assertRaisesRegex(PassageScoringError, "length"):
+            _ = length_function.max_passage_length
 
     def test_splitter_budget_rejects_a_query_with_no_positive_passage_budget(
         self,
@@ -387,6 +548,12 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             first.passage_length_function.fingerprint,
             first.fingerprint,
         )
+        self.assertTrue(
+            first.passage_length_function.fingerprint.startswith(
+                "cross-encoder-passage-length-v2/"
+            )
+        )
+        self.assertTrue(first.fingerprint.startswith("cross-encoder-pair-length-v1/"))
 
     def test_pair_length_loader_is_tokenizer_only_and_never_imports_model_stack(
         self,
