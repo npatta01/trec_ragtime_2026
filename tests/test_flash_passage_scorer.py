@@ -18,6 +18,7 @@ import threading
 import types
 import unittest
 import warnings
+from collections import UserDict
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -1246,7 +1247,7 @@ class FlashWorkerTests(unittest.TestCase):
             response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 3.5}]
         )
 
-    def test_extracted_worker_is_self_contained_with_declared_dependency_fakes(
+    def test_extracted_worker_accepts_batch_encoding_mapping_without_project_imports(
         self,
     ) -> None:
         import msgspec as installed_msgspec
@@ -1260,12 +1261,14 @@ class FlashWorkerTests(unittest.TestCase):
         class FakeTokenizer:
             def __call__(
                 self, query: str, text: str, **kwargs: Any
-            ) -> dict[str, object]:
-                return {
-                    "input_ids": [[1] * (len(query) + len(text))],
-                    "overflowing_tokens": [],
-                    "num_truncated_tokens": 0,
-                }
+            ) -> UserDict[str, object]:
+                return UserDict(
+                    {
+                        "input_ids": [[1] * (len(query) + len(text))],
+                        "overflowing_tokens": [],
+                        "num_truncated_tokens": 0,
+                    }
+                )
 
         class FakeModel:
             def __init__(self) -> None:

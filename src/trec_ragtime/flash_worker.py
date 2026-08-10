@@ -474,7 +474,9 @@ def build_flash_worker(
 
     @classmethod
     def _token_length(cls, encoded: object) -> int:
-        if not isinstance(encoded, dict):
+        from collections.abc import Mapping
+
+        if not isinstance(encoded, Mapping):
             raise cls._error("tokenizer returned a non-mapping result")
         input_ids = cls._as_sequence(encoded.get("input_ids"))
         if input_ids is None:
