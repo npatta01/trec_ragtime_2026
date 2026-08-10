@@ -372,6 +372,7 @@ def _validated_reference(
 def _corpus_manifest(retriever: RetrieverLike) -> dict[str, object]:
     metadata = getattr(getattr(retriever, "corpus", None), "metadata", None)
     return {
+        "backend": getattr(retriever, "document_backend", "local"),
         "path": (
             str(retriever.corpus_path)
             if retriever.corpus_path is not None

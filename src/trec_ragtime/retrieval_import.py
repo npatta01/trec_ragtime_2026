@@ -18,7 +18,7 @@ import stat
 import tempfile
 from urllib.parse import urlsplit
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .artifact_store import ArtifactStore
+from .cache import DEFAULT_CACHE_NAMESPACE
+from .huggingface import (
+    DEFAULT_HF_DATASET,
+    DEFAULT_HF_MT_SPLITS,
+    DEFAULT_HF_SPLITS,
+)
 from .local_corpus import LocalCorpusIndex
 from .models import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
 from .query_baselines import load_query_plans
@@ -134,8 +140,7 @@ def _read_json(source: _SourceFile) -> dict[str, Any]:
     return payload
 
 
-def _read_jsonl(source: _SourceFile) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
+def _read_jsonl(source: _SourceFile) -> Iterator[dict[str, Any]]:
     try:
         with source.path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -147,10 +152,15 @@ def _read_jsonl(source: _SourceFile) -> list[dict[str, Any]]:
                     raise RetrievalImportError("source JSONL contains invalid JSON") from None
                 if not isinstance(payload, dict):
                     raise RetrievalImportError("source JSONL records must be objects")
-                records.append(payload)
+                yield payload
     except UnicodeError:
         raise RetrievalImportError("source JSONL is not valid UTF-8") from None
-    return records
+
+
+def _validate_cache_namespace(cache: RetrievalArtifactCache) -> None:
+    namespace = getattr(cache.store, "namespace", None)
+    if namespace != DEFAULT_CACHE_NAMESPACE:
+        raise RetrievalImportError("retrieval artifact cache namespace is not canonical")
 
 
 def _validate_external_source(
@@ -246,12 +256,36 @@ def _corpus_identity(corpus: Any) -> dict[str, Any]:
     }
 
 
-def _check_manifest_corpus(manifest: Mapping[str, Any], identity: Mapping[str, Any]) -> None:
+def _check_manifest_corpus(
+    manifest: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    *,
+    schema: str,
+) -> None:
     expected = manifest.get("corpus")
     if not isinstance(expected, Mapping):
         raise RetrievalImportError("run manifest has no corpus identity")
-    if expected.get("backend") not in (None, "local"):
+    if expected.get("backend") != "local":
         raise RetrievalImportError("run manifest does not describe a local corpus")
+    required = {"backend", "revision"}
+    if schema == QUERY_BASELINE_SCHEMA:
+        required.update(
+            {
+                "schema_version",
+                "dataset",
+                "config",
+                "document_count",
+                "shard_count",
+                "splits",
+                "translation_config",
+                "translation_count",
+                "translation_shard_count",
+                "translation_splits",
+            }
+        )
+    missing = sorted(key for key in required if key not in expected)
+    if missing:
+        raise RetrievalImportError("run corpus identity is missing promised fields")
     for key in identity:
         if key == "path" or key not in expected:
             continue
@@ -402,6 +436,9 @@ def _validate_control_manifest(manifest: Mapping[str, Any]) -> None:
         raise RetrievalImportError("unsupported Control-A pipeline")
     if manifest.get("query_construction") != "problem_only_v1":
         raise RetrievalImportError("unsupported Control-A query construction")
+    top_k = manifest.get("requested_top_k")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 100:
+        raise RetrievalImportError("Control-A requested_top_k must be in the range 1..100")
     retrieval = manifest.get("retrieval")
     if not isinstance(retrieval, Mapping) or retrieval.get("max_content_fallbacks") != 0:
         raise RetrievalImportError("Control-A run is not a no-fallback retrieval artifact")
@@ -470,6 +507,29 @@ def _source_manifest(sources: Sequence[_SourceFile]) -> dict[str, dict[str, obje
     }
 
 
+def _preflight_manifest_path(path: Path, sources: Sequence[_SourceFile]) -> Path:
+    """Reject every output/source alias before corpus or cache work begins."""
+
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        raise RetrievalImportError("migration manifest path must be absolute")
+    if path.is_symlink():
+        raise RetrievalImportError("migration manifest path must not be a symlink")
+    try:
+        output_resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        raise RetrievalImportError("migration manifest path could not be resolved") from None
+    for source in sources:
+        try:
+            if output_resolved == source.path.resolve(strict=True):
+                raise RetrievalImportError("migration manifest must not replace a source input")
+            if path.exists() and os.path.samestat(path.stat(), source.path.stat()):
+                raise RetrievalImportError("migration manifest must not alias a source input")
+        except (OSError, RuntimeError):
+            raise RetrievalImportError("migration manifest and source could not be compared") from None
+    return path
+
+
 def _safe_cache_metadata(cache: RetrievalArtifactCache) -> dict[str, str]:
     store = cache.store
     output: dict[str, str] = {}
@@ -488,15 +548,7 @@ def _safe_cache_metadata(cache: RetrievalArtifactCache) -> dict[str, str]:
 
 
 def _write_manifest(path: Path, payload: Mapping[str, Any], *, sources: Sequence[_SourceFile]) -> None:
-    path = Path(path).expanduser()
-    if not path.is_absolute() or path.is_symlink():
-        raise RetrievalImportError("migration manifest path must be absolute and non-symlinked")
-    for source in sources:
-        try:
-            if path.exists() and os.path.samestat(path.stat(), source.path.stat()):
-                raise RetrievalImportError("migration manifest must not replace a source input")
-        except OSError:
-            raise RetrievalImportError("migration manifest and source could not be compared") from None
+    path = _preflight_manifest_path(path, sources)
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
     temporary: Path | None = None
@@ -541,15 +593,14 @@ def _control_records(
         if topic_id in status_by_topic:
             raise RetrievalImportError("Control-A topic statuses contain duplicates")
         status_by_topic[topic_id] = status
-    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    # Validate the complete stream before any artifact write. The subsequent
+    # per-topic passes keep only one bounded candidate group in memory.
     invalid_record_count = 0
     for record in _read_jsonl(candidate_source):
         topic_id = record.get("topic_id")
         if not isinstance(topic_id, str) or topic_id not in topic_queries:
             skipped_reasons["invalid_control_topic"] += 1
             invalid_record_count += 1
-            continue
-        grouped.setdefault(topic_id, []).append(record)
     imported = verified = 0
     skipped = invalid_record_count
     top_k = manifest.get("requested_top_k")
@@ -557,10 +608,19 @@ def _control_records(
         raise RetrievalImportError("Control-A top_k is invalid")
     for topic_id, query in topic_queries.items():
         status = status_by_topic.get(topic_id)
-        records = grouped.get(topic_id, [])
+        records: list[Mapping[str, Any]] = []
+        for record in _read_jsonl(candidate_source):
+            if record.get("topic_id") == topic_id:
+                records.append(record)
+                if len(records) > top_k:
+                    break
         if status is None or status.get("error") or status.get("unresolved_ids"):
             skipped += 1
             skipped_reasons["failed_or_partial_record"] += 1
+            continue
+        if len(records) > top_k:
+            skipped += 1
+            skipped_reasons["record_rejected"] += 1
             continue
         try:
             hits: list[dict[str, Any]] = []
@@ -713,9 +773,10 @@ def import_retrieval_run(
 ) -> RetrievalImportSummary:
     """Import one immutable Control-A or B/C run without participant I/O."""
 
-    run = _run_directory(run_dir)
     if not isinstance(cache, RetrievalArtifactCache):
         raise TypeError("cache must be a RetrievalArtifactCache")
+    _validate_cache_namespace(cache)
+    run = _run_directory(run_dir)
     base_url = _validate_base_url(base_url)
     manifest_source = _source_file("manifest.json", run / "manifest.json")
     manifest = _read_json(manifest_source)
@@ -729,14 +790,9 @@ def import_retrieval_run(
     sources, _ = _prepare_sources(
         run, manifest, schema, manifest_source=manifest_source
     )
-    output = Path(manifest_path).expanduser()
-    if not output.is_absolute():
-        raise RetrievalImportError("migration manifest path must be absolute")
-    for source in sources:
-        if output.exists() and os.path.samestat(output.stat(), source.path.stat()):
-            raise RetrievalImportError("migration manifest must not replace a source input")
+    output = _preflight_manifest_path(manifest_path, sources)
     corpus_identity = _corpus_identity(corpus)
-    _check_manifest_corpus(manifest, corpus_identity)
+    _check_manifest_corpus(manifest, corpus_identity, schema=schema)
     objects: list[str] = []
     skipped_reasons: Counter[str] = Counter()
     if schema == CONTROL_A_SCHEMA:
@@ -807,10 +863,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     load_dotenv()
     base_url = args.base_url or os.getenv("RAGTIME_BASE_URL", "")
-    corpus = LocalCorpusIndex(args.corpus)
+    store = ArtifactStore.from_env()
+    cache = RetrievalArtifactCache(store)
+    _validate_cache_namespace(cache)
+    corpus = LocalCorpusIndex(
+        args.corpus,
+        expected_dataset=DEFAULT_HF_DATASET,
+        expected_splits=DEFAULT_HF_SPLITS,
+        expected_translation_splits=DEFAULT_HF_MT_SPLITS,
+    )
     try:
-        store = ArtifactStore.from_env()
-        cache = RetrievalArtifactCache(store)
         summary = import_retrieval_run(
             args.run_dir,
             corpus=corpus,

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import duckdb
 
@@ -16,7 +17,9 @@ from trec_ragtime.local_corpus import LocalCorpusIndex, build_from_parquet
 from trec_ragtime.retrieval_cache import RetrievalArtifactCache
 from trec_ragtime.retrieval_import import (
     RetrievalImportError,
+    _read_jsonl,
     import_retrieval_run,
+    main,
 )
 
 
@@ -177,6 +180,13 @@ class RetrievalImportTests(unittest.TestCase):
                 "schema_version": 2,
                 "dataset": "example/ragtime",
                 "config": "default",
+                "document_count": 3,
+                "shard_count": 1,
+                "splits": ["eng"],
+                "translation_config": "mt_docs",
+                "translation_count": 0,
+                "translation_shard_count": 0,
+                "translation_splits": [],
             },
             "pipeline": "ragtime2",
             "top_k": 100,
@@ -282,6 +292,161 @@ class RetrievalImportTests(unittest.TestCase):
                 base_url="https://organizer.example.test",
             )
         self.assertEqual(self.store.objects, {})
+
+    def test_rejects_noncanonical_namespace_before_reading_or_writing(self) -> None:
+        run = self._write_control_run()
+        self.store.namespace = "other-v2"
+        with self.assertRaises(RetrievalImportError):
+            import_retrieval_run(
+                run,
+                corpus=self.corpus,
+                cache=self.cache,
+                manifest_path=self.root / "out.json",
+                base_url="https://organizer.example.test",
+            )
+        self.assertEqual(self.store.objects, {})
+
+    def test_output_symlink_is_preflighted_before_corpus_or_cache_work(self) -> None:
+        run = self._write_control_run()
+        target = self.root / "unrelated.json"
+        target.write_text("keep me", encoding="utf-8")
+        output = self.root / "out.json"
+        output.symlink_to(target)
+        with patch.object(self.corpus, "verify_integrity", side_effect=AssertionError("corpus must not be opened")):
+            with self.assertRaises(RetrievalImportError):
+                import_retrieval_run(
+                    run,
+                    corpus=self.corpus,
+                    cache=self.cache,
+                    manifest_path=output,
+                    base_url="https://organizer.example.test",
+                )
+        self.assertEqual(self.store.objects, {})
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep me")
+
+    def test_rejects_unsupported_control_depth_before_writing(self) -> None:
+        run = self._write_control_run()
+        manifest_path = run / "manifest.json"
+        payload = json.loads(manifest_path.read_text())
+        payload["requested_top_k"] = 101
+        payload["retrieval"]["top_k"] = 101
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(RetrievalImportError):
+            import_retrieval_run(
+                run,
+                corpus=self.corpus,
+                cache=self.cache,
+                manifest_path=self.root / "out.json",
+                base_url="https://organizer.example.test",
+            )
+        self.assertEqual(self.store.objects, {})
+
+    def test_cli_rejects_namespace_and_noncanonical_corpus_without_writes(self) -> None:
+        run = self._write_control_run()
+        output = self.root / "cli-manifest.json"
+        self.store.namespace = "other-v2"
+        with patch(
+            "trec_ragtime.retrieval_import.ArtifactStore.from_env",
+            return_value=self.store,
+        ), patch(
+            "trec_ragtime.retrieval_import.LocalCorpusIndex",
+            return_value=self.corpus,
+        ):
+            with self.assertRaises(RetrievalImportError):
+                main(
+                    [
+                        str(run),
+                        "--manifest",
+                        str(output),
+                        "--corpus",
+                        str(self.corpus_path),
+                        "--base-url",
+                        "https://organizer.example.test",
+                    ]
+                )
+        self.assertEqual(self.store.objects, {})
+
+    def test_cli_constructs_canonical_local_corpus_expectations(self) -> None:
+        run = self._write_control_run()
+        output = self.root / "cli-manifest.json"
+        captured: dict[str, Any] = {}
+
+        def construct(*args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            raise RetrievalImportError("fixture corpus is intentionally rejected")
+
+        with patch(
+            "trec_ragtime.retrieval_import.ArtifactStore.from_env",
+            return_value=self.store,
+        ), patch(
+            "trec_ragtime.retrieval_import.LocalCorpusIndex",
+            side_effect=construct,
+        ):
+            with self.assertRaises(RetrievalImportError):
+                main(
+                    [
+                        str(run),
+                        "--manifest",
+                        str(output),
+                        "--corpus",
+                        str(self.corpus_path),
+                        "--base-url",
+                        "https://organizer.example.test",
+                    ]
+                )
+        self.assertEqual(captured["expected_dataset"], "trec-ragtime/ragtime2")
+        self.assertEqual(captured["expected_splits"], ("eng", "spa", "rus", "zho"))
+        self.assertEqual(
+            captured["expected_translation_splits"],
+            ("spa.mt.eng", "rus.mt.eng", "zho.mt.eng"),
+        )
+        self.assertEqual(self.store.objects, {})
+
+    def test_baseline_promised_corpus_identity_mismatch_skips_without_writes(self) -> None:
+        for field, value in (
+            ("dataset", "wrong/dataset"),
+            ("splits", ["spa"]),
+            ("translation_splits", ["spa.mt.eng"]),
+        ):
+            run = self._write_baseline_run()
+            renamed = self.root / f"baseline-{field}"
+            run.rename(renamed)
+            manifest_path = renamed / "manifest.json"
+            payload = json.loads(manifest_path.read_text())
+            payload["corpus"][field] = value
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.subTest(field=field), self.assertRaises(RetrievalImportError):
+                import_retrieval_run(
+                    renamed,
+                    corpus=self.corpus,
+                    cache=self.cache,
+                    manifest_path=self.root / f"out-{field}.json",
+                    base_url="https://organizer.example.test",
+                )
+            self.assertEqual(self.store.objects, {})
+
+    def test_control_missing_backend_is_rejected_without_writes(self) -> None:
+        run = self._write_control_run()
+        manifest_path = run / "manifest.json"
+        payload = json.loads(manifest_path.read_text())
+        del payload["corpus"]["backend"]
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(RetrievalImportError):
+            import_retrieval_run(
+                run,
+                corpus=self.corpus,
+                cache=self.cache,
+                manifest_path=self.root / "out.json",
+                base_url="https://organizer.example.test",
+            )
+        self.assertEqual(self.store.objects, {})
+
+    def test_jsonl_reader_is_incremental(self) -> None:
+        run = self._write_control_run()
+        source = type("Source", (), {"path": run / "candidates.jsonl"})()
+        records = _read_jsonl(source)
+        self.assertNotIsInstance(records, list)
+        self.assertEqual(next(records)["document_id"], "doc-1")
 
 
 if __name__ == "__main__":
