@@ -1,4 +1,4 @@
-"""Optional Runpod Flash transport for the passage-scoring protocol."""
+"""Thin optional Runpod Flash adapter for the passage-scoring protocol."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import numbers
+import string
 import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -27,27 +28,36 @@ DEFAULT_FLASH_BATCH_SIZE = 32
 DEFAULT_FLASH_CONCURRENCY = 4
 DEFAULT_FLASH_REQUEST_TIMEOUT = 60.0
 DEFAULT_FLASH_IDLE_TIMEOUT = 300.0
-_BRIDGE_CLEANUP_GRACE_SECONDS = 0.5
-_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS = 0.5
 DEFAULT_FLASH_WORKER_NAME = "trec-ragtime-passage-scorer"
 DEFAULT_FLASH_GPU = "AMPERE_24"
+_BRIDGE_CLEANUP_GRACE_SECONDS = 0.5
+_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS = 0.5
+_MODEL_CONFIG_FIELDS = (
+    "schema_version",
+    "model_name",
+    "revision",
+    "tokenizer_name",
+    "tokenizer_revision",
+    "sentence_transformers_version",
+    "transformers_version",
+    "tokenizers_version",
+    "torch_version",
+    "device",
+    "precision",
+    "batch_size",
+    "max_length",
+    "query_format",
+    "query_policy",
+)
 
 
 class FlashScoringError(PassageScoringError):
-    """Raised for invalid Flash wire data, transport failures, or timeouts."""
-
-
-class FlashWireValidationError(FlashScoringError):
-    """Raised when a Flash request or response is not strictly well-formed."""
+    """Raised for invalid Flash wire data, transport failures, or worker errors."""
 
 
 def _validate_schema_version(value: object) -> int:
-    if (
-        value != WIRE_SCHEMA_VERSION
-        or isinstance(value, bool)
-        or not isinstance(value, int)
-    ):
-        raise FlashWireValidationError("unsupported Flash wire schema version")
+    if isinstance(value, bool) or not isinstance(value, int) or value != WIRE_SCHEMA_VERSION:
+        raise FlashScoringError("unsupported Flash wire schema version")
     return value
 
 
@@ -57,8 +67,98 @@ def _validate_fingerprint(value: object) -> str:
         or not value.strip()
         or any(character in value for character in "\r\n")
     ):
-        raise FlashWireValidationError("scorer_fingerprint must be a non-blank string")
+        raise FlashScoringError("scorer_fingerprint must be a non-blank string")
     return value
+
+
+def _validate_model_config(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != set(_MODEL_CONFIG_FIELDS):
+        raise FlashScoringError(
+            "model_config must contain exactly every result-affecting scorer setting"
+        )
+    normalized = dict(value)
+    string_fields = {
+        "model_name",
+        "revision",
+        "tokenizer_name",
+        "tokenizer_revision",
+        "sentence_transformers_version",
+        "transformers_version",
+        "tokenizers_version",
+        "torch_version",
+        "query_format",
+        "query_policy",
+    }
+    for field_name in string_fields:
+        field_value = normalized[field_name]
+        if (
+            not isinstance(field_value, str)
+            or not field_value.strip()
+            or any(character in field_value for character in "\r\n")
+        ):
+            raise FlashScoringError(f"model_config field {field_name} is invalid")
+    for field_name in ("schema_version", "batch_size", "max_length"):
+        field_value = normalized[field_name]
+        if (
+            isinstance(field_value, bool)
+            or not isinstance(field_value, int)
+            or field_value <= 0
+        ):
+            raise FlashScoringError(f"model_config field {field_name} is invalid")
+    device = normalized["device"]
+    if not isinstance(device, str) or (
+        device not in {"cpu", "cuda"}
+        and not (device.startswith("cuda:") and device.removeprefix("cuda:").isdigit())
+    ):
+        raise FlashScoringError("model_config device is invalid")
+    precision = normalized["precision"]
+    if not isinstance(precision, str) or precision not in {
+        "float32",
+        "float16",
+        "bfloat16",
+    }:
+        raise FlashScoringError("model_config precision is invalid")
+    fields: list[str] = []
+    try:
+        for _, field_name, format_spec, conversion in string.Formatter().parse(
+            normalized["query_format"]
+        ):
+            if field_name is None:
+                continue
+            if field_name != "query" or format_spec or conversion:
+                raise FlashScoringError("model_config query_format is invalid")
+            fields.append(field_name)
+    except (IndexError, ValueError) as error:
+        raise FlashScoringError("model_config query_format is invalid") from error
+    if fields != ["query"]:
+        raise FlashScoringError("model_config query_format is invalid")
+    return normalized
+
+
+def _model_config_mapping(config: LocalCrossEncoderConfig) -> dict[str, object]:
+    return {
+        "schema_version": config.schema_version,
+        "model_name": config.model_name,
+        "revision": config.revision,
+        "tokenizer_name": config.tokenizer_name,
+        "tokenizer_revision": config.tokenizer_revision,
+        "sentence_transformers_version": config.sentence_transformers_version,
+        "transformers_version": config.transformers_version,
+        "tokenizers_version": config.tokenizers_version,
+        "torch_version": config.torch_version,
+        "device": config.effective_device,
+        "precision": config.effective_precision,
+        "batch_size": config.batch_size,
+        "max_length": config.max_length,
+        "query_format": config.query_format,
+        "query_policy": config.query_policy,
+    }
+
+
+def _wire_model_config(value: object) -> dict[str, object]:
+    if isinstance(value, LocalCrossEncoderConfig):
+        return _model_config_mapping(value)
+    return _validate_model_config(value)
 
 
 def _json_bytes(value: object) -> bytes:
@@ -71,18 +171,14 @@ def _json_bytes(value: object) -> bytes:
             sort_keys=True,
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as error:
-        raise FlashWireValidationError(
-            "wire payload is not valid compact UTF-8 JSON"
-        ) from error
+        raise FlashScoringError("wire payload is not valid compact UTF-8 JSON") from error
 
 
 def _reject_json_constant(value: str) -> object:
     raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
 
 
-def _json_object(
-    payload: bytes | bytearray | str | Mapping[str, object],
-) -> dict[str, object]:
+def _json_object(payload: bytes | bytearray | str | Mapping[str, object]) -> dict[str, object]:
     if isinstance(payload, Mapping):
         value: object = dict(payload)
     else:
@@ -91,93 +187,73 @@ def _json_object(
         elif isinstance(payload, (bytes, bytearray)):
             encoded = bytes(payload)
         else:
-            raise FlashWireValidationError(
-                "wire payload must be JSON bytes or an object"
-            )
+            raise FlashScoringError("wire payload must be JSON bytes or an object")
         try:
             value = json.loads(
                 encoded.decode("utf-8"), parse_constant=_reject_json_constant
             )
-        except (
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-            TypeError,
-            ValueError,
-        ) as error:
-            raise FlashWireValidationError("wire payload is not valid JSON") from error
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise FlashScoringError("wire payload is not valid JSON") from error
     if not isinstance(value, dict):
-        raise FlashWireValidationError("wire payload must be a JSON object")
+        raise FlashScoringError("wire payload must be a JSON object")
     return cast(dict[str, object], value)
 
 
 def _validate_hash_hex(value: object, field_name: str = "hash") -> str:
     if not isinstance(value, str) or len(value) != 64 or value.lower() != value:
-        raise FlashWireValidationError(
-            f"{field_name} must be lowercase hexadecimal SHA-256"
-        )
+        raise FlashScoringError(f"{field_name} must be lowercase hexadecimal SHA-256")
     try:
         decoded = bytes.fromhex(value)
     except ValueError as error:
-        raise FlashWireValidationError(
+        raise FlashScoringError(
             f"{field_name} must be lowercase hexadecimal SHA-256"
         ) from error
     if len(decoded) != 32:
-        raise FlashWireValidationError(f"{field_name} must be exactly 32 bytes")
+        raise FlashScoringError(f"{field_name} must be exactly 32 bytes")
     return value
 
 
 def _hash_text_value(value: object, field_name: str = "hash") -> str:
     if isinstance(value, bytes):
         if len(value) != 32:
-            raise FlashWireValidationError(f"{field_name} must be exactly 32 bytes")
+            raise FlashScoringError(f"{field_name} must be exactly 32 bytes")
         return value.hex()
     return _validate_hash_hex(value, field_name)
 
 
 def _score_value(value: object, field_name: str = "score") -> float:
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
-        raise FlashWireValidationError(
-            f"{field_name} must be a finite non-Boolean number"
-        )
+        raise FlashScoringError(f"{field_name} must be a finite non-Boolean number")
     try:
         normalized = float(value)
     except (TypeError, ValueError, OverflowError) as error:
-        raise FlashWireValidationError(
-            f"{field_name} must be a finite number"
-        ) from error
+        raise FlashScoringError(f"{field_name} must be a finite number") from error
     if not math.isfinite(normalized):
-        raise FlashWireValidationError(f"{field_name} must be finite")
+        raise FlashScoringError(f"{field_name} must be finite")
     return normalized
 
 
 def _request_rows(rows: object) -> list[dict[str, str]]:
     if isinstance(rows, (str, bytes, bytearray)) or not isinstance(rows, Iterable):
-        raise FlashWireValidationError("rows must be an iterable")
+        raise FlashScoringError("rows must be an iterable")
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
     for row in rows:
         if isinstance(row, Mapping):
             if set(row) != {"hash", "text"}:
-                raise FlashWireValidationError(
-                    "request rows must contain exactly hash and text"
-                )
-            raw_hash = row["hash"]
-            text = row["text"]
+                raise FlashScoringError("request rows must contain exactly hash and text")
+            raw_hash, text = row["hash"], row["text"]
         elif isinstance(row, (tuple, list)) and len(row) == 2:
             raw_hash, text = row
         else:
-            raise FlashWireValidationError(
-                "request rows must be mappings or hash/text pairs"
-            )
+            raise FlashScoringError("request rows must be mappings or hash/text pairs")
         hash_hex = _hash_text_value(raw_hash)
         if not isinstance(text, str) or not text:
-            raise FlashWireValidationError(
-                "request row text must be a non-empty string"
-            )
+            raise FlashScoringError("request row text must be a non-empty string")
         if bytes.fromhex(hash_hex) != sha256_bytes(text):
-            raise FlashWireValidationError("request hash does not match request text")
+            raise FlashScoringError("request hash does not match request text")
         if hash_hex in seen:
-            raise FlashWireValidationError("request rows must have unique hashes")
+            raise FlashScoringError("request rows must have unique hashes")
         seen.add(hash_hex)
         normalized.append({"hash": hash_hex, "text": text})
     return normalized
@@ -185,17 +261,15 @@ def _request_rows(rows: object) -> list[dict[str, str]]:
 
 def _response_rows(rows: object) -> list[dict[str, object]]:
     if isinstance(rows, (str, bytes, bytearray)) or not isinstance(rows, Iterable):
-        raise FlashWireValidationError("scores must be an iterable")
+        raise FlashScoringError("scores must be an iterable")
     normalized: list[dict[str, object]] = []
     seen: set[str] = set()
     for row in rows:
         if not isinstance(row, Mapping) or set(row) != {"hash", "score"}:
-            raise FlashWireValidationError(
-                "response rows must contain exactly hash and score"
-            )
+            raise FlashScoringError("response rows must contain exactly hash and score")
         hash_hex = _hash_text_value(row["hash"])
         if hash_hex in seen:
-            raise FlashWireValidationError("response rows must have unique hashes")
+            raise FlashScoringError("response rows must have unique hashes")
         seen.add(hash_hex)
         normalized.append({"hash": hash_hex, "score": _score_value(row["score"])})
     return normalized
@@ -205,17 +279,19 @@ def encode_flash_request(
     query: str,
     rows: Iterable[Mapping[str, object] | Sequence[object]],
     *,
-    schema_version: int = WIRE_SCHEMA_VERSION,
+    model_config: Mapping[str, object] | LocalCrossEncoderConfig,
     scorer_fingerprint: str,
+    schema_version: int = WIRE_SCHEMA_VERSION,
 ) -> bytes:
-    """Encode a strict, identity-bearing compact request."""
+    """Encode a strict request carrying the complete scorer identity."""
 
     _validate_schema_version(schema_version)
     _validate_fingerprint(scorer_fingerprint)
     if not isinstance(query, str) or not query.strip():
-        raise FlashWireValidationError("query must be a non-blank string")
+        raise FlashScoringError("query must be a non-blank string")
     return _json_bytes(
         {
+            "model_config": _wire_model_config(model_config),
             "query": query,
             "rows": _request_rows(rows),
             "schema_version": schema_version,
@@ -227,21 +303,25 @@ def encode_flash_request(
 def decode_flash_request(
     payload: bytes | bytearray | str | Mapping[str, object],
 ) -> dict[str, object]:
-    """Decode and validate a strict identity-bearing request."""
+    """Decode and validate a strict scorer-identity-bearing request."""
 
     value = _json_object(payload)
-    if set(value) != {"query", "rows", "schema_version", "scorer_fingerprint"}:
-        raise FlashWireValidationError(
-            "request must contain exactly schema_version, scorer_fingerprint, query, and rows"
-        )
-    schema_version = _validate_schema_version(value["schema_version"])
-    scorer_fingerprint = _validate_fingerprint(value["scorer_fingerprint"])
+    expected_fields = {
+        "model_config",
+        "query",
+        "rows",
+        "schema_version",
+        "scorer_fingerprint",
+    }
+    if set(value) != expected_fields:
+        raise FlashScoringError("request fields are invalid")
     query = value["query"]
     if not isinstance(query, str) or not query.strip():
-        raise FlashWireValidationError("query must be a non-blank string")
+        raise FlashScoringError("query must be a non-blank string")
     return {
-        "schema_version": schema_version,
-        "scorer_fingerprint": scorer_fingerprint,
+        "schema_version": _validate_schema_version(value["schema_version"]),
+        "scorer_fingerprint": _validate_fingerprint(value["scorer_fingerprint"]),
+        "model_config": _validate_model_config(value["model_config"]),
         "query": query,
         "rows": _request_rows(value["rows"]),
     }
@@ -253,7 +333,7 @@ def encode_flash_response(
     schema_version: int = WIRE_SCHEMA_VERSION,
     scorer_fingerprint: str,
 ) -> bytes:
-    """Encode a strict identity-bearing compact score response."""
+    """Encode a strict score response."""
 
     _validate_schema_version(schema_version)
     _validate_fingerprint(scorer_fingerprint)
@@ -269,24 +349,16 @@ def encode_flash_response(
 def decode_flash_response(
     payload: bytes | bytearray | str | Mapping[str, object],
 ) -> dict[str, object]:
-    """Decode and validate a strict identity-bearing score response."""
+    """Decode and validate a strict score response."""
 
     value = _json_object(payload)
     if set(value) != {"scores", "schema_version", "scorer_fingerprint"}:
-        raise FlashWireValidationError(
-            "response must contain exactly schema_version, scorer_fingerprint, and scores"
-        )
+        raise FlashScoringError("response fields are invalid")
     return {
         "schema_version": _validate_schema_version(value["schema_version"]),
         "scorer_fingerprint": _validate_fingerprint(value["scorer_fingerprint"]),
         "scores": _response_rows(value["scores"]),
     }
-
-
-encode_flash_batch = encode_flash_request
-decode_flash_batch = decode_flash_request
-encode_flash_batch_response = encode_flash_response
-decode_flash_batch_response = decode_flash_response
 
 
 def _effective_model_config(config: "RunpodFlashConfig") -> LocalCrossEncoderConfig:
@@ -311,9 +383,7 @@ def _effective_model_config(config: "RunpodFlashConfig") -> LocalCrossEncoderCon
             updates[field_name] = value
     if config.batch_size is not None:
         updates["batch_size"] = config.batch_size
-    if not updates:
-        return config.model_config
-    return replace(config.model_config, **updates)
+    return replace(config.model_config, **updates) if updates else config.model_config
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,9 +391,7 @@ class RunpodFlashConfig:
     """Immutable Flash transport settings and effective local model policy."""
 
     endpoint_id: str
-    model_config: LocalCrossEncoderConfig = field(
-        default_factory=LocalCrossEncoderConfig
-    )
+    model_config: LocalCrossEncoderConfig = field(default_factory=LocalCrossEncoderConfig)
     batch_size: int | None = None
     max_payload_bytes: int = FLASH_PAYLOAD_LIMIT_BYTES
     concurrency: int = DEFAULT_FLASH_CONCURRENCY
@@ -392,18 +460,14 @@ class RunpodFlashConfig:
                 or not value.strip()
                 or any(character in value for character in "\r\n")
             ):
-                raise ValueError(
-                    f"{field_name} must be a non-blank string when provided"
-                )
+                raise ValueError(f"{field_name} must be a non-blank string when provided")
         if self.max_length is not None and (
             isinstance(self.max_length, bool)
             or not isinstance(self.max_length, int)
             or self.max_length <= 0
         ):
             raise ValueError("max_length must be a positive integer when provided")
-        object.__setattr__(
-            self, "_fingerprint", self.effective_model_config.fingerprint
-        )
+        object.__setattr__(self, "_fingerprint", self.effective_model_config.fingerprint)
 
     @property
     def effective_model_config(self) -> LocalCrossEncoderConfig:
@@ -430,8 +494,17 @@ class RunpodFlashConfig:
         return self.effective_model_config.batch_size
 
 
+async def _run_with_completion(
+    awaitable: Awaitable[Any], completed: threading.Event
+) -> Any:
+    try:
+        return await awaitable
+    finally:
+        completed.set()
+
+
 class _EventLoopBridge:
-    """Own one private loop thread and quiesce it deterministically."""
+    """Bridge async injected transports into synchronous PassageScorer calls."""
 
     def __init__(self, *, startup_timeout: float = 5.0) -> None:
         self._ready = threading.Event()
@@ -443,9 +516,6 @@ class _EventLoopBridge:
         self._thread = threading.Thread(
             target=self._run,
             name="trec-ragtime-flash-loop",
-            # A loop blocked inside a broken event-loop factory must not keep
-            # the host process alive after bounded startup cleanup fails.
-            # Normal close still joins this thread deterministically.
             daemon=True,
         )
         self._thread.start()
@@ -453,32 +523,13 @@ class _EventLoopBridge:
             self._closed = True
             self._request_stop()
             self._thread.join(_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS)
-            if self._thread.is_alive():
-                raise FlashScoringError(
-                    "Flash event-loop thread did not stop after startup timeout"
-                )
             raise FlashScoringError("Flash event-loop thread did not start")
-        if self._startup_error is not None:
+        if self._startup_error is not None or self._loop is None:
             error = self._startup_error
             self._closed = True
             self._request_stop()
             self._thread.join(_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS)
-            if self._thread.is_alive():
-                raise FlashScoringError(
-                    "Flash event-loop thread failed to stop after startup error"
-                )
-            raise FlashScoringError(
-                "Flash event-loop thread failed to start"
-            ) from error
-        if self._loop is None:
-            self._closed = True
-            self._request_stop()
-            self._thread.join(_BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS)
-            if self._thread.is_alive():
-                raise FlashScoringError(
-                    "Flash event-loop thread failed to stop after startup"
-                )
-            raise FlashScoringError("Flash event-loop thread did not publish a loop")
+            raise FlashScoringError("Flash event-loop thread failed to start") from error
 
     def _run(self) -> None:
         try:
@@ -506,8 +557,6 @@ class _EventLoopBridge:
             loop = self._loop
             if loop is not None and not loop.is_closed():
                 try:
-                    # Scheduling stop is safe before run_forever starts and
-                    # closes the race between the startup check and loop run.
                     loop.call_soon_threadsafe(loop.stop)
                 except RuntimeError:
                     pass
@@ -517,7 +566,6 @@ class _EventLoopBridge:
         pending = list(asyncio.all_tasks(loop))
         for task in pending:
             task.cancel()
-
         if pending:
 
             async def drain() -> None:
@@ -527,15 +575,9 @@ class _EventLoopBridge:
                 loop.run_until_complete(drain())
             except BaseException:
                 pass
-
-        remaining = list(asyncio.all_tasks(loop))
-        for task in remaining:
+        for task in list(asyncio.all_tasks(loop)):
             task.cancel()
-            # A task that ignores cancellation cannot be awaited safely during
-            # shutdown.  Closing the loop discards it; suppress asyncio's
-            # pending-task destructor report for this deliberate finalization.
-            log_destroy_pending = getattr(task, "_log_destroy_pending", None)
-            if log_destroy_pending is not None:
+            if hasattr(task, "_log_destroy_pending"):
                 task._log_destroy_pending = False  # type: ignore[attr-defined]
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -558,32 +600,20 @@ class _EventLoopBridge:
                 awaitable_or_factory.close()
             raise FlashScoringError("Flash event-loop bridge is closed")
         if threading.current_thread() is self._thread:
-            raise FlashScoringError(
-                "nested synchronous use of the Flash event loop is not allowed"
-            )
+            raise FlashScoringError("nested synchronous Flash scoring is not allowed")
         awaitable = (
             awaitable_or_factory()
             if callable(awaitable_or_factory)
             else awaitable_or_factory
         )
-        if self._closed or self._loop is None:
-            if inspect.iscoroutine(awaitable):
-                awaitable.close()
-            raise FlashScoringError("Flash event-loop bridge is closed")
         completed = threading.Event()
         future = asyncio.run_coroutine_threadsafe(
-            _run_with_completion(awaitable, completed),
-            self._loop,
+            _run_with_completion(awaitable, completed), self._loop
         )
         try:
             return future.result(timeout=timeout)
         except TimeoutError:
             future.cancel()
-            # Cancellation of a concurrent future only schedules cancellation
-            # on the private loop.  Wait for the wrapped coroutine's finally
-            # block so sibling cancellation and endpoint job cleanup finish
-            # before returning.  Closing in either case keeps this timed-out
-            # bridge from ever returning with local work or a live thread.
             completed.wait(_BRIDGE_CLEANUP_GRACE_SECONDS)
             try:
                 self.close()
@@ -593,17 +623,12 @@ class _EventLoopBridge:
 
     def close(self) -> None:
         if self._closed:
-            if (
-                threading.current_thread() is not self._thread
-                and self._thread.is_alive()
-            ):
+            if threading.current_thread() is not self._thread and self._thread.is_alive():
                 self._thread.join()
             return
         self._closed = True
         if threading.current_thread() is self._thread:
-            raise FlashScoringError(
-                "cannot close the Flash event loop from its own thread"
-            )
+            raise FlashScoringError("cannot close the Flash event loop from its own thread")
         self._request_stop()
         self._thread.join()
 
@@ -620,16 +645,6 @@ class _EventLoopBridge:
             pass
 
 
-async def _run_with_completion(
-    awaitable: Awaitable[Any],
-    completed: threading.Event,
-) -> Any:
-    try:
-        return await awaitable
-    finally:
-        completed.set()
-
-
 def _runner_awaitable(runner: object, payload: bytes) -> Awaitable[object]:
     method = getattr(runner, "run_batch", None)
     if callable(method):
@@ -637,35 +652,29 @@ def _runner_awaitable(runner: object, payload: bytes) -> Awaitable[object]:
     elif callable(runner):
         result = runner(payload)  # type: ignore[operator]
     else:
-        raise FlashScoringError(
-            "batch runner must be callable or expose async run_batch"
-        )
+        raise FlashScoringError("batch runner must expose async run_batch")
     if not hasattr(result, "__await__"):
         raise FlashScoringError("batch runner must return an awaitable")
     return cast(Awaitable[object], result)
 
 
-def _response_bytes(value: object) -> bytes:
-    if isinstance(value, (bytes, bytearray, str, Mapping)):
-        decoded = decode_flash_response(value)
-        return encode_flash_response(
-            cast(Iterable[Mapping[str, object]], decoded["scores"]),
-            schema_version=cast(int, decoded["schema_version"]),
-            scorer_fingerprint=cast(str, decoded["scorer_fingerprint"]),
-        )
-    raise FlashWireValidationError("batch runner returned an unsupported response")
-
-
 class RunpodFlashPassageScorer:
     """Synchronous exact scorer backed by bounded asynchronous Flash batches."""
 
-    __slots__ = ("_config", "_runner", "_bridge")
+    __slots__ = ("_config", "_runner", "_owned_runner", "_bridge")
 
     def __init__(self, config: RunpodFlashConfig, batch_runner: object) -> None:
         if not isinstance(config, RunpodFlashConfig):
             raise TypeError("config must be a RunpodFlashConfig")
         self._config = config
-        self._runner = batch_runner
+        self._owned_runner: FlashEndpointBatchRunner | None = None
+        if callable(getattr(batch_runner, "run", None)) and not callable(
+            getattr(batch_runner, "run_batch", None)
+        ):
+            self._owned_runner = FlashEndpointBatchRunner(config, endpoint=batch_runner)
+            self._runner: object = self._owned_runner
+        else:
+            self._runner = batch_runner
         self._bridge = _EventLoopBridge()
 
     @property
@@ -679,44 +688,40 @@ class RunpodFlashPassageScorer:
     @staticmethod
     def _build_batches(
         query: str,
-        unique: Sequence[tuple[bytes, str]],
+        unique: Mapping[bytes, str],
         config: RunpodFlashConfig,
     ) -> tuple[tuple[bytes, frozenset[bytes]], ...]:
         batches: list[tuple[bytes, frozenset[bytes]]] = []
         current: list[tuple[bytes, str]] = []
 
-        def flush() -> None:
-            if current:
-                payload = encode_flash_request(
-                    query,
-                    current,
-                    scorer_fingerprint=config.fingerprint,
-                )
-                if (
-                    len(payload) >= config.max_payload_bytes
-                    or len(payload) >= FLASH_PAYLOAD_LIMIT_BYTES
-                ):
-                    raise FlashScoringError(
-                        "Flash payload must be strictly below its byte limit"
-                    )
-                batches.append(
-                    (payload, frozenset(content_hash for content_hash, _ in current))
-                )
-                current.clear()
+        def fits(payload: bytes) -> bool:
+            return len(payload) < config.max_payload_bytes and len(payload) < FLASH_PAYLOAD_LIMIT_BYTES
 
-        for content_hash, text in unique:
+        def flush() -> None:
+            if not current:
+                return
+            payload = encode_flash_request(
+                query,
+                current,
+                model_config=_model_config_mapping(config.effective_model_config),
+                scorer_fingerprint=config.fingerprint,
+            )
+            if not fits(payload):
+                raise FlashScoringError("Flash payload must be strictly below its byte limit")
+            batches.append((payload, frozenset(content_hash for content_hash, _ in current)))
+            current.clear()
+
+        for content_hash, text in unique.items():
             if len(current) >= config.effective_batch_size:
                 flush()
             candidate = current + [(content_hash, text)]
             candidate_payload = encode_flash_request(
                 query,
                 candidate,
+                model_config=_model_config_mapping(config.effective_model_config),
                 scorer_fingerprint=config.fingerprint,
             )
-            if (
-                len(candidate_payload) < config.max_payload_bytes
-                and len(candidate_payload) < FLASH_PAYLOAD_LIMIT_BYTES
-            ):
+            if fits(candidate_payload):
                 current.append((content_hash, text))
                 continue
             if current:
@@ -724,15 +729,11 @@ class RunpodFlashPassageScorer:
                 single_payload = encode_flash_request(
                     query,
                     [(content_hash, text)],
+                    model_config=_model_config_mapping(config.effective_model_config),
                     scorer_fingerprint=config.fingerprint,
                 )
-                if (
-                    len(single_payload) >= config.max_payload_bytes
-                    or len(single_payload) >= FLASH_PAYLOAD_LIMIT_BYTES
-                ):
-                    raise FlashScoringError(
-                        "one passage exceeds the Flash JSON payload limit"
-                    )
+                if not fits(single_payload):
+                    raise FlashScoringError("one passage exceeds the Flash JSON payload limit")
                 current.append((content_hash, text))
                 continue
             raise FlashScoringError("one passage exceeds the Flash JSON payload limit")
@@ -740,33 +741,30 @@ class RunpodFlashPassageScorer:
         return tuple(batches)
 
     async def _run_one(
-        self,
-        payload: bytes,
-        expected_batch: frozenset[bytes],
+        self, payload: bytes, expected_batch: frozenset[bytes]
     ) -> dict[bytes, float]:
         try:
             raw = await asyncio.wait_for(
                 _runner_awaitable(self._runner, payload),
                 timeout=float(self._config.request_timeout),
             )
-            response = decode_flash_response(_response_bytes(raw))
+            response = decode_flash_response(raw)  # type: ignore[arg-type]
         except asyncio.TimeoutError as error:
             raise FlashScoringError("Flash batch timed out") from error
         except FlashScoringError:
             raise
         except Exception as error:
             raise FlashScoringError("Flash batch failed") from error
-
         if response["scorer_fingerprint"] != self._config.fingerprint:
             raise FlashScoringError("Flash response scorer fingerprint mismatch")
         rows = cast(list[dict[str, object]], response["scores"])
-        batch_scores = {
+        scores = {
             bytes.fromhex(cast(str, row["hash"])): cast(float, row["score"])
             for row in rows
         }
-        if set(batch_scores) != set(expected_batch):
+        if set(scores) != set(expected_batch):
             raise FlashScoringError("Flash response coverage does not match its batch")
-        return batch_scores
+        return scores
 
     @staticmethod
     async def _cancel_and_await(tasks: Sequence[asyncio.Task[Any]]) -> None:
@@ -810,25 +808,18 @@ class RunpodFlashPassageScorer:
 
         merged: dict[bytes, float] = {}
         for result in batch_results:
-            overlap = set(result) & set(merged)
-            if overlap:
+            if set(result) & set(merged):
                 raise FlashScoringError("Flash batches returned duplicate score hashes")
             merged.update(result)
         expected_global = {
-            content_hash
-            for _, expected_batch in batches
-            for content_hash in expected_batch
+            content_hash for _, expected_batch in batches for content_hash in expected_batch
         }
         if set(merged) != expected_global:
-            raise FlashScoringError(
-                "Flash response coverage does not match the global request"
-            )
+            raise FlashScoringError("Flash response coverage does not match the global request")
         try:
             return validate_passage_scores(passages, merged)
         except PassageScoringError as error:
-            raise FlashScoringError(
-                "Flash scores failed the passage scorer contract"
-            ) from error
+            raise FlashScoringError("Flash scores failed the passage scorer contract") from error
 
     def score(self, query: str, passages: Sequence[Passage]) -> Mapping[bytes, float]:
         if self._bridge.closed:
@@ -838,17 +829,14 @@ class RunpodFlashPassageScorer:
         try:
             unique = _unique_passages(passages)
         except PassageScoringError as error:
-            raise FlashScoringError(
-                "passages failed the passage scorer contract"
-            ) from error
+            raise FlashScoringError("passages failed the passage scorer contract") from error
         if not unique:
             return {}
         batches = self._build_batches(query, unique, self._config)
         try:
             return self._bridge.run(
                 lambda: self._score_async(passages, batches),
-                timeout=float(self._config.request_timeout) * max(1, len(batches))
-                + 1.0,
+                timeout=float(self._config.request_timeout) * max(1, len(batches)) + 1.0,
             )
         except FlashScoringError:
             raise
@@ -859,6 +847,8 @@ class RunpodFlashPassageScorer:
 
     def close(self) -> None:
         self._bridge.close()
+        if self._owned_runner is not None:
+            self._owned_runner.close()
 
     def __enter__(self) -> "RunpodFlashPassageScorer":
         return self
@@ -874,7 +864,7 @@ class RunpodFlashPassageScorer:
 
 
 class FlashEndpointBatchRunner:
-    """Lazy optional Runpod Flash endpoint client using run plus wait."""
+    """Lazy Runpod Flash endpoint client using async ``run`` then ``wait``."""
 
     __slots__ = ("_config", "_endpoint_factory", "_endpoint", "_bridge")
 
@@ -914,8 +904,7 @@ class FlashEndpointBatchRunner:
         done = getattr(job, "done", None)
         if isinstance(done, bool):
             return done
-        status = getattr(job, "status", None)
-        return status in {"COMPLETED", "FAILED", "CANCELLED"}
+        return getattr(job, "status", None) in {"COMPLETED", "FAILED", "CANCELLED"}
 
     async def _cancel_job_best_effort(self, job: object) -> None:
         cancel = getattr(job, "cancel", None)
@@ -939,33 +928,32 @@ class FlashEndpointBatchRunner:
             run = getattr(endpoint, "run", None)
             if not callable(run):
                 raise FlashScoringError("Flash endpoint does not expose async run")
-            job = await run(request)
+            job_result = run(request)
+            if not hasattr(job_result, "__await__"):
+                raise FlashScoringError("Flash endpoint run must be awaitable")
+            job = await cast(Awaitable[object], job_result)
             wait = getattr(job, "wait", None)
             if not callable(wait):
                 raise FlashScoringError("Flash endpoint job does not expose wait")
-            completed = await wait(timeout=float(self._config.request_timeout))
+            wait_result = wait(timeout=float(self._config.request_timeout))
+            if not hasattr(wait_result, "__await__"):
+                raise FlashScoringError("Flash endpoint job wait must be awaitable")
+            completed = await cast(Awaitable[object], wait_result)
             wait_completed = True
             job_for_state = completed if completed is not None else job
-            if getattr(job_for_state, "error", None):
-                raise FlashScoringError("Flash endpoint job failed")
-            status = getattr(job_for_state, "status", None)
-            if status == "FAILED":
+            if getattr(job_for_state, "error", None) or getattr(job_for_state, "status", None) == "FAILED":
                 raise FlashScoringError("Flash endpoint job failed")
             output = getattr(job_for_state, "output", None)
-            if output is None:
+            if output is None and job is not None:
                 output = getattr(job, "output", None)
             if output is None:
                 raise FlashScoringError("Flash endpoint job returned no output")
-            response = decode_flash_response(_response_bytes(output))
+            response = decode_flash_response(output)
             if response["scorer_fingerprint"] != self._config.fingerprint:
-                raise FlashScoringError(
-                    "Flash endpoint response scorer fingerprint mismatch"
-                )
-            return _response_bytes(response)
+                raise FlashScoringError("Flash endpoint response scorer fingerprint mismatch")
+            return json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8")
         except BaseException:
-            if job is not None and (
-                not wait_completed or not self._job_is_terminal(job)
-            ):
+            if job is not None and (not wait_completed or not self._job_is_terminal(job)):
                 await self._cancel_job_best_effort(job)
             raise
 
@@ -1007,21 +995,18 @@ class FlashEndpointBatchRunner:
 __all__ = [
     "DEFAULT_FLASH_BATCH_SIZE",
     "DEFAULT_FLASH_CONCURRENCY",
+    "DEFAULT_FLASH_GPU",
     "DEFAULT_FLASH_IDLE_TIMEOUT",
     "DEFAULT_FLASH_REQUEST_TIMEOUT",
+    "DEFAULT_FLASH_WORKER_NAME",
     "FLASH_PAYLOAD_LIMIT_BYTES",
     "WIRE_SCHEMA_VERSION",
     "FlashEndpointBatchRunner",
     "FlashScoringError",
-    "FlashWireValidationError",
     "RunpodFlashConfig",
     "RunpodFlashPassageScorer",
-    "decode_flash_batch",
-    "decode_flash_batch_response",
     "decode_flash_request",
     "decode_flash_response",
-    "encode_flash_batch",
-    "encode_flash_batch_response",
     "encode_flash_request",
     "encode_flash_response",
 ]
