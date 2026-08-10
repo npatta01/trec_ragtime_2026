@@ -92,6 +92,8 @@ result with an explicit status; they are not silently dropped.
 The pinned local model is
 `BAAI/bge-reranker-v2-m3` at revision
 `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`, using raw cross-encoder logits.
+The separately fingerprinted tokenizer name and revision are pinned to that
+same checkpoint and revision.
 Passage preparation uses the maintained LangChain `CharacterTextSplitter` and
 the pinned spaCy 3.8.0 pipelines (`en_core_web_sm`, `es_core_news_sm`,
 `ru_core_news_sm`, and `zh_core_web_sm`). Paragraphs and adjacent sentences
@@ -101,26 +103,32 @@ over the model passage budget. Every passage retains exact Python character
 offsets, canonical/selected-representation SHA-256 hashes, content hashes,
 and stable lineage IDs; schema version 1 uses zero overlap.
 
-The primary local path is lazy and loads model weights only on the first score
-call. The snippet below is a continuation from the hydrated `RetrievalResult`
-created in [Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration);
+The primary local path is complete and lazy: pinned tokenizer assets load when
+chunking first measures a query/passage pair, while model weights load only on
+the first score call. The snippet below is a continuation from the hydrated
+`RetrievalResult` created in
+[Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration);
 `retrieval` is that existing value, so this is not a standalone script:
 
 ```python
 from trec_ragtime import (
     ChunkerConfig,
+    CrossEncoderPairLengthFunction,
     LangChainPassageChunker,
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
     rerank_retrieval,
 )
 
+policy = LocalCrossEncoderConfig(device="cpu")
+pair_length = CrossEncoderPairLengthFunction(policy, retrieval.query)
 chunker = LangChainPassageChunker(
-    ChunkerConfig(chunk_size=512)
+    ChunkerConfig(
+        chunk_size=policy.max_length,
+        length_function=pair_length,
+    )
 )
-scorer = LocalCrossEncoderScorer(
-    LocalCrossEncoderConfig(device="cpu")
-)
+scorer = LocalCrossEncoderScorer(policy)
 report_result = rerank_retrieval(
     retrieval,
     topic_id="topic-1",
@@ -129,6 +137,11 @@ report_result = rerank_retrieval(
     representation="report_text",
 )
 ```
+
+`ChunkerConfig` automatically uses the pair-length callable's stable
+fingerprint. Keep this tokenizer-aware full-pair budget aligned with the scorer;
+a character-counting `len` budget can admit passages that overflow once the
+formatted query and tokenizer special tokens are included.
 
 Use `device="cuda"` for CUDA PyTorch, or the user-facing `device="rocm"`
 alias on ROCm builds; `rocm` is normalized to PyTorch's `cuda` device. The
@@ -144,14 +157,79 @@ branch does not provide or import a concrete ArtifactStore. A cache hit returns
 only the requested passage hashes, while overlapping requests merge into one
 complete object; failed or partial scoring is never written.
 
-Flash is an optional transport for the same `PassageScorer` contract, not the
-default path. Install it separately with `uv sync --extra runpod`, then supply
-an explicit `RunpodFlashConfig` with a model policy, endpoint ID, bounded
-batch size, payload limit below 10 MB, concurrency, request timeout, worker
-count, and idle timeout. `FlashEndpointBatchRunner` is the separate existing
-`Endpoint(id=...)`/`run()`/`job.wait()` adapter; `build_flash_worker()` produces
-the class-style warm worker definition. Neither path claims a deployment, and
-this task provisions no Runpod worker.
+Flash remains an optional transport for the same `PassageScorer` contract; the
+local path above is the primary complete execution path. Install Flash
+separately with `uv sync --extra runpod`. One explicit policy can describe both
+an already-provisioned endpoint caller and a possible later worker definition:
+
+```python
+from trec_ragtime import (
+    DEFAULT_FLASH_GPU,
+    DEFAULT_FLASH_WORKER_NAME,
+    ChunkerConfig,
+    CrossEncoderPairLengthFunction,
+    FlashEndpointBatchRunner,
+    LangChainPassageChunker,
+    RunpodFlashPassageScorer,
+    RunpodFlashConfig,
+    build_flash_worker,
+    rerank_retrieval,
+)
+
+flash_policy = RunpodFlashConfig(
+    endpoint_id="existing-endpoint-id",
+    model_config=policy,
+    device="cuda",
+    batch_size=32,
+    max_payload_bytes=9_000_000,
+    concurrency=4,
+    request_timeout=60.0,
+    worker_name=DEFAULT_FLASH_WORKER_NAME,
+    gpu=DEFAULT_FLASH_GPU,
+    workers=1,
+    idle_timeout=300.0,
+)
+
+remote_policy = flash_policy.effective_model_config
+remote_pair_length = CrossEncoderPairLengthFunction(remote_policy, retrieval.query)
+remote_chunker = LangChainPassageChunker(
+    ChunkerConfig(
+        chunk_size=remote_policy.max_length,
+        length_function=remote_pair_length,
+    )
+)
+
+# Caller and scorer for an endpoint that already exists.
+with FlashEndpointBatchRunner(flash_policy) as endpoint_runner:
+    with RunpodFlashPassageScorer(flash_policy, endpoint_runner) as flash_scorer:
+        flash_result = rerank_retrieval(
+            retrieval,
+            topic_id="topic-1",
+            chunker=remote_chunker,
+            scorer=flash_scorer,
+            representation="report_text",
+        )
+
+# Definition seam for a later, explicit `flash dev` workflow.
+from runpod_flash import Endpoint
+
+FlashPassageWorker = build_flash_worker(
+    flash_policy,
+    endpoint_factory=Endpoint,
+)
+```
+
+`FlashEndpointBatchRunner` constructs `Endpoint(id=...)`, submits with
+`run()`, and waits with `job.wait()`. The Endpoint-style `build_flash_worker()`
+decoration carries `worker_name`, resolved `gpu`, `workers`, `idle_timeout`,
+and pinned runtime dependencies into the class-style warm worker definition.
+The explicit `device="cuda"` override produces a distinct immutable effective
+model policy and scorer fingerprint from the local CPU policy; deriving the
+remote pair-length chunker from it also isolates the chunker and score-cache
+identity. Both endpoint objects use context managers for deterministic cleanup.
+Building the worker definition does not deploy or provision it. Payload size,
+batching, concurrency, and request timeout remain explicit bounded caller
+controls; using `flash dev` remains a separate deferred paid smoke gate.
 
 Offline reranking verification starts after decrypting `.env` and makes no
 organizer, Hugging Face, Runpod, or model-download calls:
