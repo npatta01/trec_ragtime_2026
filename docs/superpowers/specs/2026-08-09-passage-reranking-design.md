@@ -19,6 +19,10 @@ Control-A/B/C artifact formats.
   paragraph/sentence parser or a greedy packing algorithm.
 - `RecursiveCharacterTextSplitter` is used only when one sentence by itself
   exceeds the configured passage token budget.
+- Production chunking counts the complete formatted query/passage pair with the
+  same pinned tokenizer used for scoring, including special tokens. Character
+  `len` remains available only as an explicit boundary-test/benchmark policy;
+  it is never an implicit production ceiling.
 - Overlap is zero in schema version 1.
 - Local scoring is the default path. Runpod Flash is an optional transport
   adapter implementing the same scorer protocol.
@@ -79,11 +83,21 @@ and full reconstruction (`"".join(chunks) == parent_text`). Nested offsets are
 adjusted to document coordinates and all checks are repeated on the final
 sequence.
 
+`ChunkerConfig` requires an explicit length callable. The production callable
+is `CrossEncoderPairLengthFunction`, which captures one exact query and local
+model policy, lazy-loads tokenizer assets without model weights, and exposes
+its own stable fingerprint. A custom callable must likewise expose a stable
+fingerprint or be paired with an explicit one.
+
 The production pipeline mapping is pinned to spaCy 3.8.0 model wheels:
 `eng -> en_core_web_sm`, `spa -> es_core_news_sm`, `rus -> ru_core_news_sm`, and
 `zho -> zh_core_web_sm`; English `report_text` also uses `en_core_web_sm`.
 Callers may override a pipeline name, but the benchmark fails clearly if a
 required pinned model is unavailable.
+
+The chunker fingerprint composes configuration and any caller namespace with
+the installed `langchain-text-splitters`, spaCy, and selected spaCy-model
+distribution versions. A caller namespace cannot replace those identities.
 
 The selected dependency is recorded only after a fixture benchmark checks
 short text, multiple paragraphs, headings/lists, abbreviations, a very long
@@ -143,6 +157,13 @@ are accepted; a user-facing `rocm` alias normalizes to PyTorch's `cuda` device
 on ROCm builds. Before inference, formatted query/passage pairs are tokenized
 without truncation and any overflow is rejected; silent truncation would make a
 score invalid for the recorded passage.
+
+The immutable policy records explicit tokenizer name/revision and the installed
+Sentence Transformers, Transformers, Tokenizers, and PyTorch versions. Policy
+construction fails closed if declared runtime metadata differs from the local
+environment. `CrossEncoderPairLengthFunction` uses the same query formatting
+and tokenizer identity as inference, so every emitted production passage fits
+the scorer's complete pair ceiling before prediction.
 
 ### `passage_score_cache.py`
 
@@ -215,6 +236,13 @@ request timeout, and transport concurrency are excluded.
 An optional endpoint runner uses `Endpoint(id=...)`, `run()`, and
 `job.wait()` rather than the synchronous timeout path. A dedicated private
 event-loop thread bridges that async API to the synchronous scorer protocol.
+Startup uses a stop-request handshake and bounded cleanup so a late or broken
+event-loop factory cannot hang the host process. An Endpoint-style worker
+decorator receives the configured worker name, resolved GPU group/type,
+workers, idle timeout, and exact runtime dependencies; constructing the raw
+class performs no provisioning. The generated worker reconstructs the full
+embedded local policy and rejects runtime-version drift before loading or
+reporting a scorer fingerprint.
 The worker definition uses a class-style endpoint whose initializer loads the
 same pinned local scorer once per worker. Worker-required imports and helpers
 remain inside the shipped class scope. Neither worker nor transport logs query
@@ -238,7 +266,8 @@ Focused tests cover multilingual and translated fixtures, repeated text,
 paragraph/sentence behavior, exact offsets and reconstruction at every splitter
 level, binary hashes, stable IDs across processes, long-sentence fallback,
 whole-document short chunks, scorer schema, local fake-model batching, no
-truncation, cache fingerprint isolation, warm reuse, overlap merge,
+truncation, a real pinned-tokenizer CJK ceiling smoke, cache fingerprint
+isolation, warm reuse, overlap merge,
 complete-only writes, deterministic aggregation, exact parity under one
 deterministic local/remote fake, payload/timeout/concurrency bounds, and log
 redaction.

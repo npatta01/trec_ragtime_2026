@@ -1,5 +1,29 @@
 # Passage Reranking Implementation Plan
 
+## Implementation status — 2026-08-10
+
+- Objective and merge base remain unchanged: issue #15 on
+  `codex/passage-reranking`, based on `72596ad` / `origin/codex/control-a-foundation`.
+- Tasks 1–6 are implemented and task-reviewed. The main implementation commits
+  cover LangChain/spaCy passage lineage, local scoring, complete ArtifactStoreLike
+  score maps, deterministic reranking artifacts, optional Flash transport, and
+  public integration/documentation.
+- Final Sol standards/spec review requested four implementation fixes. Passage
+  configuration/runtime identity is fixed in `f841547`; pair-token and scorer
+  runtime identity is fixed in `945b304`; Flash startup/runtime/provisioning is
+  fixed in `604f4f4`. Public integration of those settled interfaces is in
+  progress.
+- Latest evidence before public re-integration: 26 passage tests, 22 scorer
+  tests, 64 Flash+scorer tests, 246 full repository tests, and the multilingual
+  benchmark are green. A real pinned-tokenizer-only CJK smoke proved 502
+  characters / 513 pair tokens become two exact passages with a 512-token
+  maximum; no model weights or inference were used.
+- Next action: finish exports/README/integration regression, run scoped Sol
+  re-review, then repeat focused, benchmark, full, lock, diff, and secret gates.
+- External gates remain deferred and must not be represented as complete: real
+  model-weight inference, organizer/canonical/report ranking comparison, paid
+  `flash dev`, and cross-machine reuse after issue #12 lands.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add boundary-aware passage preparation, local and optional Runpod Flash cross-encoder scoring, complete per-query ArtifactStore score reuse, and deterministic document reranking for hydrated RAGTIME retrievals.
@@ -17,11 +41,16 @@
 - Normal passage preparation uses English `report_text`; canonical English, Spanish, Russian, and Chinese remain explicit supported representations.
 - Use LangChain/spaCy for paragraph packing, sentence segmentation, and adjacent-sentence packing; do not implement a project-owned paragraph/sentence parser or greedy packer.
 - Use `RecursiveCharacterTextSplitter` only when one individual sentence exceeds the configured model token ceiling.
+- Require an explicit length callable; production uses the pinned tokenizer to
+  count the complete formatted query/passage pair, while explicit `len` is
+  boundary-test-only.
 - Combine only adjacent source paragraphs/sentences, never reorder text, use zero overlap in v1, and require maintained `create_documents()` start indexes, cursor equality, full reconstruction, and exact source slices at every nested splitter stage.
 - Preserve exact Python character offsets and exact UTF-8 SHA-256 bytes without Unicode normalization or whitespace stripping.
 - `PassageScorer.score(query, passages)` returns exactly one finite non-Boolean float per unique binary passage-content hash.
 - Store successful validated score unions as deterministic `dict[bytes, float]` MessagePack under `passage-scores/v1/<effective-score-fingerprint>/<query-prefix>/<query-hash>.mpk`; the effective fingerprint covers schema, scorer, chunker, and representation.
-- Consume only the issue #12 `ArtifactStoreLike.read_validated()`/`write()` interface; do not edit or reimplement HF Bucket/simplecache mechanics.
+- Consume the issue #12 `ArtifactStoreLike` shape (`read`, `read_validated`,
+  `write`, `evict_local`) while the cache adapter itself uses only validated
+  reads and writes; do not edit or reimplement HF Bucket/simplecache mechanics.
 - Failed, partial, malformed, non-finite, truncated, transport-error, or storage-error scoring never becomes a successful cache artifact.
 - Aggregate documents with versioned `max_passage_v1`, preserve organizer provenance, and retain unscored documents with explicit statuses.
 - Local scoring is the default and supports CPU/CUDA plus a user-facing ROCm alias normalized to PyTorch `cuda`; Runpod Flash is optional transport using the same scorer contract.
