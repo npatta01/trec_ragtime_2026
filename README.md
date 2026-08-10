@@ -274,11 +274,19 @@ owner-only `fsspec.simplecache` directory (L1). Configure the bucket with
 `RAGTIME_HF_BUCKET_ID`, an optional `RAGTIME_ARTIFACT_PREFIX`, and an optional
 absolute `RAGTIME_ARTIFACT_CACHE_DIR` (defaulting to
 `<git-common-dir>/ragtime-cache/artifacts-v1`). `HF_TOKEN` is optional when the
-normal Hugging Face authentication lookup is available. L1 artifacts may be
-discarded and rebuilt from the private bucket; transport, permission, and
-malformed L2 failures are fatal, while a malformed L1 candidate is repaired
-once from L2. The complete local corpus remains a separate revision-pinned
-DuckDB database and does not use per-document response caching.
+normal Hugging Face authentication lookup is available. Runtime artifact
+caching is best effort: a private-bucket authentication, transport, permission,
+server, or write failure emits one credential-safe warning, disables remote
+access for that store instance, and leaves the live result usable as an
+uncached response. A cache miss is therefore normal after the breaker opens.
+L1 artifacts may be discarded and rebuilt from the private bucket; a malformed
+L1 candidate is repaired once from L2, and malformed or mismatched typed
+payloads are never accepted. Retrieval artifacts are eligible only for complete
+hydrated results without hydration failures. Runner checkpoints may include an
+optional artifact reference and omit it when best-effort storage is unavailable.
+The durable Hugging Face Bucket must remain private. The complete local corpus
+remains a separate revision-pinned DuckDB database and does not use
+per-document response caching.
 
 Private `/pipeline` and `/content` entries do not expire by default because the
 participant endpoint is treated as immutable. Numeric
@@ -387,11 +395,13 @@ The importer accepts only `control_a_v1` and `query_baseline_v1` B/C
 directories. It validates source hashes and pinned corpus identity, hydrates
 exact IDs only through `LocalCorpusIndex.enrich_documents`, writes complete
 objects through `RetrievalArtifactCache`, then evicts its disposable L1 copy
-and independently rereads the private L2 object. Failed or partial records are
-counted as skipped; they are never turned into successful artifacts. The
-source run files are read-only and the owner-only manifest contains only file
-hashes, sanitized counts, corpus provenance, and retrieval object keys—not
-queries, document bodies, credentials, or local cache secrets.
+and independently rereads the private L2 object. Malformed or partial input
+records may be counted as skipped; an unsuccessful write, L2 verification miss,
+or decoded-artifact mismatch is a strict migration failure, never a counted
+success, and produces no successful output manifest. The source run files are
+read-only and the owner-only manifest contains only file hashes, sanitized
+counts, corpus provenance, and retrieval object keys—not queries, document
+bodies, credentials, or local cache secrets.
 
 ## Repository Map
 

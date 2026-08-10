@@ -21,6 +21,8 @@ class MemoryArtifactStore:
         self.local: dict[str, bytes] = {}
         self.reads: list[str] = []
         self.read_sources: list[str] = []
+        self.write_result = True
+        self.keep_remote_on_write = False
         self.bucket_id = "owner/private-cache"
         self.prefix = "migration-v1"
 
@@ -37,7 +39,10 @@ class MemoryArtifactStore:
         return decoder(encoded)
 
     def write(self, object_key: str, payload: bytes) -> bool:
-        self.objects[object_key] = payload
+        if self.write_result is not True:
+            return False
+        if not self.keep_remote_on_write or object_key not in self.objects:
+            self.objects[object_key] = payload
         self.local[object_key] = payload
         return True
 
@@ -303,6 +308,61 @@ class CacheImportTestCase(unittest.TestCase):
         self.assertEqual(self.source.read_bytes(), before)
         self.assertFalse(self.manifest.exists())
         self.assertEqual(store.read_sources, [])
+
+    def test_write_false_fails_before_independent_verification(self) -> None:
+        self.source.unlink()
+        self._create_source([pipeline_row()])
+        cache, store = self._cache()
+        request = {"pipeline": "ragtime2%100", "query": "safe query"}
+        response = {
+            "query": "safe query",
+            "pipeline": "ragtime2%100",
+            "scores": {"doc-1": 0.9, "doc-2": 0.8},
+        }
+        cache.put(
+            base_url="https://ragtime.example.test",
+            operation="pipeline",
+            request=request,
+            response=response,
+            stored_at=1_700_000_000.0,
+        )
+        before = self.source.read_bytes()
+        store.write_result = False
+
+        with self.assertRaises(CacheImportError):
+            import_sqlite_cache(self.source, cache, self.manifest)
+
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual(store.read_sources, [])
+        self.assertEqual(store.local, store.objects)
+
+    def test_independent_verification_rejects_mismatched_artifact(self) -> None:
+        self.source.unlink()
+        self._create_source([pipeline_row()])
+        cache, store = self._cache()
+        request = {"pipeline": "ragtime2%100", "query": "safe query"}
+        stale_response = {
+            "query": "safe query",
+            "pipeline": "ragtime2%100",
+            "scores": {"doc-1": 0.1, "doc-2": 0.2},
+        }
+        cache.put(
+            base_url="https://ragtime.example.test",
+            operation="pipeline",
+            request=request,
+            response=stale_response,
+            stored_at=1_700_000_000.0,
+        )
+        store.keep_remote_on_write = True
+        before = self.source.read_bytes()
+
+        with self.assertRaises(CacheImportError):
+            import_sqlite_cache(self.source, cache, self.manifest)
+
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual(store.read_sources, ["remote"])
 
     def test_source_is_opened_read_only_and_missing_source_does_not_get_created(self) -> None:
         self.source.unlink()

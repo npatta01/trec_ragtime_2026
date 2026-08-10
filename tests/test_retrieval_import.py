@@ -28,6 +28,8 @@ class MemoryArtifactStore:
         self.objects: dict[str, bytes] = {}
         self.local: dict[str, bytes] = {}
         self.read_sources: list[str] = []
+        self.write_result = True
+        self.drop_remote_after_evict = False
         self.bucket_id = "owner/private-cache"
         self.prefix = "retrieval-v1"
         self.namespace = "ragtime2-2026-v1"
@@ -44,12 +46,16 @@ class MemoryArtifactStore:
         return decoder(payload)
 
     def write(self, object_key: str, payload: bytes) -> bool:
+        if self.write_result is not True:
+            return False
         self.objects[object_key] = payload
         self.local[object_key] = payload
         return True
 
     def evict_local(self, object_key: str) -> None:
         self.local.pop(object_key, None)
+        if self.drop_remote_after_evict:
+            self.objects.clear()
 
 
 class RaisingMetadataStore(MemoryArtifactStore):
@@ -297,6 +303,34 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertNotIn("token", manifest_text.lower())
         self.assertEqual(self.store.read_sources[-1], "remote")
 
+    def test_control_import_rejects_failed_write_without_verification(self) -> None:
+        run = self._write_control_run()
+        output = self.root / "import-manifest.json"
+        import_retrieval_run(
+            run,
+            corpus=self.corpus,
+            cache=self.cache,
+            manifest_path=output,
+            base_url="https://organizer.example.test",
+        )
+        output.unlink()
+        before = (run / "candidates.jsonl").read_bytes()
+        self.store.write_result = False
+        self.store.read_sources.clear()
+
+        with self.assertRaises(RetrievalImportError):
+            import_retrieval_run(
+                run,
+                corpus=self.corpus,
+                cache=self.cache,
+                manifest_path=output,
+                base_url="https://organizer.example.test",
+            )
+
+        self.assertEqual((run / "candidates.jsonl").read_bytes(), before)
+        self.assertFalse(output.exists())
+        self.assertEqual(self.store.read_sources, [])
+
     def test_default_empty_prefix_finishes_manifest_and_idempotent_resume(self) -> None:
         run = self._write_control_run()
         output = self.root / "import-manifest.json"
@@ -500,6 +534,33 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(len(self.store.objects), count)
         self.assertEqual(json.loads(output.read_text())['counts']['verified'], 2)
         self.assertGreaterEqual(self.store.read_sources.count("remote"), 2)
+
+    def test_baseline_import_rejects_l2_verification_miss(self) -> None:
+        run = self._write_baseline_run()
+        output = self.root / "import-manifest.json"
+        import_retrieval_run(
+            run,
+            corpus=self.corpus,
+            cache=self.cache,
+            manifest_path=output,
+            base_url="https://organizer.example.test",
+        )
+        output.unlink()
+        before = (run / "queries.jsonl").read_bytes()
+        self.store.drop_remote_after_evict = True
+
+        with self.assertRaises(RetrievalImportError):
+            import_retrieval_run(
+                run,
+                corpus=self.corpus,
+                cache=self.cache,
+                manifest_path=output,
+                base_url="https://organizer.example.test",
+            )
+
+        self.assertEqual((run / "queries.jsonl").read_bytes(), before)
+        self.assertFalse(output.exists())
+        self.assertEqual(self.store.objects, {})
 
     def test_rejects_unsupported_schema_before_writing(self) -> None:
         run = self._write_control_run()

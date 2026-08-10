@@ -484,13 +484,18 @@ def import_sqlite_cache(
                         skipped_reasons["row_rejected"] += 1
                         continue
                     try:
-                        cache.put(
+                        expected_value = validated.validator(validated.response)
+                        stored_at = cache.put(
                             base_url=validated.base_url,
                             operation=validated.operation,
                             request=validated.request,
                             response=validated.response,
                             stored_at=validated.stored_at,
                         )
+                        if stored_at is None:
+                            raise CacheImportError(
+                                "destination artifact write failed"
+                            )
                         cache.evict_local(
                             base_url=validated.base_url,
                             operation=validated.operation,
@@ -503,7 +508,11 @@ def import_sqlite_cache(
                             ttl_seconds=validated.ttl_seconds,
                             validator=validated.validator,
                         )
-                        if reread is None or reread.stored_at != validated.stored_at:
+                        if (
+                            reread is None
+                            or reread.stored_at != stored_at
+                            or reread.value != expected_value
+                        ):
                             raise CacheImportError(
                                 "destination artifact failed independent verification"
                             )
