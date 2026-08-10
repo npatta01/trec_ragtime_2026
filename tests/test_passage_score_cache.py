@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import subprocess
 import sys
 import unittest
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
 
 import msgspec
 
@@ -15,10 +13,8 @@ from trec_ragtime.passage_score_cache import (
     CachedPassageScorer,
     PassageScoreArtifactValidationError,
     PassageScoreCache,
-    PassageScoreEnvelope,
-    decode_score_envelope,
-    effective_score_fingerprint,
-    encode_score_envelope,
+    decode_score_map,
+    encode_score_map,
     query_hash,
     score_object_key,
 )
@@ -33,8 +29,6 @@ class FakeArtifactStore:
         self.read_calls: list[str] = []
         self.read_validated_calls: list[str] = []
         self.write_calls: list[tuple[str, bytes]] = []
-        self.read_error: BaseException | None = None
-        self.write_error: BaseException | None = None
 
     def read(self, key: str) -> bytes | None:
         self.read_calls.append(key)
@@ -43,19 +37,46 @@ class FakeArtifactStore:
     def read_validated(
         self,
         key: str,
-        decoder: Callable[[bytes], Any],
-    ) -> Any | None:
+        decoder: Callable[[bytes], object],
+    ) -> object | None:
+        self.read_validated_calls.append(key)
+        payload = self.objects.get(key)
+        return None if payload is None else decoder(payload)
+
+    def write(self, key: str, payload: bytes) -> None:
+        self.write_calls.append((key, payload))
+        self.objects[key] = payload
+
+    def evict_local(self, key: str) -> None:
+        self.objects.pop(key, None)
+
+
+class FailingArtifactStore(FakeArtifactStore):
+    def __init__(
+        self,
+        *,
+        read_error: BaseException | None = None,
+        write_error: BaseException | None = None,
+    ) -> None:
+        super().__init__()
+        self.read_error = read_error
+        self.write_error = write_error
+
+    def read_validated(
+        self,
+        key: str,
+        decoder: Callable[[bytes], object],
+    ) -> object | None:
         self.read_validated_calls.append(key)
         if self.read_error is not None:
             raise self.read_error
-        raw = self.objects.get(key)
-        return None if raw is None else decoder(raw)
+        payload = self.objects.get(key)
+        return None if payload is None else decoder(payload)
 
     def write(self, key: str, payload: bytes) -> None:
         if self.write_error is not None:
             raise self.write_error
-        self.write_calls.append((key, payload))
-        self.objects[key] = payload
+        super().write(key, payload)
 
 
 class RecordingScorer:
@@ -83,34 +104,34 @@ class RecordingScorer:
         }
 
 
-class FalseyRecordingScorer(RecordingScorer):
-    def __bool__(self) -> bool:
-        return False
-
-
 def _passage(
     text: str,
     *,
     document_id: str = "doc",
-    chunker_fingerprint: str = "chunker-v1",
     representation: str = "canonical",
 ) -> Passage:
     return Passage(
         document_id=document_id,
-        source_content_hash=sha256_bytes(text),
         representation=representation,  # type: ignore[arg-type]
-        representation_hash=sha256_bytes(text),
         language="eng",
-        chunk_index=0,
-        passage_id=sha256_bytes(f"passage:{document_id}:{text}"),
         text=text,
         start_char=0,
         end_char=len(text),
-        boundary="paragraph_packed",
-        previous_passage_id=None,
-        next_passage_id=None,
+        boundary="sentence",
         content_hash=sha256_bytes(text),
-        chunker_fingerprint=chunker_fingerprint,
+    )
+
+
+def _report_passage(text: str, *, document_id: str = "doc") -> Passage:
+    return Passage(
+        document_id=document_id,
+        representation="report_text",
+        language="eng",
+        text=text,
+        start_char=0,
+        end_char=len(text),
+        boundary="sentence",
+        content_hash=sha256_bytes(text),
     )
 
 
@@ -124,463 +145,229 @@ def _cache(
     return PassageScoreCache(
         store,
         scorer,
-        chunker_fingerprint,
-        representation,
-        FakeArtifactStore.ArtifactValidationError,
+        chunker_fingerprint=chunker_fingerprint,
+        representation=representation,
+        artifact_validation_error=FakeArtifactStore.ArtifactValidationError,
     )
 
 
-def _coverage_digest(coverage: Sequence[bytes]) -> bytes:
-    return hashlib.sha256(msgspec.msgpack.encode(tuple(coverage))).digest()
-
-
-def _raw_envelope(
-    query: str,
-    *,
-    scorer_fingerprint: str = "model-v1",
-    chunker_fingerprint: str = "chunker-v1",
-    representation: str = "canonical",
-    schema_version: int = 1,
-    coverage: Sequence[bytes] = (),
-    scores: Mapping[bytes, object] | None = None,
-    extra: Mapping[str, object] | None = None,
-) -> bytes:
-    sorted_coverage = tuple(sorted(coverage))
-    fields: dict[str, object] = {
-        "schema_version": schema_version,
-        "scorer_fingerprint": scorer_fingerprint,
-        "chunker_fingerprint": chunker_fingerprint,
-        "representation": representation,
-        "score_fingerprint": effective_score_fingerprint(
-            scorer_fingerprint,
-            chunker_fingerprint,
-            representation,
-            schema_version=schema_version,
-        ),
-        "query_hash": query_hash(query),
-        "coverage": sorted_coverage,
-        "coverage_digest": _coverage_digest(sorted_coverage),
-        "scores": dict(scores or {}),
-    }
-    if extra:
-        fields.update(extra)
-    return msgspec.msgpack.encode(fields)
-
-
 class PassageScoreCacheTests(unittest.TestCase):
-    def test_key_and_encoded_bytes_are_stable_across_subprocesses(self) -> None:
+    def test_key_and_map_bytes_are_stable_across_subprocesses(self) -> None:
         code = """
-import msgspec
-from trec_ragtime.passage_score_cache import (
-    PassageScoreEnvelope,
-    effective_score_fingerprint,
-    encode_score_envelope,
-    query_hash,
-    score_object_key,
-)
-coverage = (b'a' * 32, b'b' * 32)
-envelope = PassageScoreEnvelope(
-    schema_version=1,
-    scorer_fingerprint='model-v1',
-    chunker_fingerprint='chunker-v1',
-    representation='canonical',
-    score_fingerprint=effective_score_fingerprint('model-v1', 'chunker-v1', 'canonical'),
-    query_hash=query_hash('exact query'),
-    coverage=coverage,
-    coverage_digest=__import__('hashlib').sha256(msgspec.msgpack.encode(coverage)).digest(),
-    scores={b'b' * 32: 2.0, b'a' * 32: 1.0},
-)
+from trec_ragtime.passage_score_cache import encode_score_map, score_object_key
+scores = {b'b' * 32: 2, b'a' * 32: 1}
 print(score_object_key('exact query', 'model-v1', 'chunker-v1', 'canonical'))
-print(encode_score_envelope(envelope).hex())
+print(encode_score_map(scores).hex())
 """
         expected = subprocess.check_output([sys.executable, "-c", code], text=True)
         actual = subprocess.check_output([sys.executable, "-c", code], text=True)
+
         self.assertEqual(actual, expected)
         self.assertEqual(expected.count("passage-scores/v1/"), 1)
+        self.assertNotIn("exact query", expected)
 
-    def test_query_hash_uses_exact_utf8_bytes_and_only_query_path_identity(
-        self,
-    ) -> None:
+    def test_query_hash_uses_exact_utf8_bytes(self) -> None:
         self.assertNotEqual(query_hash("café"), query_hash("cafe\u0301"))
         self.assertNotEqual(
             score_object_key("query", "model-v1", "chunker-v1", "canonical"),
             score_object_key("query ", "model-v1", "chunker-v1", "canonical"),
         )
-        self.assertEqual(
-            score_object_key("query", "model-v1", "chunker-v1", "canonical"),
-            score_object_key("query", "model-v1", "chunker-v1", "canonical"),
-        )
 
-    def test_scorer_chunker_and_representation_fingerprints_isolate_objects(
-        self,
-    ) -> None:
-        variants = {
+    def test_scorer_chunker_and_representation_isolate_objects(self) -> None:
+        keys = {
             score_object_key("q", "model-v1", "chunker-v1", "canonical"),
             score_object_key("q", "model-v2", "chunker-v1", "canonical"),
             score_object_key("q", "model-v1", "chunker-v2", "canonical"),
             score_object_key("q", "model-v1", "chunker-v1", "report_text"),
         }
-        self.assertEqual(len(variants), 4)
-        self.assertEqual(
-            effective_score_fingerprint("model-v1", "chunker-v1", "canonical"),
-            effective_score_fingerprint("model-v1", "chunker-v1", "canonical"),
-        )
+        self.assertEqual(len(keys), 4)
+
+    def test_map_codec_normalizes_scores_and_orders_binary_keys(self) -> None:
+        first = b"a" * 32
+        second = b"b" * 32
+
+        payload = encode_score_map({second: 2, first: 1.5})
+
+        self.assertEqual(decode_score_map(payload), {first: 1.5, second: 2.0})
+        self.assertEqual(payload, encode_score_map({first: 1.5, second: 2.0}))
+
+    def test_empty_request_does_not_read_score_or_write_an_empty_artifact(self) -> None:
+        store = FakeArtifactStore()
+        scorer = RecordingScorer()
+
+        self.assertEqual(_cache(store, scorer).score("query", ()), {})
+        self.assertEqual(store.read_validated_calls, [])
+        self.assertEqual(store.write_calls, [])
+        self.assertEqual(scorer.calls, [])
 
     def test_requested_passage_identity_is_validated_before_storage(self) -> None:
         store = FakeArtifactStore()
         scorer = RecordingScorer()
-        cache = _cache(store, scorer)
 
         with self.assertRaises(PassageScoreArtifactValidationError):
-            cache.score("q", (_passage("x", chunker_fingerprint="other"),))
-        with self.assertRaises(PassageScoreArtifactValidationError):
-            cache.score("q", (_passage("x", representation="report_text"),))
+            _cache(store, scorer).score(
+                "q", (_report_passage("x"),)
+            )
+
         self.assertEqual(store.read_validated_calls, [])
         self.assertEqual(scorer.calls, [])
 
-    def test_cold_miss_scores_all_unique_passages_and_writes_once(self) -> None:
+    def test_cold_miss_scores_unique_passages_and_writes_one_complete_map(self) -> None:
         store = FakeArtifactStore()
         scorer = RecordingScorer()
-        cache = _cache(store, scorer)
         first = _passage("first", document_id="first")
         duplicate = _passage("first", document_id="duplicate")
         second = _passage("second", document_id="second")
 
-        result = cache.score("query", (first, duplicate, second))
+        result = _cache(store, scorer).score("query", (first, duplicate, second))
 
         self.assertEqual(result, {first.content_hash: 1.0, second.content_hash: 2.0})
         self.assertEqual(
             scorer.calls, [("query", (first.content_hash, second.content_hash))]
         )
-        self.assertEqual(len(store.write_calls), 1)
+        self.assertEqual(len(store.read_validated_calls), 1)
         self.assertEqual(store.read_calls, [])
-
-        envelope = decode_score_envelope(store.write_calls[0][1])
+        self.assertEqual(len(store.write_calls), 1)
         self.assertEqual(
-            envelope.coverage, tuple(sorted((first.content_hash, second.content_hash)))
+            decode_score_map(store.write_calls[0][1]),
+            {first.content_hash: 1.0, second.content_hash: 2.0},
         )
-        self.assertEqual(list(envelope.scores), list(sorted(envelope.scores)))
-        self.assertEqual(set(envelope.scores), set(envelope.coverage))
 
-    def test_complete_warm_hit_returns_only_request_keys_without_scorer_or_write(
-        self,
-    ) -> None:
+    def test_complete_warm_hit_returns_only_requested_hashes(self) -> None:
         store = FakeArtifactStore()
-        first_scorer = RecordingScorer()
-        first_cache = _cache(store, first_scorer)
         first = _passage("first", document_id="first")
         second = _passage("second", document_id="second")
-        first_cache.score("query", (first, second))
+        _cache(store, RecordingScorer()).score("query", (first, second))
         store.write_calls.clear()
+        warm_scorer = RecordingScorer(failure=AssertionError("warm hit scored"))
 
-        warm_scorer = RecordingScorer(failure=AssertionError("warm hit called scorer"))
         result = _cache(store, warm_scorer).score("query", (second,))
 
         self.assertEqual(result, {second.content_hash: 2.0})
         self.assertEqual(warm_scorer.calls, [])
         self.assertEqual(store.write_calls, [])
 
-    def test_fingerprint_only_cache_returns_warm_hit_without_a_scorer(self) -> None:
+    def test_missing_only_scoring_rewrites_the_complete_union(self) -> None:
         store = FakeArtifactStore()
         scorer = RecordingScorer()
-        first = _passage("first")
-        second = _passage("second", document_id="second")
-        _cache(store, scorer).score("query", (first, second))
-        store.write_calls.clear()
-
-        fingerprint_only = PassageScoreCache(
-            store,
-            scorer.fingerprint,
-            "chunker-v1",
-            "canonical",
-            FakeArtifactStore.ArtifactValidationError,
-        )
-        result = fingerprint_only.score("query", (second,))
-
-        self.assertEqual(result, {second.content_hash: 2.0})
-        self.assertEqual(len(store.read_validated_calls), 2)
-        self.assertEqual(store.write_calls, [])
-
-    def test_fingerprint_only_cache_miss_requires_scorer_without_writing(self) -> None:
-        store = FakeArtifactStore()
-        fingerprint_only = PassageScoreCache(
-            store,
-            "model-v1",
-            "chunker-v1",
-            "canonical",
-            FakeArtifactStore.ArtifactValidationError,
-        )
-
-        with self.assertRaisesRegex(TypeError, "scorer is required"):
-            fingerprint_only.score("query", (_passage("missing"),))
-
-        self.assertEqual(len(store.read_validated_calls), 1)
-        self.assertEqual(store.write_calls, [])
-
-    def test_falsey_scorer_override_is_honored_on_a_cache_miss(self) -> None:
-        store = FakeArtifactStore()
-        scorer = FalseyRecordingScorer()
-        fingerprint_only = PassageScoreCache(
-            store,
-            scorer.fingerprint,
-            "chunker-v1",
-            "canonical",
-            FakeArtifactStore.ArtifactValidationError,
-        )
-        passage = _passage("falsey")
-
-        result = fingerprint_only.score("query", (passage,), scorer)
-
-        self.assertEqual(result, {passage.content_hash: 1.0})
-        self.assertEqual(scorer.calls, [("query", (passage.content_hash,))])
-        self.assertEqual(len(store.write_calls), 1)
-
-    def test_overlapping_query_sets_reuse_one_object_and_rewrite_complete_union(
-        self,
-    ) -> None:
-        store = FakeArtifactStore()
-        scorer = RecordingScorer()
-        cache = _cache(store, scorer)
         first = _passage("first", document_id="first")
         second = _passage("second", document_id="second")
         third = _passage("third", document_id="third")
+        cache = _cache(store, scorer)
 
-        first_result = cache.score("query", (second, first))
-        first_write = store.write_calls[0][1]
+        cache.score("query", (first, second))
+        first_payload = store.write_calls[0][1]
         store.write_calls.clear()
-        second_result = cache.score("query", (third, second))
+        result = cache.score("query", (second, third))
 
-        self.assertEqual(
-            first_result, {first.content_hash: 2.0, second.content_hash: 1.0}
-        )
-        self.assertEqual(
-            second_result, {second.content_hash: 1.0, third.content_hash: 1.0}
-        )
+        self.assertEqual(result, {second.content_hash: 2.0, third.content_hash: 1.0})
         self.assertEqual(
             scorer.calls,
             [
-                ("query", (second.content_hash, first.content_hash)),
+                ("query", (first.content_hash, second.content_hash)),
                 ("query", (third.content_hash,)),
             ],
         )
         self.assertEqual(len(store.write_calls), 1)
-        union = decode_score_envelope(store.write_calls[0][1])
+        self.assertNotEqual(first_payload, store.write_calls[0][1])
         self.assertEqual(
-            union.coverage,
-            tuple(
-                sorted((first.content_hash, second.content_hash, third.content_hash))
-            ),
+            decode_score_map(store.write_calls[0][1]),
+            {
+                first.content_hash: 1.0,
+                second.content_hash: 2.0,
+                third.content_hash: 1.0,
+            },
         )
-        self.assertEqual(
-            store.write_calls[0][1],
-            encode_score_envelope(union),
-        )
-        self.assertNotEqual(first_write, store.write_calls[0][1])
 
-    def test_cached_passage_scorer_exposes_scorer_contract(self) -> None:
+    def test_cached_passage_scorer_delegates_to_one_cache(self) -> None:
         store = FakeArtifactStore()
         scorer = RecordingScorer()
         cache = _cache(store, scorer)
-        cached = CachedPassageScorer(scorer, cache)
+        cached = CachedPassageScorer(cache)
         passage = _passage("passage")
 
         self.assertEqual(cached.fingerprint, scorer.fingerprint)
+        self.assertEqual(cached.cache, cache)
         self.assertEqual(cached.score("q", (passage,)), {passage.content_hash: 1.0})
 
-    def test_decode_rejects_strict_unknown_fields(self) -> None:
-        raw = _raw_envelope(
-            "query",
-            coverage=(b"a" * 32,),
-            scores={b"a" * 32: 1.0},
-            extra={"unknown": 1},
-        )
+    def test_old_positional_identity_constructor_is_removed(self) -> None:
+        with self.assertRaises(TypeError):
+            PassageScoreCache(
+                FakeArtifactStore(),
+                RecordingScorer(),
+                "chunker-v1",  # type: ignore[call-arg]
+                "canonical",  # type: ignore[call-arg]
+                FakeArtifactStore.ArtifactValidationError,  # type: ignore[call-arg]
+            )
 
-        with self.assertRaises(PassageScoreArtifactValidationError):
-            decode_score_envelope(raw)
-
-    def test_malformed_truncated_and_wrong_schema_objects_are_rejected_without_write(
+    def test_malformed_truncated_non_map_nonfinite_and_wrong_key_artifacts_fail(
         self,
     ) -> None:
-        first = _passage("first")
+        passage = _passage("first")
+        key = score_object_key("query", "model-v1", "chunker-v1", "canonical")
+        valid = msgspec.msgpack.encode({passage.content_hash: 1.0})
         cases = (
             b"not msgpack",
-            _raw_envelope(
-                "query",
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0},
-            )[:-1],
-            _raw_envelope(
-                "query",
-                schema_version=2,
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0},
-            ),
+            valid[:-1],
+            msgspec.msgpack.encode([passage.content_hash, 1.0]),
+            msgspec.msgpack.encode({passage.content_hash: math.nan}),
+            msgspec.msgpack.encode({b"wrong": 1.0}),
+            msgspec.msgpack.encode({}),
         )
-        for raw in cases:
-            with self.subTest(raw_prefix=raw[:12]):
-                store = FakeArtifactStore()
-                key = score_object_key("query", "model-v1", "chunker-v1", "canonical")
-                store.objects[key] = raw
-                scorer = RecordingScorer()
-                cache = _cache(store, scorer)
 
-                with self.assertRaises(FakeArtifactStore.ArtifactValidationError):
-                    cache.score("query", (first,))
-                self.assertEqual(scorer.calls, [])
-                self.assertEqual(store.write_calls, [])
-
-    def test_wrong_query_and_wrong_fingerprint_objects_are_rejected(self) -> None:
-        first = _passage("first")
-        key = score_object_key("query", "model-v1", "chunker-v1", "canonical")
-        cases = (
-            _raw_envelope(
-                "different",
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0},
-            ),
-            _raw_envelope(
-                "query",
-                scorer_fingerprint="wrong",
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0},
-            ),
-            _raw_envelope(
-                "query",
-                extra={"scorer_fingerprint": "bad\n"},
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0},
-            ),
-            _raw_envelope(
-                "query",
-                chunker_fingerprint="wrong",
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0},
-            ),
-            _raw_envelope(
-                "query",
-                representation="report_text",
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0},
-            ),
-        )
         for raw in cases:
             with self.subTest(raw_prefix=raw[:12]):
                 store = FakeArtifactStore()
                 store.objects[key] = raw
                 scorer = RecordingScorer()
+
                 with self.assertRaises(FakeArtifactStore.ArtifactValidationError):
-                    _cache(store, scorer).score("query", (first,))
+                    _cache(store, scorer).score("query", (passage,))
                 self.assertEqual(scorer.calls, [])
                 self.assertEqual(store.write_calls, [])
 
-    def test_nonfinite_and_incomplete_coverage_objects_are_rejected(self) -> None:
-        first = _passage("first")
-        second = _passage("second", document_id="second")
-        key = score_object_key("query", "model-v1", "chunker-v1", "canonical")
-        cases = (
-            _raw_envelope(
-                "query",
-                coverage=(first.content_hash,),
-                scores={first.content_hash: math.nan},
-            ),
-            _raw_envelope(
-                "query",
-                coverage=(first.content_hash, second.content_hash),
-                scores={first.content_hash: 1.0},
-            ),
-            _raw_envelope(
-                "query",
-                coverage=(first.content_hash,),
-                scores={first.content_hash: 1.0, b"x" * 32: 2.0},
-            ),
-        )
-        for raw in cases:
-            with self.subTest(raw_prefix=raw[:12]):
-                store = FakeArtifactStore()
-                store.objects[key] = raw
-                scorer = RecordingScorer()
-                with self.assertRaises(FakeArtifactStore.ArtifactValidationError):
-                    _cache(store, scorer).score("query", (first, second))
-                self.assertEqual(scorer.calls, [])
-                self.assertEqual(store.write_calls, [])
-
-    def test_decoder_wraps_domain_validation_with_the_exact_injected_store_exception(
-        self,
-    ) -> None:
+    def test_direct_codec_rejects_non_bytes_non_map_and_bad_values(self) -> None:
         with self.assertRaises(PassageScoreArtifactValidationError):
-            decode_score_envelope(b"bad")
+            decode_score_map(bytearray())  # type: ignore[arg-type]
+        with self.assertRaises(PassageScoreArtifactValidationError):
+            decode_score_map(msgspec.msgpack.encode({b"x" * 32: math.inf}))
+        with self.assertRaises(PassageScoreArtifactValidationError):
+            encode_score_map({b"x" * 31: 1.0})  # type: ignore[dict-item]
+        with self.assertRaises(PassageScoreArtifactValidationError):
+            encode_score_map({b"x" * 32: "not a score"})  # type: ignore[dict-item]
 
-        store = FakeArtifactStore()
-        first = _passage("first")
-        key = score_object_key("query", "model-v1", "chunker-v1", "canonical")
-        store.objects[key] = b"bad"
-        with self.assertRaises(FakeArtifactStore.ArtifactValidationError) as raised:
-            _cache(store, RecordingScorer()).score("query", (first,))
-        self.assertIsInstance(
-            raised.exception.__cause__, PassageScoreArtifactValidationError
-        )
-        self.assertIsNot(
-            raised.exception.__class__, PassageScoreArtifactValidationError
-        )
-
-    def test_storage_errors_propagate_and_are_never_treated_as_misses(self) -> None:
-        first = _passage("first")
-        store = FakeArtifactStore()
-        store.read_error = RuntimeError("read failed")
+    def test_storage_failures_propagate_without_becoming_misses(self) -> None:
+        passage = _passage("first")
+        read_store = FailingArtifactStore(read_error=RuntimeError("read failed"))
         scorer = RecordingScorer()
+
         with self.assertRaisesRegex(RuntimeError, "read failed"):
-            _cache(store, scorer).score("query", (first,))
+            _cache(read_store, scorer).score("query", (passage,))
         self.assertEqual(scorer.calls, [])
-        self.assertEqual(store.write_calls, [])
+        self.assertEqual(read_store.write_calls, [])
 
-        store = FakeArtifactStore()
-        store.write_error = RuntimeError("write failed")
+        write_store = FailingArtifactStore(write_error=RuntimeError("write failed"))
         with self.assertRaisesRegex(RuntimeError, "write failed"):
-            _cache(store, RecordingScorer()).score("query", (first,))
-        self.assertEqual(len(store.write_calls), 0)
+            _cache(write_store, RecordingScorer()).score("query", (passage,))
+        self.assertEqual(write_store.write_calls, [])
 
-    def test_scorer_failure_or_partial_response_never_writes(self) -> None:
+    def test_scorer_failure_or_partial_coverage_never_writes(self) -> None:
         first = _passage("first")
         second = _passage("second", document_id="second")
-        failing_store = FakeArtifactStore()
+
+        failed_store = FakeArtifactStore()
         with self.assertRaisesRegex(RuntimeError, "model failed"):
             _cache(
-                failing_store,
+                failed_store,
                 RecordingScorer(failure=RuntimeError("model failed")),
             ).score("query", (first, second))
-        self.assertEqual(failing_store.write_calls, [])
+        self.assertEqual(failed_store.write_calls, [])
 
         partial_store = FakeArtifactStore()
         partial_scorer = RecordingScorer(response={first.content_hash: 1.0})
         with self.assertRaises(ValueError):
             _cache(partial_store, partial_scorer).score("query", (first, second))
         self.assertEqual(partial_store.write_calls, [])
-
-
-class PassageScoreEnvelopeTests(unittest.TestCase):
-    def test_envelope_is_frozen_and_round_trips_canonically(self) -> None:
-        coverage = (b"a" * 32, b"b" * 32)
-        envelope = PassageScoreEnvelope(
-            schema_version=1,
-            scorer_fingerprint="model-v1",
-            chunker_fingerprint="chunker-v1",
-            representation="canonical",
-            score_fingerprint=effective_score_fingerprint(
-                "model-v1", "chunker-v1", "canonical"
-            ),
-            query_hash=query_hash("query"),
-            coverage=coverage,
-            coverage_digest=_coverage_digest(coverage),
-            scores={coverage[1]: 2.0, coverage[0]: 1.0},
-        )
-        with self.assertRaises((AttributeError, TypeError)):
-            envelope.schema_version = 2  # type: ignore[misc]
-        decoded = decode_score_envelope(encode_score_envelope(envelope))
-        self.assertEqual(decoded.coverage, coverage)
-        self.assertEqual(list(decoded.scores), list(sorted(decoded.scores)))
-        self.assertEqual(
-            encode_score_envelope(envelope), encode_score_envelope(decoded)
-        )
 
 
 if __name__ == "__main__":
