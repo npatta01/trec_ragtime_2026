@@ -22,12 +22,11 @@ from trec_ragtime import (
     LocalCorpusIndex,
     PipelineResult,
     RagtimeApiError,
-    RagtimeClient,
     RagtimeRetriever,
-    ResponseCache,
     SearchHit,
 )
 from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.cache import ResponseCache
 from trec_ragtime.retrieval_cache import RetrievalArtifactCache
 
 

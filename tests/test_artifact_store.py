@@ -12,6 +12,7 @@ from unittest.mock import patch
 from trec_ragtime.artifact_store import (
     ArtifactStore,
     ArtifactStoreConfigurationError,
+    ArtifactStoreUnavailableError,
     ArtifactValidationError,
 )
 
@@ -503,10 +504,47 @@ class ArtifactStoreTestCase(unittest.TestCase):
                 with self.assertRaises(ArtifactStoreConfigurationError):
                     ArtifactStore.from_env()
 
+    def test_missing_bucket_still_validates_explicit_cache_settings(self) -> None:
+        settings = (
+            {"namespace": ""},
+            {"prefix": "/invalid"},
+            {"local_dir": "relative-cache"},
+        )
+        with patch.dict(os.environ, {"RAGTIME_HF_BUCKET_ID": ""}, clear=False):
+            for overrides in settings:
+                with self.subTest(overrides=overrides):
+                    with self.assertRaises(ArtifactStoreConfigurationError) as raised:
+                        ArtifactStore.from_env(**overrides)
+                    self.assertNotIsInstance(
+                        raised.exception, ArtifactStoreUnavailableError
+                    )
+
+            with self.assertRaises(ArtifactStoreUnavailableError):
+                ArtifactStore.from_env()
+
     def test_configuration_metadata_never_exposes_token(self) -> None:
         store = self.make_store(token="super-secret")
         self.assertNotIn("super-secret", repr(store.configuration()))
         self.assertTrue(store.configuration()["token_configured"])
+
+    def test_write_failure_when_l1_probe_raises_cleans_candidate(self) -> None:
+        store = self.make_store()
+        real_exists = Path.exists
+        calls = 0
+
+        def exists() -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("candidate status unavailable")
+            return real_exists(store.local_candidate("object.mpk"))
+
+        with patch.object(Path, "exists", side_effect=exists):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertFalse(store.write("object.mpk", b"payload"))
+        self.assert_one_sanitized_warning(caught)
+        self.assertFalse(store.local_candidate("object.mpk").exists())
 
 
 if __name__ == "__main__":

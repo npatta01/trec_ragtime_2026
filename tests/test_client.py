@@ -16,9 +16,9 @@ from trec_ragtime import (
     RagtimeClient,
     RagtimeConfigurationError,
     RagtimeProtocolError,
-    ResponseCache,
 )
 from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.cache import ResponseCache
 
 
 class MemoryArtifactStore:
@@ -456,6 +456,56 @@ class RagtimeClientTests(unittest.TestCase):
         self.assertIs(caught[0].category, RuntimeWarning)
         self.assertNotIn("secret", str(caught[0].message))
         client.close()
+
+    def test_missing_bucket_does_not_hide_invalid_cache_environment_settings(self) -> None:
+        settings = (
+            {"RAGTIME_CACHE_NAMESPACE": ""},
+            {"RAGTIME_ARTIFACT_PREFIX": "/invalid"},
+            {"RAGTIME_ARTIFACT_CACHE_DIR": "relative-cache"},
+        )
+        for setting in settings:
+            with self.subTest(setting=setting), patch.dict(
+                os.environ,
+                {
+                    "RAGTIME_BASE_URL": "https://api.example",
+                    "RAGTIME_BEARER_TOKEN": "secret",
+                    "RAGTIME_HF_BUCKET_ID": "",
+                    **setting,
+                },
+                clear=True,
+            ):
+                with self.assertRaises(RagtimeConfigurationError):
+                    RagtimeClient.from_env(session=RecordingSession())
+
+    def test_package_root_does_not_export_cache_implementation_surface(self) -> None:
+        import trec_ragtime
+
+        cache_exports = (
+            "CACHE_SCHEMA_VERSION",
+            "DEFAULT_CACHE_NAMESPACE",
+            "ArtifactStore",
+            "ArtifactStoreConfigurationError",
+            "ArtifactStoreError",
+            "ArtifactStoreRemoteError",
+            "ArtifactStoreUnavailableError",
+            "ArtifactValidationError",
+            "ArtifactStoreLike",
+            "PROJECT_CACHE_DIR_ENV",
+            "default_project_cache_dir",
+            "ensure_private_cache_dir",
+            "CacheEntry",
+            "ResponseCache",
+            "ResponseEnvelope",
+            "RetrievalArtifactCache",
+            "base_url_digest",
+            "canonical_request_bytes",
+            "canonicalize_json",
+            "request_digest",
+            "response_object_key",
+        )
+        for name in cache_exports:
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(trec_ragtime, name))
 
     def test_public_client_exposes_artifact_store_and_sanitized_configuration(self) -> None:
         cache, store = make_cache()

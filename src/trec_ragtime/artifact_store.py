@@ -103,9 +103,7 @@ class ArtifactStore:
         self.bucket_id = self._validate_bucket_id(bucket_id)
         self.prefix = self._validate_prefix(prefix)
         self.local_dir = self._prepare_local_dir(local_dir)
-        if not isinstance(namespace, str) or not namespace.strip():
-            raise _configuration_error("RAGTIME_CACHE_NAMESPACE must not be empty")
-        self.namespace = namespace.strip()
+        self.namespace = self._validate_namespace(namespace)
         self.token = token
         self.endpoint = endpoint
         self._api_factory = api_factory or HfApi
@@ -127,6 +125,22 @@ class ArtifactStore:
             )
 
         bucket_override = "bucket_id" in overrides
+        local_dir_override = "local_dir" in overrides
+        prefix = overrides.pop("prefix", os.getenv("RAGTIME_ARTIFACT_PREFIX", ""))
+        local_value = overrides.pop(
+            "local_dir", os.getenv("RAGTIME_ARTIFACT_CACHE_DIR", "").strip()
+        )
+        if local_dir_override and not local_value:
+            raise _configuration_error("artifact cache directory must be absolute")
+        if not local_value:
+            local_value = default_project_cache_dir() / DEFAULT_ARTIFACT_CACHE_SUBDIRECTORY
+        prefix = cls._validate_prefix(prefix)
+        local_path = cls._validate_local_dir_value(local_value)
+        namespace = overrides.pop(
+            "namespace",
+            os.getenv("RAGTIME_CACHE_NAMESPACE", DEFAULT_CACHE_NAMESPACE),
+        )
+        namespace = cls._validate_namespace(namespace)
         bucket_id = overrides.pop(
             "bucket_id", os.getenv("RAGTIME_HF_BUCKET_ID", "").strip()
         )
@@ -137,22 +151,11 @@ class ArtifactStore:
                 "RAGTIME_HF_BUCKET_ID is not configured"
             )
 
-        prefix = overrides.pop("prefix", os.getenv("RAGTIME_ARTIFACT_PREFIX", ""))
-        local_value = overrides.pop(
-            "local_dir", os.getenv("RAGTIME_ARTIFACT_CACHE_DIR", "").strip()
-        )
-        if not local_value:
-            local_value = default_project_cache_dir() / DEFAULT_ARTIFACT_CACHE_SUBDIRECTORY
-
         token = overrides.pop("token", os.getenv("HF_TOKEN") or None)
-        namespace = overrides.pop(
-            "namespace",
-            os.getenv("RAGTIME_CACHE_NAMESPACE", DEFAULT_CACHE_NAMESPACE),
-        )
         endpoint = overrides.pop("endpoint", None)
         return cls(
             bucket_id,
-            local_value,
+            local_path,
             prefix=prefix,
             token=token,
             namespace=namespace,
@@ -192,12 +195,28 @@ class ArtifactStore:
         return prefix
 
     @staticmethod
-    def _prepare_local_dir(local_dir: str | os.PathLike[str]) -> Path:
-        path = Path(local_dir).expanduser()
+    def _validate_namespace(namespace: str) -> str:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise _configuration_error("RAGTIME_CACHE_NAMESPACE must not be empty")
+        return namespace.strip()
+
+    @staticmethod
+    def _validate_local_dir_value(local_dir: str | os.PathLike[str]) -> Path:
+        try:
+            path = Path(local_dir).expanduser()
+        except (TypeError, ValueError):
+            raise _configuration_error(
+                "artifact cache directory must be an absolute path"
+            ) from None
         if not path.is_absolute():
             raise _configuration_error("artifact cache directory must be absolute")
         if path.is_symlink():
             raise _configuration_error("artifact cache directory must not be a symlink")
+        return path
+
+    @staticmethod
+    def _prepare_local_dir(local_dir: str | os.PathLike[str]) -> Path:
+        path = ArtifactStore._validate_local_dir_value(local_dir)
         try:
             ensure_private_cache_dir(path)
         except (OSError, ValueError):
@@ -401,18 +420,19 @@ class ArtifactStore:
         if not isinstance(payload, bytes):
             raise _configuration_error("artifact payload must be bytes")
         candidate = self.local_candidate(object_key)
-        candidate_existed_before = candidate.exists()
         if self._remote_disabled:
             return False
         remote_open_attempted = False
+        candidate_existed_before = False
         try:
+            candidate_existed_before = candidate.exists()
             self._verify_private_bucket()
             filesystem = self._get_filesystem()
             handle = filesystem.open(self._remote_path(object_key), "wb")
             remote_open_attempted = True
             with handle:
                 handle.write(payload)
-            if candidate.read_bytes() != payload:
+            if not candidate.exists() or candidate.read_bytes() != payload:
                 raise ArtifactStoreRemoteError(
                     "local artifact candidate did not retain the written bytes"
                 )

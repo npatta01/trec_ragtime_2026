@@ -1,17 +1,5 @@
 """Reusable client for the TREC RAGTIME retrieval service."""
 
-from .cache import (
-    CACHE_SCHEMA_VERSION,
-    DEFAULT_CACHE_NAMESPACE,
-    CacheEntry,
-    ResponseCache,
-    ResponseEnvelope,
-    base_url_digest,
-    canonical_request_bytes,
-    canonicalize_json,
-    request_digest,
-    response_object_key,
-)
 from .client import (
     DEFAULT_CONTENT_COLLECTION,
     DEFAULT_PIPELINE,
@@ -57,11 +45,6 @@ from .models import (
     RetrievedDocument,
     SearchHit,
 )
-from .paths import (
-    PROJECT_CACHE_DIR_ENV,
-    default_project_cache_dir,
-    ensure_private_cache_dir,
-)
 from .retriever import (
     DEFAULT_MAX_CONTENT_FALLBACKS,
     DocumentCorpus,
@@ -69,7 +52,6 @@ from .retriever import (
 )
 __all__ = [
     "DEFAULT_CONTENT_COLLECTION",
-    "DEFAULT_CACHE_NAMESPACE",
     "DEFAULT_HF_BASE_URL",
     "DEFAULT_HF_CONFIG",
     "DEFAULT_HF_DATASET",
@@ -79,8 +61,6 @@ __all__ = [
     "DEFAULT_HF_SPLITS",
     "DEFAULT_MAX_CONTENT_FALLBACKS",
     "DEFAULT_PIPELINE",
-    "CACHE_SCHEMA_VERSION",
-    "CacheEntry",
     "Document",
     "DocumentCorpus",
     "HuggingFaceApiError",
@@ -100,25 +80,15 @@ __all__ = [
     "LocalCorpusReadError",
     "LocalCorpusValidationError",
     "PipelineResult",
-    "PROJECT_CACHE_DIR_ENV",
     "RagtimeApiError",
     "RagtimeClient",
     "RagtimeConfigurationError",
     "RagtimeError",
     "RagtimeProtocolError",
     "RagtimeRetriever",
-    "ResponseCache",
-    "ResponseEnvelope",
     "RetrievalResult",
     "RetrievedDocument",
     "SearchHit",
-    "base_url_digest",
     "build_from_parquet",
-    "canonical_request_bytes",
-    "canonicalize_json",
     "default_local_corpus_path",
-    "default_project_cache_dir",
-    "ensure_private_cache_dir",
-    "request_digest",
-    "response_object_key",
 ]
