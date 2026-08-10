@@ -372,8 +372,12 @@ class ArtifactStore:
                         "artifact filesystem did not retain the local candidate"
                     )
             else:
-                with filesystem.open(self._remote_path(object_key), "rb") as handle:
-                    payload = handle.read()
+                # Do not fall back to SimpleCacheFileSystem.open(): its stock
+                # read path probes target.exists(), which is not a permitted
+                # miss classifier after paths-info proved this object exists.
+                raise ArtifactStoreRemoteError(
+                    "required artifact hydration primitive is unavailable"
+                )
             if not isinstance(payload, (bytes, bytearray)):
                 raise ArtifactStoreRemoteError("Hugging Face artifact did not contain bytes")
             self._secure_candidate(candidate)

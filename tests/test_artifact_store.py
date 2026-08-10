@@ -80,6 +80,18 @@ class FakeSimpleCache:
     def _mapper(self, path: str) -> str:
         return hashlib.sha256(path.encode("utf-8")).hexdigest()
 
+    def _get_cached_file_before_open(self, path: str, **kwargs) -> None:
+        self.open_calls.append((path, "rb"))
+        key = self._strip_protocol(path).removeprefix("buckets/")
+        candidate = Path(self.storage[-1]) / self._mapper(self._strip_protocol(path))
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        if self.fail_download is not None:
+            raise self.fail_download
+        if key not in self.remote:
+            raise FileNotFoundError(key)
+        candidate.write_bytes(self.remote[key])
+        os.chmod(candidate, 0o600)
+
     def open(self, path: str, mode: str):
         self.open_calls.append((path, mode))
         key = self._strip_protocol(path).removeprefix("buckets/")
@@ -101,12 +113,12 @@ class PartialFailSimpleCache(FakeSimpleCache):
         super().__init__(*args, **kwargs)
         self.partial_then_fail = True
 
-    def open(self, path: str, mode: str):
-        if "r" in mode and self.partial_then_fail:
+    def _get_cached_file_before_open(self, path: str, **kwargs) -> None:
+        if self.partial_then_fail:
             candidate = Path(self.storage[-1]) / self._mapper(self._strip_protocol(path))
             candidate.write_bytes(b"partial")
             raise RuntimeError("download interrupted")
-        return super().open(path, mode)
+        return super()._get_cached_file_before_open(path, **kwargs)
 
 
 class BarrierWriteFile(FakeWriteFile):
@@ -179,6 +191,21 @@ class ActualSimpleCacheFactory:
             fs=self.target,
             cache_storage=str(self.storage),
         )
+
+
+class UnavailableHydrationSimpleCache:
+    """A SimpleCache-shaped filesystem without its exact hydration helper."""
+
+    def __init__(self, inner, open_calls: list[tuple[str, str]]) -> None:
+        self.inner = inner
+        self.open_calls = open_calls
+        # Mask the class method to model a compatible fsspec implementation
+        # where the required exact-transfer primitive is unavailable.
+        self._get_cached_file_before_open = None
+
+    def open(self, path: str, mode: str):
+        self.open_calls.append((path, mode))
+        return self.inner.open(path, mode)
 
 
 class FakeHfApi:
@@ -318,7 +345,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
         assert self.api is not None
         self.assertEqual(self.api.paths_calls, [("owner/bucket", ["foo/object.mpk"])])
         assert self.fs is not None
-        self.assertEqual(self.fs.open_calls, [("hf://buckets/owner/bucket/foo/object.mpk", "rb")])
+        self.assertEqual(self.fs.open_calls, [("buckets/owner/bucket/foo/object.mpk", "rb")])
         self.assertEqual(store.local_candidate("object.mpk").read_bytes(), b"remote")
 
     def test_empty_paths_info_is_the_only_remote_miss(self) -> None:
@@ -413,6 +440,29 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(exists_calls, [])
         assert factory.target is not None
         self.assertEqual(len(factory.target.get_file_calls), 1)
+
+    def test_missing_hydration_primitive_fails_closed_without_open_or_exists(self) -> None:
+        exists_calls: list[str] = []
+        open_calls: list[tuple[str, str]] = []
+        target = ActualSimpleCacheTarget(self.remote, exists_calls)
+
+        def factory(protocol: str, **kwargs):
+            self.assertEqual(protocol, "simplecache")
+            inner = fsspec.filesystem(
+                "simplecache",
+                fs=target,
+                cache_storage=str(self.local_dir),
+            )
+            return UnavailableHydrationSimpleCache(inner, open_calls)
+
+        store = self.make_store(filesystem_factory_override=factory)
+
+        with self.assertRaises(ArtifactStoreRemoteError) as raised:
+            store.read("object.mpk")
+
+        self.assertEqual(str(raised.exception), "failed to download the Hugging Face artifact")
+        self.assertEqual(open_calls, [])
+        self.assertEqual(exists_calls, [])
 
     def test_successful_write_uploads_and_retains_mode_0600_candidate(self) -> None:
         store = self.make_store()
