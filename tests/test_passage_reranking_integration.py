@@ -31,33 +31,150 @@ from trec_ragtime.models import PipelineResult, RetrievalResult, RetrievedDocume
 
 
 _INTEGRATION_QUERY = "shared evidence and practical outcomes"
-_EXPECTED_PUBLIC_SURFACE = {
+_SUPPORTED_BASELINE_PUBLIC_EXPORTS = {
+    "DEFAULT_CONTENT_COLLECTION",
+    "DEFAULT_BATCH_SIZE",
+    "DEFAULT_FLASH_BATCH_SIZE",
+    "DEFAULT_FLASH_CONCURRENCY",
+    "DEFAULT_FLASH_GPU",
+    "DEFAULT_FLASH_IDLE_TIMEOUT",
+    "DEFAULT_FLASH_REQUEST_TIMEOUT",
+    "DEFAULT_FLASH_WORKER_NAME",
+    "DEFAULT_HF_BASE_URL",
+    "DEFAULT_HF_CONFIG",
+    "DEFAULT_HF_DATASET",
+    "DEFAULT_HF_DOCUMENT_CACHE_TTL_SECONDS",
+    "DEFAULT_HF_MT_CONFIG",
+    "DEFAULT_HF_MT_SPLITS",
+    "DEFAULT_HF_SPLITS",
+    "DEFAULT_MAX_CONTENT_FALLBACKS",
+    "DEFAULT_MAX_LENGTH",
+    "DEFAULT_MODEL_NAME",
+    "DEFAULT_MODEL_REVISION",
+    "DEFAULT_PIPELINE",
+    "DEFAULT_QUERY_FORMAT",
+    "DEFAULT_QUERY_POLICY",
+    "DEFAULT_SCHEMA_VERSION",
+    "DEFAULT_TOKENIZER_NAME",
+    "DEFAULT_TOKENIZER_REVISION",
+    "CachedPassageScorer",
+    "CrossEncoderPairLengthFunction",
+    "FLASH_PAYLOAD_LIMIT_BYTES",
+    "FlashEndpointBatchRunner",
+    "FlashPassageWorker",
+    "FlashScoringError",
     "Boundary",
+    "LocalCrossEncoderConfig",
+    "LocalCrossEncoderScorer",
+    "Document",
+    "DocumentCorpus",
+    "HuggingFaceApiError",
+    "HuggingFaceConfigurationError",
+    "HuggingFaceCorpus",
+    "HuggingFaceDocument",
+    "HuggingFaceError",
+    "HuggingFaceHydrationError",
+    "HuggingFaceProtocolError",
+    "HydrationFailure",
+    "HydrationResult",
+    "LocalCorpusBuildError",
+    "LocalCorpusConfigurationError",
+    "LocalCorpusError",
+    "LocalCorpusIndex",
+    "LocalCorpusMetadata",
+    "LocalCorpusReadError",
+    "LocalCorpusValidationError",
     "Passage",
     "PassageChunker",
     "PassageChunkingError",
-    "Representation",
-    "sha256_bytes",
-    "validate_passages",
-    "CrossEncoderPairLengthFunction",
-    "LocalCrossEncoderConfig",
-    "LocalCrossEncoderScorer",
-    "CachedPassageScorer",
-    "PassageScoreCache",
     "PassageEvidence",
+    "PassageScoreCache",
+    "PassageScorer",
+    "PassageScoringError",
+    "PipelineResult",
+    "PROJECT_CACHE_DIR_ENV",
+    "RagtimeApiError",
+    "RagtimeClient",
+    "RagtimeConfigurationError",
+    "RagtimeError",
+    "RagtimeProtocolError",
+    "RagtimeRetriever",
+    "RetrievalResult",
+    "RetrievedDocument",
     "RerankedDocument",
+    "RerankingError",
     "RerankingResult",
-    "rerank_retrieval",
-    "FlashEndpointBatchRunner",
     "RunpodFlashConfig",
     "RunpodFlashPassageScorer",
-    "FlashPassageWorker",
+    "Representation",
+    "SQLiteResponseCache",
+    "SearchHit",
+    "WIRE_SCHEMA_VERSION",
     "build_flash_worker",
+    "build_from_parquet",
+    "decode_flash_request",
+    "decode_flash_response",
+    "default_cache_path",
+    "default_local_corpus_path",
+    "default_project_cache_dir",
+    "ensure_private_cache_dir",
+    "encode_flash_request",
+    "encode_flash_response",
+    "max_passage_v1",
+    "rerank_retrieval",
+    "sha256_bytes",
+    "validate_passage_scores",
+    "validate_passages",
+}
+_DELETED_ISSUE15_PUBLIC_EXPORTS = {
+    "CACHE_SCHEMA_VERSION",
+    "ChunkerConfig",
+    "FlashWireValidationError",
+    "LangChainPassageChunker",
+    "PassageScoreArtifactValidationError",
+    "PassageScoreEnvelope",
+    "PassageScoreValidationError",
+    "PassageValidationError",
+    "RERANKED_RECORD_FILENAME",
+    "RERANKING_SCHEMA",
+    "RERANKING_SCHEMA_VERSION",
+    "RerankedPassage",
+    "ScoreEnvelope",
+    "decode_flash_batch",
+    "decode_flash_batch_response",
+    "decode_passage_score_envelope",
+    "decode_score_envelope",
+    "decode_score_map",
+    "effective_score_fingerprint",
+    "encode_flash_batch",
+    "encode_flash_batch_response",
+    "encode_passage_score_envelope",
+    "encode_score_envelope",
+    "encode_score_map",
+    "query_hash",
+    "score_object_key",
+    "write_reranking_artifact",
 }
 
 
 def _fake_score(text: str) -> float:
     return float(sum(text.encode("utf-8")) % 997)
+
+
+def _winning_content_hash(row: RerankedDocument) -> bytes | None:
+    matching_evidence = [
+        evidence for evidence in row.evidence if evidence.score == row.score
+    ]
+    if not matching_evidence:
+        return None
+    return min(
+        matching_evidence,
+        key=lambda evidence: (
+            evidence.start_char,
+            evidence.end_char,
+            evidence.content_hash,
+        ),
+    ).content_hash
 
 
 class ArtifactStoreFake:
@@ -334,29 +451,14 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
         ), model
 
     def test_public_surface_has_no_deleted_compatibility_symbols(self) -> None:
-        expected = {
-            "Passage",
-            "PassageChunker",
-            "CrossEncoderPairLengthFunction",
-            "LocalCrossEncoderConfig",
-            "LocalCrossEncoderScorer",
-            "PassageScoreCache",
-            "CachedPassageScorer",
-            "PassageEvidence",
-            "RerankedDocument",
-            "RerankingResult",
-            "rerank_retrieval",
-            "RunpodFlashPassageScorer",
-            "FlashPassageWorker",
-        }
-        self.assertEqual(len(trec_ragtime.__all__), len(set(trec_ragtime.__all__)))
-        self.assertTrue(expected <= set(trec_ragtime.__all__))
-        self.assertEqual(set(trec_ragtime.__all__), _EXPECTED_PUBLIC_SURFACE)
-        self.assertFalse(hasattr(trec_ragtime, "write_reranking_artifact"))
-        self.assertFalse(hasattr(trec_ragtime, "ChunkerConfig"))
-        self.assertFalse(hasattr(trec_ragtime, "LangChainPassageChunker"))
-        self.assertFalse(hasattr(trec_ragtime, "RerankedPassage"))
-        self.assertFalse(hasattr(trec_ragtime, "PassageValidationError"))
+        public_exports = set(trec_ragtime.__all__)
+        self.assertEqual(len(trec_ragtime.__all__), len(public_exports))
+        self.assertTrue(_SUPPORTED_BASELINE_PUBLIC_EXPORTS <= public_exports)
+        self.assertTrue(
+            _DELETED_ISSUE15_PUBLIC_EXPORTS.isdisjoint(public_exports)
+        )
+        for deleted_name in _DELETED_ISSUE15_PUBLIC_EXPORTS:
+            self.assertFalse(hasattr(trec_ragtime, deleted_name), deleted_name)
 
     def test_offline_multilingual_reranking_cache_and_flash_parity(self) -> None:
         retrieval = _retrieval_fixture()
@@ -489,16 +591,36 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
         self.assertEqual(
             [
                 tuple(
-                    (evidence.start_char, evidence.end_char, evidence.content_hash)
+                    (
+                        evidence.start_char,
+                        evidence.end_char,
+                        evidence.score,
+                        evidence.content_hash,
+                    )
                     for evidence in row.evidence
                 )
                 for row in canonical_result.documents
             ],
             [
                 tuple(
-                    (evidence.start_char, evidence.end_char, evidence.content_hash)
+                    (
+                        evidence.start_char,
+                        evidence.end_char,
+                        evidence.score,
+                        evidence.content_hash,
+                    )
                     for evidence in row.evidence
                 )
+                for row in flash_result.documents
+            ],
+        )
+        self.assertEqual(
+            [
+                _winning_content_hash(row)
+                for row in canonical_result.documents
+            ],
+            [
+                _winning_content_hash(row)
                 for row in flash_result.documents
             ],
         )
