@@ -7,9 +7,13 @@ import json
 import math
 import os
 import shutil
+import ctypes
+import errno
+import msgspec
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -31,6 +35,10 @@ RERANKING_SCHEMA = RERANKING_SCHEMA_VERSION
 RERANKED_RECORD_FILENAME = "reranked.jsonl"
 _STATUSES = ("scored", "missing_representation", "unresolved", "no_passages")
 _Status = Literal["scored", "missing_representation", "unresolved", "no_passages"]
+_BOUNDARIES = frozenset(
+    ("paragraph_packed", "sentence_packed", "oversized_sentence_fallback")
+)
+_HASH_LENGTH = 32
 
 
 def _non_blank(value: object, field_name: str, *, allow_newlines: bool = False) -> str:
@@ -62,6 +70,137 @@ def _optional_identity(value: object, field_name: str) -> str | None:
     return _non_blank(value, field_name)
 
 
+def _validate_hash(value: object, field_name: str) -> bytes:
+    if not isinstance(value, bytes) or len(value) != _HASH_LENGTH:
+        raise ValueError(f"{field_name} must be exactly {_HASH_LENGTH} bytes")
+    return value
+
+
+def _optional_hash(value: object, field_name: str) -> bytes | None:
+    if value is None:
+        return None
+    return _validate_hash(value, field_name)
+
+
+def _nonnegative_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative integer")
+    return value
+
+
+def _optional_text(value: object, field_name: str) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or None")
+    return value
+
+
+def _passage_lineage_id(
+    *,
+    document_id: str,
+    representation: str,
+    representation_hash: bytes,
+    start_char: int,
+    end_char: int,
+    chunk_index: int,
+    chunker_fingerprint: str,
+) -> bytes:
+    return sha256_bytes(
+        msgspec.msgpack.encode(
+            (
+                document_id,
+                representation,
+                representation_hash,
+                start_char,
+                end_char,
+                chunk_index,
+                chunker_fingerprint,
+            )
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PassageEvidence:
+    """Immutable, self-contained audit evidence for one scored passage."""
+
+    document_id: str
+    passage_id: bytes
+    content_hash: bytes
+    source_content_hash: bytes
+    representation_hash: bytes
+    representation: Representation
+    language: str
+    chunk_index: int
+    text: str
+    start_char: int
+    end_char: int
+    boundary: str
+    previous_passage_id: bytes | None
+    next_passage_id: bytes | None
+    overlap_chars: int
+    overlap_tokens: int
+    chunker_fingerprint: str
+    score: float
+
+    def __post_init__(self) -> None:
+        _non_blank(self.document_id, "passage document_id")
+        passage_id = _validate_hash(self.passage_id, "passage_id")
+        content_hash = _validate_hash(self.content_hash, "content_hash")
+        _validate_hash(self.source_content_hash, "source_content_hash")
+        representation_hash = _validate_hash(
+            self.representation_hash, "representation_hash"
+        )
+        if self.representation not in {"canonical", "report_text"}:
+            raise ValueError("passage representation is invalid")
+        language = _non_blank(self.language, "passage language")
+        if self.representation == "report_text" and language != "eng":
+            raise ValueError("report_text passage evidence requires language='eng'")
+        chunk_index = _nonnegative_int(self.chunk_index, "chunk_index")
+        if not isinstance(self.text, str) or not self.text:
+            raise ValueError("passage evidence text must not be empty")
+        if (
+            isinstance(self.start_char, bool)
+            or not isinstance(self.start_char, int)
+            or isinstance(self.end_char, bool)
+            or not isinstance(self.end_char, int)
+            or self.start_char < 0
+            or self.end_char <= self.start_char
+            or self.end_char - self.start_char != len(self.text)
+        ):
+            raise ValueError("passage evidence offsets must exactly cover text")
+        if self.boundary not in _BOUNDARIES:
+            raise ValueError("passage evidence boundary is invalid")
+        _optional_hash(self.previous_passage_id, "previous_passage_id")
+        _optional_hash(self.next_passage_id, "next_passage_id")
+        _validate_hash(self.content_hash, "content_hash")
+        if content_hash != sha256_bytes(self.text):
+            raise ValueError("content_hash does not match passage evidence text")
+        chunker_fingerprint = _non_blank(
+            self.chunker_fingerprint, "passage chunker_fingerprint"
+        )
+        score = _finite_float(self.score, "passage score")
+        if type(self.score) is not float:
+            object.__setattr__(self, "score", score)
+        overlap_chars = _nonnegative_int(self.overlap_chars, "overlap_chars")
+        overlap_tokens = _nonnegative_int(self.overlap_tokens, "overlap_tokens")
+        if overlap_chars != 0 or overlap_tokens != 0:
+            raise ValueError("max_passage_v1 requires zero passage overlap")
+        expected_id = _passage_lineage_id(
+            document_id=self.document_id,
+            representation=self.representation,
+            representation_hash=representation_hash,
+            start_char=self.start_char,
+            end_char=self.end_char,
+            chunk_index=chunk_index,
+            chunker_fingerprint=chunker_fingerprint,
+        )
+        if passage_id != expected_id:
+            raise ValueError("passage_id does not match passage evidence lineage")
+
+
+RerankedPassage = PassageEvidence
+
+
 @dataclass(frozen=True, slots=True)
 class RerankedDocument:
     """One organizer document with its deterministic reranking evidence."""
@@ -69,6 +208,7 @@ class RerankedDocument:
     topic_id: str
     document_id: str
     status: _Status
+    reranked_rank: int
     organizer_rank: int
     organizer_score: float
     score: float | None
@@ -77,6 +217,7 @@ class RerankedDocument:
     passage_ids: tuple[bytes, ...]
     passage_hashes: tuple[bytes, ...]
     passage_scores: tuple[float, ...]
+    passage_evidence: tuple[PassageEvidence, ...]
     representation: Representation
     language: str | None
     source_language: str | None
@@ -93,6 +234,188 @@ class RerankedDocument:
     cache_fingerprint: str | None
     cache_key: str | None
     aggregation: str
+
+    def __post_init__(self) -> None:
+        _non_blank(self.topic_id, "document topic_id")
+        _non_blank(self.document_id, "document document_id")
+        if self.status not in _STATUSES:
+            raise ValueError("document status is invalid")
+        _positive_int(self.reranked_rank, "reranked_rank")
+        _positive_int(self.organizer_rank, "organizer_rank")
+        _finite_float(self.organizer_score, "organizer_score")
+        if self.representation not in {"canonical", "report_text"}:
+            raise ValueError("document representation is invalid")
+        _optional_text(self.language, "document language")
+        _optional_text(self.source_language, "document source_language")
+        _optional_text(self.canonical_text, "canonical_text")
+        _optional_text(self.selected_text, "selected_text")
+        _optional_text(self.report_text, "report_text")
+        _optional_text(self.url, "url")
+        _optional_text(self.date, "date")
+        _optional_text(self.content_source, "content_source")
+        _optional_text(self.english_text, "english_text")
+        if self.content_local_cache_hit is not None and not isinstance(
+            self.content_local_cache_hit, bool
+        ):
+            raise ValueError("content_local_cache_hit must be a boolean or None")
+        _non_blank(self.chunker_fingerprint, "chunker_fingerprint")
+        _non_blank(self.scorer_fingerprint, "scorer_fingerprint")
+        cache_fingerprint = _optional_identity(
+            self.cache_fingerprint, "cache_fingerprint"
+        )
+        cache_key = _optional_identity(self.cache_key, "cache_key")
+        if (cache_fingerprint is None) != (cache_key is None):
+            raise ValueError("cache_fingerprint and cache_key must be provided together")
+        if self.aggregation != max_passage_v1:
+            raise ValueError("unsupported passage aggregation")
+
+        if not isinstance(self.passage_ids, tuple):
+            raise ValueError("passage_ids must be a tuple")
+        if not isinstance(self.passage_hashes, tuple):
+            raise ValueError("passage_hashes must be a tuple")
+        if not isinstance(self.passage_scores, tuple):
+            raise ValueError("passage_scores must be a tuple")
+        if not isinstance(self.passage_evidence, tuple):
+            raise ValueError("passage_evidence must be a tuple")
+        if any(_validate_hash(value, "passage_id") != value for value in self.passage_ids):
+            raise ValueError("passage_ids are malformed")
+        if any(_validate_hash(value, "passage hash") != value for value in self.passage_hashes):
+            raise ValueError("passage_hashes are malformed")
+        if len(self.passage_ids) != len(self.passage_hashes) or len(
+            self.passage_ids
+        ) != len(self.passage_scores) or len(self.passage_ids) != len(
+            self.passage_evidence
+        ):
+            raise ValueError("passage convenience fields and evidence disagree")
+        if any(not isinstance(value, PassageEvidence) for value in self.passage_evidence):
+            raise ValueError("passage_evidence must contain PassageEvidence values")
+        for evidence, passage_id, content_hash, passage_score in zip(
+            self.passage_evidence,
+            self.passage_ids,
+            self.passage_hashes,
+            self.passage_scores,
+            strict=True,
+        ):
+            try:
+                PassageEvidence(
+                    **{
+                        field: getattr(evidence, field)
+                        for field in PassageEvidence.__dataclass_fields__
+                    }
+                )
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ValueError("passage_evidence contains invalid evidence") from error
+            if evidence.document_id != self.document_id:
+                raise ValueError("passage evidence document_id disagrees")
+            if evidence.representation != self.representation:
+                raise ValueError("passage evidence representation disagrees")
+            if evidence.passage_id != passage_id:
+                raise ValueError("passage_ids disagree with passage evidence")
+            if evidence.content_hash != content_hash:
+                raise ValueError("passage_hashes disagree with passage evidence")
+            if _finite_float(passage_score, "passage score") != evidence.score:
+                raise ValueError("passage_scores disagree with passage evidence")
+
+        if self.status == "scored":
+            if self.canonical_text is None or self.selected_text is None:
+                raise ValueError("scored documents require both text representations")
+            if self.score is None:
+                raise ValueError("scored documents require a score")
+            scored_value = _finite_float(self.score, "document score")
+            if self.winning_passage_id is None or self.winning_content_hash is None:
+                raise ValueError("scored documents require a winning passage")
+            _validate_hash(self.winning_passage_id, "winning_passage_id")
+            _validate_hash(self.winning_content_hash, "winning_content_hash")
+            if not self.passage_evidence:
+                raise ValueError("scored documents require passage evidence")
+            if self.representation == "report_text":
+                if self.language != "eng" or self.report_text != self.selected_text:
+                    raise ValueError("report_text documents require exact English report text")
+            elif self.language is None or self.language != self.source_language:
+                raise ValueError("canonical documents require their source language")
+            expected_source_hash = sha256_bytes(self.canonical_text)
+            expected_representation_hash = sha256_bytes(self.selected_text)
+            cursor = 0
+            for index, evidence in enumerate(self.passage_evidence):
+                if evidence.chunk_index != index:
+                    raise ValueError("passage evidence indexes must be contiguous")
+                if evidence.language != self.language:
+                    raise ValueError("passage evidence language disagrees")
+                if evidence.chunker_fingerprint != self.chunker_fingerprint:
+                    raise ValueError("passage evidence chunker fingerprint disagrees")
+                if evidence.source_content_hash != expected_source_hash:
+                    raise ValueError("passage evidence source hash disagrees")
+                if evidence.representation_hash != expected_representation_hash:
+                    raise ValueError("passage evidence representation hash disagrees")
+                expected_previous = (
+                    None
+                    if index == 0
+                    else self.passage_evidence[index - 1].passage_id
+                )
+                expected_next = (
+                    None
+                    if index == len(self.passage_evidence) - 1
+                    else self.passage_evidence[index + 1].passage_id
+                )
+                if evidence.previous_passage_id != expected_previous:
+                    raise ValueError("previous passage linkage disagrees")
+                if evidence.next_passage_id != expected_next:
+                    raise ValueError("next passage linkage disagrees")
+                if evidence.start_char != cursor:
+                    raise ValueError("passage evidence must reconstruct selected_text")
+                if self.selected_text[evidence.start_char : evidence.end_char] != evidence.text:
+                    raise ValueError("passage evidence text does not match selected_text")
+                cursor = evidence.end_char
+            if cursor != len(self.selected_text):
+                raise ValueError("passage evidence does not cover selected_text")
+            winning_score = max(evidence.score for evidence in self.passage_evidence)
+            if scored_value != winning_score:
+                raise ValueError("document score must equal max passage score")
+            winning = min(
+                (
+                    evidence
+                    for evidence in self.passage_evidence
+                    if evidence.score == winning_score
+                ),
+                key=lambda evidence: evidence.content_hash,
+            )
+            if self.winning_passage_id != winning.passage_id:
+                raise ValueError("winning_passage_id disagrees with winning evidence")
+            if self.winning_content_hash != winning.content_hash:
+                raise ValueError("winning_content_hash disagrees with winning evidence")
+        else:
+            if self.score is not None:
+                raise ValueError("unscored documents must not have a score")
+            if self.winning_passage_id is not None or self.winning_content_hash is not None:
+                raise ValueError("unscored documents must not have a winning passage")
+            if self.passage_evidence or self.passage_ids or self.passage_hashes or self.passage_scores:
+                raise ValueError("unscored documents must not have passage evidence")
+            if self.status == "unresolved":
+                if self.canonical_text is not None or self.selected_text is not None:
+                    raise ValueError("unresolved documents must not have selected text")
+            elif self.status == "missing_representation":
+                if self.selected_text is not None:
+                    raise ValueError("missing representations must not have selected text")
+                if self.representation == "report_text" and self.language != "eng":
+                    raise ValueError("missing report representations require language='eng'")
+            elif self.status == "no_passages":
+                if self.canonical_text is None or self.selected_text is None:
+                    raise ValueError("no_passages documents require selected text")
+                if self.representation == "report_text":
+                    if self.language != "eng" or self.report_text != self.selected_text:
+                        raise ValueError("no_passages report text must be English and exact")
+                elif self.language is None or self.language != self.source_language:
+                    raise ValueError("no_passages canonical text requires source language")
+
+    @property
+    def winning_passage(self) -> PassageEvidence | None:
+        if self.winning_passage_id is None:
+            return None
+        return next(
+            evidence
+            for evidence in self.passage_evidence
+            if evidence.passage_id == self.winning_passage_id
+        )
 
     @property
     def reranked_score(self) -> float | None:
@@ -164,6 +487,9 @@ class RerankingResult:
     aggregation: str
     documents: tuple[RerankedDocument, ...]
 
+    def __post_init__(self) -> None:
+        _validate_reranking_result(self)
+
     @property
     def topic(self) -> str:
         """Compatibility name for the explicit topic identity."""
@@ -194,6 +520,54 @@ class _PreparedDocument:
     selected_text: str | None
     selected_language: str | None
     passages: tuple[Passage, ...]
+
+
+def _validate_reranking_result(result: RerankingResult) -> None:
+    _non_blank(result.topic_id, "topic_id")
+    _non_blank(result.query, "query", allow_newlines=True)
+    _non_blank(result.pipeline, "pipeline")
+    if result.representation not in {"canonical", "report_text"}:
+        raise ValueError("result representation is invalid")
+    _non_blank(result.chunker_fingerprint, "chunker_fingerprint")
+    _non_blank(result.scorer_fingerprint, "scorer_fingerprint")
+    cache_fingerprint = _optional_identity(
+        result.cache_fingerprint, "cache_fingerprint"
+    )
+    cache_key = _optional_identity(result.cache_key, "cache_key")
+    if (cache_fingerprint is None) != (cache_key is None):
+        raise ValueError("result cache_fingerprint and cache_key must agree")
+    if result.aggregation != max_passage_v1:
+        raise ValueError("result aggregation is invalid")
+    if not isinstance(result.documents, tuple):
+        raise ValueError("result documents must be a tuple")
+    for index, document in enumerate(result.documents, start=1):
+        if not isinstance(document, RerankedDocument):
+            raise ValueError("result documents must contain RerankedDocument values")
+        try:
+            RerankedDocument(
+                **{
+                    field: getattr(document, field)
+                    for field in document.__dataclass_fields__
+                }
+            )
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("result contains an invalid RerankedDocument") from error
+        if document.reranked_rank != index:
+            raise ValueError("reranked_rank values must exactly match tuple order")
+        if document.topic_id != result.topic_id:
+            raise ValueError("document topic_id disagrees with result")
+        if document.representation != result.representation:
+            raise ValueError("document representation disagrees with result")
+        if document.chunker_fingerprint != result.chunker_fingerprint:
+            raise ValueError("document chunker_fingerprint disagrees with result")
+        if document.scorer_fingerprint != result.scorer_fingerprint:
+            raise ValueError("document scorer_fingerprint disagrees with result")
+        if document.cache_fingerprint != result.cache_fingerprint:
+            raise ValueError("document cache_fingerprint disagrees with result")
+        if document.cache_key != result.cache_key:
+            raise ValueError("document cache_key disagrees with result")
+        if document.aggregation != result.aggregation:
+            raise ValueError("document aggregation disagrees with result")
 
 
 def _validate_search_rows(retrieval: RetrievalResult) -> tuple[tuple[SearchHit, RetrievedDocument], ...]:
@@ -345,6 +719,29 @@ def _make_result_document(
     passage_ids = tuple(passage.passage_id for passage in prepared.passages)
     passage_hashes = tuple(passage.content_hash for passage in prepared.passages)
     passage_scores = tuple(float(scores[passage.content_hash]) for passage in prepared.passages)
+    passage_evidence = tuple(
+        PassageEvidence(
+            document_id=passage.document_id,
+            passage_id=passage.passage_id,
+            content_hash=passage.content_hash,
+            source_content_hash=passage.source_content_hash,
+            representation_hash=passage.representation_hash,
+            representation=passage.representation,
+            language=passage.language,
+            chunk_index=passage.chunk_index,
+            text=passage.text,
+            start_char=passage.start_char,
+            end_char=passage.end_char,
+            boundary=passage.boundary,
+            previous_passage_id=passage.previous_passage_id,
+            next_passage_id=passage.next_passage_id,
+            overlap_chars=passage.overlap_chars,
+            overlap_tokens=passage.overlap_tokens,
+            chunker_fingerprint=passage.chunker_fingerprint,
+            score=passage_scores[index],
+        )
+        for index, passage in enumerate(prepared.passages)
+    )
     canonical_text = prepared.canonical_text
     selected_text = prepared.selected_text
     source_language = document.language
@@ -353,6 +750,7 @@ def _make_result_document(
             topic_id=topic_id,
             document_id=document.document_id,
             status=prepared.status,
+            reranked_rank=1,
             organizer_rank=prepared.organizer_rank,
             organizer_score=prepared.organizer_score,
             score=None,
@@ -361,6 +759,7 @@ def _make_result_document(
             passage_ids=passage_ids,
             passage_hashes=passage_hashes,
             passage_scores=passage_scores,
+            passage_evidence=passage_evidence,
             representation=representation,
             language=prepared.selected_language,
             source_language=source_language,
@@ -392,6 +791,7 @@ def _make_result_document(
         topic_id=topic_id,
         document_id=document.document_id,
         status="scored",
+        reranked_rank=1,
         organizer_rank=prepared.organizer_rank,
         organizer_score=prepared.organizer_score,
         score=winning_score,
@@ -400,6 +800,7 @@ def _make_result_document(
         passage_ids=passage_ids,
         passage_hashes=passage_hashes,
         passage_scores=passage_scores,
+        passage_evidence=passage_evidence,
         representation=representation,
         language=prepared.selected_language,
         source_language=source_language,
@@ -575,6 +976,11 @@ def rerank_retrieval(
         (document for document in reranked_documents if document.status != "scored"),
         key=lambda document: (document.organizer_rank, document.document_id),
     )
+    ordered_documents = tuple(scored + unscored)
+    ranked_documents = tuple(
+        replace(document, reranked_rank=index)
+        for index, document in enumerate(ordered_documents, start=1)
+    )
     return RerankingResult(
         topic_id=topic,
         query=query,
@@ -585,16 +991,51 @@ def rerank_retrieval(
         cache_fingerprint=cache_fingerprint,
         cache_key=cache_key,
         aggregation=max_passage_v1,
-        documents=tuple(scored + unscored),
+        documents=ranked_documents,
     )
 
 
-def _json_record(document: RerankedDocument) -> dict[str, object]:
+def _json_evidence(evidence: PassageEvidence) -> dict[str, object]:
+    return {
+        "boundary": evidence.boundary,
+        "chunk_index": evidence.chunk_index,
+        "content_hash": evidence.content_hash.hex(),
+        "document_id": evidence.document_id,
+        "end_char": evidence.end_char,
+        "language": evidence.language,
+        "next_passage_id": (
+            None
+            if evidence.next_passage_id is None
+            else evidence.next_passage_id.hex()
+        ),
+        "overlap_chars": evidence.overlap_chars,
+        "overlap_tokens": evidence.overlap_tokens,
+        "passage_id": evidence.passage_id.hex(),
+        "previous_passage_id": (
+            None
+            if evidence.previous_passage_id is None
+            else evidence.previous_passage_id.hex()
+        ),
+        "representation": evidence.representation,
+        "representation_hash": evidence.representation_hash.hex(),
+        "score": evidence.score,
+        "source_content_hash": evidence.source_content_hash.hex(),
+        "start_char": evidence.start_char,
+        "text": evidence.text,
+        "chunker_fingerprint": evidence.chunker_fingerprint,
+    }
+
+
+def _json_record(
+    result: RerankingResult, document: RerankedDocument
+) -> dict[str, object]:
+    winning_passage = document.winning_passage
     return {
         "aggregation": document.aggregation,
         "cache_fingerprint": document.cache_fingerprint,
         "cache_key": document.cache_key,
         "canonical_text": document.canonical_text,
+        "chunker_fingerprint": document.chunker_fingerprint,
         "content_local_cache_hit": document.content_local_cache_hit,
         "content_source": document.content_source,
         "date": document.date,
@@ -603,12 +1044,20 @@ def _json_record(document: RerankedDocument) -> dict[str, object]:
         "language": document.language,
         "organizer_rank": document.organizer_rank,
         "organizer_score": document.organizer_score,
+        "pipeline": result.pipeline,
+        "passage_evidence": [
+            _json_evidence(evidence) for evidence in document.passage_evidence
+        ],
         "passage_hashes": [value.hex() for value in document.passage_hashes],
         "passage_ids": [value.hex() for value in document.passage_ids],
         "passage_scores": list(document.passage_scores),
         "report_text": document.report_text,
+        "representation": document.representation,
+        "reranked_rank": document.reranked_rank,
         "score": document.score,
         "selected_text": document.selected_text,
+        "schema_version": RERANKING_SCHEMA_VERSION,
+        "scorer_fingerprint": document.scorer_fingerprint,
         "source_language": document.source_language,
         "status": document.status,
         "topic_id": document.topic_id,
@@ -619,6 +1068,10 @@ def _json_record(document: RerankedDocument) -> dict[str, object]:
         "winning_passage_id": (
             None if document.winning_passage_id is None else document.winning_passage_id.hex()
         ),
+        "winning_passage": (
+            None if winning_passage is None else _json_evidence(winning_passage)
+        ),
+        "query": result.query,
     }
 
 
@@ -642,6 +1095,56 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _publish_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without ever replacing a destination."""
+
+    if not sys.platform.startswith("linux"):
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace publication is unavailable on this platform",
+        )
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError) as error:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace publication is unavailable on this platform",
+        ) from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,  # AT_FDCWD
+        os.fsencode(source),
+        -100,  # AT_FDCWD
+        os.fsencode(destination),
+        1,  # RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number, os.strerror(error_number), str(destination)
+        )
+    if error_number in {
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace publication is unavailable",
+        )
+    raise OSError(error_number, os.strerror(error_number), str(destination))
+
+
 def write_reranking_artifact(
     destination: str | os.PathLike[str],
     result: RerankingResult,
@@ -652,6 +1155,7 @@ def write_reranking_artifact(
 
     if not isinstance(result, RerankingResult):
         raise TypeError("result must be a RerankingResult")
+    _validate_reranking_result(result)
     source_ref = _non_blank(source_retrieval_ref, "source_retrieval_ref")
     destination_path = Path(destination)
     if os.path.lexists(destination_path):
@@ -664,7 +1168,7 @@ def write_reranking_artifact(
     records_payload = b"".join(
         (
             json.dumps(
-                _json_record(document),
+                _json_record(result, document),
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -711,9 +1215,7 @@ def write_reranking_artifact(
         _write_fsync(temporary_path / RERANKED_RECORD_FILENAME, records_payload)
         _write_fsync(temporary_path / "manifest.json", manifest_payload)
         _fsync_directory(temporary_path)
-        if os.path.lexists(destination_path):
-            raise FileExistsError(f"reranking artifact already exists: {destination_path}")
-        os.replace(temporary_path, destination_path)
+        _publish_noreplace(temporary_path, destination_path)
         temporary_path = None
         _fsync_directory(parent)
     finally:
@@ -725,7 +1227,9 @@ __all__ = [
     "RERANKED_RECORD_FILENAME",
     "RERANKING_SCHEMA",
     "RERANKING_SCHEMA_VERSION",
+    "PassageEvidence",
     "RerankedDocument",
+    "RerankedPassage",
     "RerankingResult",
     "max_passage_v1",
     "rerank_retrieval",

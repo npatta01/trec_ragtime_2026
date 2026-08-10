@@ -5,7 +5,7 @@ import json
 import math
 import tempfile
 import unittest
-from dataclasses import is_dataclass
+from dataclasses import is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
@@ -18,7 +18,9 @@ from trec_ragtime.models import (
     SearchHit,
 )
 from trec_ragtime.passages import Passage, sha256_bytes
+import trec_ragtime.reranking as reranking_module
 from trec_ragtime.reranking import (
+    PassageEvidence,
     RerankedDocument,
     RerankingResult,
     max_passage_v1,
@@ -254,6 +256,87 @@ class RerankingTests(unittest.TestCase):
         self.assertIsInstance(RerankingResult.__slots__, tuple)
         self.assertIsNot(RerankedDocument.__setattr__, object.__setattr__)
         self.assertIsNot(RerankingResult.__setattr__, object.__setattr__)
+
+    def test_scored_result_retains_complete_frozen_passage_evidence(self) -> None:
+        document = _document("doc-1", rank=1, score=0.5, text="first second")
+        result = rerank_retrieval(
+            _retrieval((document,)),
+            topic_id="topic-1",
+            chunker=RecordingChunker({"doc-1": ("first", " second")}),
+            scorer=RecordingScorer({"first": 1.0, " second": 2.0}),
+            representation="canonical",
+        )
+        ranked = result.documents[0]
+
+        self.assertEqual(ranked.reranked_rank, 1)
+        self.assertEqual(len(ranked.passage_evidence), 2)
+        self.assertEqual(
+            [evidence.text for evidence in ranked.passage_evidence],
+            ["first", " second"],
+        )
+        for evidence in ranked.passage_evidence:
+            self.assertIsInstance(evidence, PassageEvidence)
+            self.assertTrue(is_dataclass(evidence))
+            self.assertIsInstance(evidence.__slots__, tuple)
+            self.assertEqual(evidence.document_id, "doc-1")
+            self.assertEqual(evidence.source_content_hash, sha256_bytes("first second"))
+            self.assertEqual(evidence.representation_hash, sha256_bytes("first second"))
+            self.assertEqual(evidence.content_hash, sha256_bytes(evidence.text))
+            self.assertEqual(evidence.end_char - evidence.start_char, len(evidence.text))
+            self.assertEqual(evidence.score, ranked.passage_scores[evidence.chunk_index])
+            self.assertIsNot(evidence.__setattr__, object.__setattr__)
+        self.assertEqual(
+            ranked.winning_passage,
+            ranked.passage_evidence[1],
+        )
+        with self.assertRaises(ValueError):
+            replace(ranked, passage_scores=(99.0, 2.0))
+
+    def test_result_enforces_reranked_rank_sequence_and_global_identity(self) -> None:
+        result = rerank_retrieval(
+            _retrieval(
+                (
+                    _document("doc-a", rank=1, score=0.5, text="a"),
+                    _document("doc-b", rank=2, score=0.4, text="b"),
+                )
+            ),
+            topic_id="topic-1",
+            chunker=RecordingChunker(),
+            scorer=RecordingScorer({"a": 2.0, "b": 1.0}),
+            representation="canonical",
+        )
+        self.assertEqual([document.reranked_rank for document in result.documents], [1, 2])
+        with self.assertRaises(ValueError):
+            replace(
+                result,
+                documents=(replace(result.documents[0], reranked_rank=2), result.documents[1]),
+            )
+        with self.assertRaises(ValueError):
+            replace(result, documents=(replace(result.documents[0], topic_id="other"), result.documents[1]))
+        counts = result.status_counts
+        counts["scored"] = 0
+        self.assertEqual(result.status_counts["scored"], 2)
+
+    def test_document_validation_rejects_invalid_status_score_winner_and_report_language(self) -> None:
+        result = rerank_retrieval(
+            _retrieval((_document("doc-1", rank=1, score=0.5, text="text"),)),
+            topic_id="topic-1",
+            chunker=RecordingChunker(),
+            scorer=RecordingScorer({"text": 1.0}),
+            representation="canonical",
+        )
+        document = result.documents[0]
+        invalid_documents = (
+            lambda: replace(document, reranked_rank=0),
+            lambda: replace(document, status="unresolved"),
+            lambda: replace(document, score=math.nan),
+            lambda: replace(document, winning_content_hash=b"x" * 32),
+            lambda: replace(document, language="spa"),
+        )
+        for build_invalid in invalid_documents:
+            with self.subTest(build_invalid=build_invalid):
+                with self.assertRaises(ValueError):
+                    build_invalid()
 
     def test_report_text_selection_preserves_exact_source_and_english_language(self) -> None:
         document = _document(
@@ -529,6 +612,41 @@ class RerankingArtifactTests(unittest.TestCase):
         self.assertNotIn(str(self.destination), manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(records_bytes.count(b"\n"), 2)
         self.assertEqual(records_bytes, (self.destination / "reranked.jsonl").read_bytes())
+        rows = [json.loads(line) for line in records_bytes.splitlines()]
+        scored_row = rows[0]
+        self.assertEqual(scored_row["reranked_rank"], 1)
+        self.assertEqual(scored_row["representation"], "canonical")
+        self.assertEqual(scored_row["query"], "artifact query")
+        self.assertEqual(scored_row["pipeline"], "ragtime2%100")
+        self.assertEqual(scored_row["aggregation"], max_passage_v1)
+        self.assertEqual(scored_row["chunker_fingerprint"], "chunker-v1")
+        self.assertEqual(scored_row["scorer_fingerprint"], "scorer-v1")
+        self.assertEqual(scored_row["cache_fingerprint"], "cache-v1")
+        self.assertEqual(len(scored_row["passage_evidence"]), 1)
+        self.assertEqual(scored_row["winning_passage"], scored_row["passage_evidence"][0])
+        self.assertEqual(
+            set(scored_row["passage_evidence"][0]),
+            {
+                "boundary",
+                "chunk_index",
+                "content_hash",
+                "document_id",
+                "end_char",
+                "language",
+                "next_passage_id",
+                "overlap_chars",
+                "overlap_tokens",
+                "passage_id",
+                "previous_passage_id",
+                "representation",
+                "representation_hash",
+                "score",
+                "source_content_hash",
+                "start_char",
+                "text",
+                "chunker_fingerprint",
+            },
+        )
 
         first_bytes = (manifest_path.read_bytes(), records_bytes)
         second_destination = Path(self.temporary_directory.name) / "run-2"
@@ -565,7 +683,10 @@ class RerankingArtifactTests(unittest.TestCase):
 
     def test_writer_cleans_temporary_sibling_after_atomic_rename_failure(self) -> None:
         parent = self.destination.parent
-        with patch("trec_ragtime.reranking.os.replace", side_effect=OSError("rename failed")):
+        with patch(
+            "trec_ragtime.reranking._publish_noreplace",
+            side_effect=OSError("rename failed"),
+        ):
             with self.assertRaises(OSError):
                 write_reranking_artifact(
                     self.destination,
@@ -574,6 +695,64 @@ class RerankingArtifactTests(unittest.TestCase):
                 )
         self.assertFalse(self.destination.exists())
         self.assertEqual(tuple(path for path in parent.iterdir() if path.name.startswith(".run.")), ())
+
+    def test_writer_revalidates_a_forged_result_before_emitting(self) -> None:
+        forged = object.__new__(RerankingResult)
+        for field in self.result.__dataclass_fields__:
+            object.__setattr__(forged, field, getattr(self.result, field))
+        object.__setattr__(forged, "documents", (replace(self.result.documents[0], reranked_rank=2),))
+        with self.assertRaises(ValueError):
+            write_reranking_artifact(
+                self.destination,
+                forged,
+                source_retrieval_ref="retrieval-artifact-v1",
+            )
+        self.assertFalse(self.destination.exists())
+
+    def test_writer_revalidates_forged_passage_evidence_before_emitting(self) -> None:
+        original_evidence = self.result.documents[0].passage_evidence[0]
+        forged_evidence = object.__new__(PassageEvidence)
+        for field in original_evidence.__dataclass_fields__:
+            object.__setattr__(forged_evidence, field, getattr(original_evidence, field))
+        object.__setattr__(forged_evidence, "boundary", "forged")
+        forged_document = object.__new__(RerankedDocument)
+        for field in self.result.documents[0].__dataclass_fields__:
+            object.__setattr__(forged_document, field, getattr(self.result.documents[0], field))
+        object.__setattr__(forged_document, "passage_evidence", (forged_evidence,))
+        forged_result = object.__new__(RerankingResult)
+        for field in self.result.__dataclass_fields__:
+            object.__setattr__(forged_result, field, getattr(self.result, field))
+        object.__setattr__(forged_result, "documents", (forged_document,))
+
+        with self.assertRaises(ValueError):
+            write_reranking_artifact(
+                self.destination,
+                forged_result,
+                source_retrieval_ref="retrieval-artifact-v1",
+            )
+        self.assertFalse(self.destination.exists())
+
+    def test_writer_race_preserves_competing_destination_and_sentinel(self) -> None:
+        sentinel = self.destination / "sentinel"
+        original_publish = reranking_module._publish_noreplace
+
+        def compete_before_publish(source: Path, destination: Path) -> None:
+            destination.mkdir()
+            sentinel.write_bytes(b"winner")
+            original_publish(source, destination)
+
+        with patch(
+            "trec_ragtime.reranking._publish_noreplace",
+            side_effect=compete_before_publish,
+        ):
+            with self.assertRaises(FileExistsError):
+                write_reranking_artifact(
+                    self.destination,
+                    self.result,
+                    source_retrieval_ref="retrieval-artifact-v1",
+                )
+        self.assertEqual(sentinel.read_bytes(), b"winner")
+        self.assertEqual(tuple(path for path in self.destination.parent.iterdir() if path.name.startswith(".run.")), ())
 
 
 if __name__ == "__main__":
