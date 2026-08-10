@@ -1,0 +1,124 @@
+{
+  "cases": [
+    {
+      "name": "english_paragraphs_headings_and_lists",
+      "document_id": "doc-eng-001",
+      "canonical_text": "Alpha sentence. Beta sentence.\n\nHeading:\n- first item\n- second item.",
+      "selected_text": "Alpha sentence. Beta sentence.\n\nHeading:\n- first item\n- second item.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 68]
+      ]
+    },
+    {
+      "name": "spanish",
+      "document_id": "doc-spa-001",
+      "canonical_text": "Primera oración. Segunda oración.",
+      "selected_text": "Primera oración. Segunda oración.",
+      "representation": "canonical",
+      "language": "spa",
+      "pipeline_name": "es_core_news_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 33]
+      ]
+    },
+    {
+      "name": "russian",
+      "document_id": "doc-rus-001",
+      "canonical_text": "Первое предложение. Второе предложение.",
+      "selected_text": "Первое предложение. Второе предложение.",
+      "representation": "canonical",
+      "language": "rus",
+      "pipeline_name": "ru_core_news_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 39]
+      ]
+    },
+    {
+      "name": "chinese",
+      "document_id": "doc-zho-001",
+      "canonical_text": "第一句话。第二句话。",
+      "selected_text": "第一句话。第二句话。",
+      "representation": "canonical",
+      "language": "zho",
+      "pipeline_name": "zh_core_web_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 10]
+      ]
+    },
+    {
+      "name": "english_machine_translation",
+      "document_id": "doc-spa-translation-001",
+      "canonical_text": "Texto fuente en español.",
+      "selected_text": "English machine translation of the source.",
+      "representation": "report_text",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 42]
+      ]
+    },
+    {
+      "name": "crlf_paragraphs",
+      "document_id": "doc-crlf-001",
+      "canonical_text": "First paragraph.\r\n\r\nSecond paragraph.",
+      "selected_text": "First paragraph.\r\n\r\nSecond paragraph.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 37]
+      ]
+    },
+    {
+      "name": "repeated_identical_sentences",
+      "document_id": "doc-repeat-001",
+      "canonical_text": "Repeat. Repeat. Repeat.",
+      "selected_text": "Repeat. Repeat. Repeat.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 23]
+      ]
+    },
+    {
+      "name": "short_whole_document",
+      "document_id": "doc-short-001",
+      "canonical_text": "Short.",
+      "selected_text": "Short.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 1000,
+      "expected_spans": [
+        [0, 6]
+      ]
+    },
+    {
+      "name": "oversized_sentence",
+      "document_id": "doc-long-001",
+      "canonical_text": "One two three four five six seven eight nine ten eleven.",
+      "selected_text": "One two three four five six seven eight nine ten eleven.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "chunk_size": 16,
+      "expected_spans": [
+        [0, 14],
+        [14, 28],
+        [28, 40],
+        [40, 56]
+      ]
+    }
+  ]
+}

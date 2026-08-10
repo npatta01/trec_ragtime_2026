@@ -10,14 +10,25 @@ dependencies = [
   "ipykernel>=6.30.0",
   "ipython>=9.0.0",
   "jupyter>=1.1.0",
+  "langchain-text-splitters>=1.1.2,<2",
+  "msgspec>=0.19,<1",
   "nbconvert>=7.16.0",
   "nbformat>=5.10.0",
   "pandas>=2.3.0",
   "python-dotenv>=1.2.2",
   "requests>=2.32.0",
   "requests-ratelimiter>=0.10.0",
+  "sentence-transformers>=5.6,<6",
+  "spacy>=3.8,<4",
   "urllib3>=2.5.0",
+  "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+  "es-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.8.0/es_core_news_sm-3.8.0-py3-none-any.whl",
+  "ru-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_sm-3.8.0/ru_core_news_sm-3.8.0-py3-none-any.whl",
+  "zh-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/zh_core_web_sm-3.8.0/zh_core_web_sm-3.8.0-py3-none-any.whl",
 ]
+
+[project.optional-dependencies]
+runpod = ["runpod-flash>=1.18,<2"]
 
 [project.scripts]
 ragtime-corpus = "trec_ragtime.corpus_cli:main"
