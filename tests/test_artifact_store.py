@@ -94,6 +94,15 @@ class FakeSimpleCache:
         return FakeWriteFile(self, candidate, key)
 
 
+class PartialMissingSimpleCache(FakeSimpleCache):
+    def open(self, path: str, mode: str):
+        if "r" in mode:
+            self.open_calls.append((path, mode))
+            self._candidate(path).write_bytes(b"partial")
+            raise FileNotFoundError("remote disappeared")
+        return super().open(path, mode)
+
+
 class FakeHfApi:
     def __init__(
         self,
@@ -215,6 +224,26 @@ class ArtifactStoreTestCase(unittest.TestCase):
             ],
         )
 
+    def test_remote_file_not_found_evicts_partial_l1_candidate(self) -> None:
+        partial_fs: PartialMissingSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal partial_fs
+            partial_fs = PartialMissingSimpleCache(self.local_dir, self.remote)
+            return partial_fs
+
+        store = self.make_store(filesystem_factory_override=factory)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertIsNone(store.read("object.mpk"))
+        self.assertEqual(caught, [])
+        self.assertFalse(store.local_candidate("object.mpk").exists())
+        assert partial_fs is not None
+        self.assertEqual(
+            partial_fs.open_calls,
+            [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
+        )
+
     def test_remote_failures_warn_once_disable_remote_and_preserve_l1(self) -> None:
         failures = (
             {"api_error": RuntimeError("Authorization: Bearer secret-token")},
@@ -295,6 +324,32 @@ class ArtifactStoreTestCase(unittest.TestCase):
             [("hf://buckets/owner/bucket/foo/object.mpk", "wb")],
         )
 
+    def test_failed_write_before_filesystem_open_preserves_existing_l1(self) -> None:
+        store = self.make_store(private=False)
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"keep")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertFalse(store.write("object.mpk", b"replacement"))
+        self.assert_one_sanitized_warning(caught)
+        self.assertEqual(candidate.read_bytes(), b"keep")
+        self.assertEqual(self.fs_constructed, 0)
+
+    def test_failed_filesystem_construction_preserves_existing_l1(self) -> None:
+        def factory(protocol: str, **kwargs):
+            raise OSError("filesystem unavailable")
+
+        store = self.make_store(filesystem_factory_override=factory)
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"keep")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertFalse(store.write("object.mpk", b"replacement"))
+        self.assert_one_sanitized_warning(caught)
+        self.assertEqual(candidate.read_bytes(), b"keep")
+
     def test_successful_write_returns_true_and_retains_complete_l1_candidate(self) -> None:
         store = self.make_store()
 
@@ -302,7 +357,6 @@ class ArtifactStoreTestCase(unittest.TestCase):
 
         candidate = store.local_candidate("object.mpk")
         self.assertEqual(candidate.read_bytes(), b"new-payload")
-        self.assertEqual(stat.S_IMODE(candidate.stat().st_mode), 0o600)
         self.assertEqual(self.remote["owner/bucket/foo/object.mpk"], b"new-payload")
 
     def test_evict_local_removes_only_exact_candidate(self) -> None:
@@ -326,6 +380,20 @@ class ArtifactStoreTestCase(unittest.TestCase):
             store.read_validated("object.mpk", permission_failure)
         self.assertEqual(self.api_constructed, 0)
 
+    def test_local_l1_read_failure_is_a_warned_miss_and_disables_remote(self) -> None:
+        store = self.make_store()
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"local")
+
+        with patch.object(Path, "read_bytes", side_effect=OSError("permission denied")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertIsNone(store.read("object.mpk"))
+                self.assertIsNone(store.read("object.mpk"))
+        self.assert_one_sanitized_warning(caught)
+        self.assertEqual(self.api_constructed, 0)
+        self.assertEqual(self.fs_constructed, 0)
+
     def test_bucket_directory_is_private_and_symlink_is_rejected(self) -> None:
         store = self.make_store()
         self.assertEqual(stat.S_IMODE(store.local_dir.stat().st_mode), 0o700)
@@ -348,6 +416,30 @@ class ArtifactStoreTestCase(unittest.TestCase):
             with self.subTest(key=key):
                 with self.assertRaises(ArtifactStoreConfigurationError):
                     store.read(key)
+
+        with self.assertRaises(ArtifactStoreConfigurationError):
+            self.make_store(prefix="/invalid")
+        with self.assertRaises(ArtifactStoreConfigurationError):
+            ArtifactStore(
+                bucket_id="owner/bucket",
+                local_dir=self.local_dir,
+                namespace="",
+                api_factory=lambda **kwargs: None,
+                filesystem_factory=lambda *args, **kwargs: None,
+            )
+        with self.assertRaises(ArtifactStoreConfigurationError):
+            ArtifactStore(
+                bucket_id="owner/bucket",
+                local_dir="relative-cache",
+                api_factory=lambda **kwargs: None,
+                filesystem_factory=lambda *args, **kwargs: None,
+            )
+        with self.assertRaises(ArtifactStoreConfigurationError):
+            store.write("payload.mpk", bytearray(b"not-bytes"))
+        for name in ("RAGTIME_CACHE_PATH", "RAGTIME_CACHE_DIR"):
+            with patch.dict(os.environ, {name: "/tmp/legacy-cache"}, clear=False):
+                with self.assertRaises(ArtifactStoreConfigurationError):
+                    ArtifactStore.from_env()
 
     def test_configuration_metadata_never_exposes_token(self) -> None:
         store = self.make_store(token="super-secret")

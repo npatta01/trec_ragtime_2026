@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar, cast
@@ -296,66 +295,9 @@ class ArtifactStore:
 
     def _read_local(self, candidate: Path) -> tuple[bool, bytes | None]:
         try:
-            file_status = candidate.lstat()
+            return True, candidate.read_bytes()
         except FileNotFoundError:
             return False, None
-        except OSError:
-            raise ArtifactStoreRemoteError("failed to inspect local artifact cache") from None
-        if stat.S_ISLNK(file_status.st_mode):
-            raise ArtifactStoreRemoteError("local artifact cache candidate is a symlink")
-        if not stat.S_ISREG(file_status.st_mode):
-            raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
-        # L1 is owner-only even when a candidate was created or modified
-        # outside this process.  Secure the exact regular path before reading
-        # bytes; symlinks and non-regular files remain fatal.
-        self._secure_candidate(candidate)
-        try:
-            return True, candidate.read_bytes()
-        except OSError:
-            raise ArtifactStoreRemoteError("failed to read local artifact cache") from None
-
-    @staticmethod
-    def _remove_candidate(candidate: Path) -> None:
-        try:
-            candidate.unlink(missing_ok=True)
-        except OSError:
-            raise ArtifactStoreRemoteError(
-                "failed to evict the local artifact cache candidate"
-            ) from None
-
-    @staticmethod
-    def _secure_candidate(candidate: Path) -> None:
-        try:
-            file_status = candidate.lstat()
-        except FileNotFoundError:
-            raise ArtifactStoreRemoteError(
-                "artifact filesystem did not retain the local candidate"
-            ) from None
-        except OSError:
-            raise ArtifactStoreRemoteError("failed to inspect local artifact cache") from None
-        if stat.S_ISLNK(file_status.st_mode) or not stat.S_ISREG(file_status.st_mode):
-            raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
-        try:
-            os.chmod(candidate, 0o600)
-        except OSError:
-            raise ArtifactStoreRemoteError(
-                "failed to secure the local artifact cache candidate"
-            ) from None
-
-    @staticmethod
-    def _check_candidate_before_write(candidate: Path) -> None:
-        """Reject a pre-existing unsafe path before simplecache opens it."""
-
-        try:
-            file_status = candidate.lstat()
-        except FileNotFoundError:
-            return
-        except OSError:
-            raise ArtifactStoreRemoteError("failed to inspect local artifact cache") from None
-        if stat.S_ISLNK(file_status.st_mode):
-            raise ArtifactStoreRemoteError("local artifact cache candidate is a symlink")
-        if not stat.S_ISREG(file_status.st_mode):
-            raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
 
     def _best_effort_remove_candidate(self, candidate: Path) -> None:
         """Remove a failed remote candidate without masking the remote miss."""
@@ -381,18 +323,13 @@ class ArtifactStore:
         except FileNotFoundError:
             # Ordinary simplecache absence is a quiet miss.  In particular,
             # do not trip the breaker on the target's normal not-found path.
+            self._best_effort_remove_candidate(candidate)
             return None
         except Exception:
             self._best_effort_remove_candidate(candidate)
             self._disable_remote()
             return None
         if not isinstance(payload, (bytes, bytearray)):
-            self._best_effort_remove_candidate(candidate)
-            self._disable_remote()
-            return None
-        try:
-            self._secure_candidate(candidate)
-        except Exception:
             self._best_effort_remove_candidate(candidate)
             self._disable_remote()
             return None
@@ -403,7 +340,11 @@ class ArtifactStore:
 
         object_key = self._validate_object_key(object_key)
         candidate = self.local_candidate(object_key)
-        found, payload = self._read_local(candidate)
+        try:
+            found, payload = self._read_local(candidate)
+        except (OSError, ArtifactStoreRemoteError):
+            self._disable_remote()
+            return None
         if found:
             return cast(bytes, payload)
         return self._read_remote(object_key)
@@ -413,17 +354,7 @@ class ArtifactStore:
 
         object_key = self._validate_object_key(object_key)
         candidate = self.local_candidate(object_key)
-        try:
-            file_status = candidate.lstat()
-        except FileNotFoundError:
-            return
-        except OSError:
-            raise ArtifactStoreRemoteError("failed to inspect local artifact cache") from None
-        if stat.S_ISLNK(file_status.st_mode):
-            raise ArtifactStoreRemoteError("local artifact cache candidate is a symlink")
-        if not stat.S_ISREG(file_status.st_mode):
-            raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
-        self._remove_candidate(candidate)
+        self._best_effort_remove_candidate(candidate)
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], T]
@@ -432,12 +363,16 @@ class ArtifactStore:
 
         object_key = self._validate_object_key(object_key)
         candidate = self.local_candidate(object_key)
-        found, payload = self._read_local(candidate)
+        try:
+            found, payload = self._read_local(candidate)
+        except (OSError, ArtifactStoreRemoteError):
+            self._disable_remote()
+            return None
         if found:
             try:
                 return decoder(cast(bytes, payload))
             except ArtifactValidationError:
-                self._remove_candidate(candidate)
+                self._best_effort_remove_candidate(candidate)
         payload = self._read_remote(object_key)
         if payload is None:
             return None
@@ -457,16 +392,18 @@ class ArtifactStore:
         if not isinstance(payload, bytes):
             raise _configuration_error("artifact payload must be bytes")
         candidate = self.local_candidate(object_key)
-        self._check_candidate_before_write(candidate)
         if self._remote_disabled:
             return False
+        remote_open_attempted = False
         try:
             self._verify_private_bucket()
-            with self._get_filesystem().open(self._remote_path(object_key), "wb") as handle:
+            filesystem = self._get_filesystem()
+            remote_open_attempted = True
+            with filesystem.open(self._remote_path(object_key), "wb") as handle:
                 handle.write(payload)
-            self._secure_candidate(candidate)
         except Exception:
-            self._best_effort_remove_candidate(candidate)
+            if remote_open_attempted:
+                self._best_effort_remove_candidate(candidate)
             self._disable_remote()
             return False
         return True
