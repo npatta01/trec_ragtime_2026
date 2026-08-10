@@ -14,9 +14,9 @@ Control-A/B/C artifact formats.
 - Normal report synthesis chunks English `report_text`. Canonical source text
   remains supported for the required English/Spanish/Russian/Chinese comparison
   and for documents without a verified English representation.
-- Maintained LangChain and spaCy components own sentence segmentation and
-  adjacent-sentence packing. The project does not implement a sentence parser or
-  a greedy packing algorithm.
+- Maintained LangChain and spaCy components own paragraph packing, sentence
+  segmentation, and adjacent-sentence packing. The project does not implement a
+  paragraph/sentence parser or a greedy packing algorithm.
 - `RecursiveCharacterTextSplitter` is used only when one sentence by itself
   exceeds the configured passage token budget.
 - Overlap is zero in schema version 1.
@@ -25,7 +25,13 @@ Control-A/B/C artifact formats.
 - The issue #12/#13 implementation remains owned by its other branch/session.
   This branch consumes only the published `ArtifactStoreLike` protocol and uses
   in-memory fakes in tests.
-- No Runpod endpoint is created or deployed by this work.
+- This implementation creates no persistent Runpod deployment. An ephemeral
+  `flash dev` worker smoke is a separately authorized deferred gate and is not
+  part of the offline implementation run.
+- Within this branch, Task 1 exclusively owns dependency/lock changes and Task 6
+  exclusively owns exports/documentation. Sol owns final reconciliation of
+  those shared files after #12/#13 land; this branch does not preemptively rebase
+  or copy their pending implementation.
 
 ## Module boundaries
 
@@ -49,22 +55,35 @@ class PassageChunker(Protocol):
     ) -> tuple[Passage, ...]: ...
 ```
 
-`LangChainPassageChunker` composes:
+`LangChainPassageChunker` composes three maintained stages:
 
-1. `SpacyTextSplitter` configured with `separator=""`,
-   `strip_whitespace=False`, `chunk_overlap=0`, `add_start_index=True`, and a
-   target-model tokenizer length function. This makes LangChain join adjacent
-   complete `Span.text_with_ws` values without reconstructing whitespace.
-2. `RecursiveCharacterTextSplitter` configured with the same tokenizer,
+1. `CharacterTextSplitter` configured with regex separator
+   `r"(?:\r?\n){2,}"`, `is_separator_regex=True`, `keep_separator="end"`,
+   `strip_whitespace=False`, `chunk_overlap=0`, `add_start_index=True`, and the
+   same target-model `chunk_size`/tokenizer `length_function` used at every
+   stage. It packs adjacent complete LF or CRLF paragraphs while retaining
+   exact blank-line bytes. Only a single over-budget paragraph descends.
+2. `SpacyTextSplitter` configured with `separator=""`,
+   `strip_whitespace=False`, `chunk_overlap=0`, `add_start_index=True`, and the
+   target-model tokenizer length function. It packs adjacent complete
+   `Span.text_with_ws` values without reconstructing whitespace. Only a single
+   over-budget sentence descends.
+3. `RecursiveCharacterTextSplitter` configured with the same tokenizer,
    zero overlap, no whitespace stripping, and separators `(" ", "")`. It is
-   invoked only for an over-budget output from the sentence splitter, which
-   proves the over-budget source unit is one individual sentence.
+   invoked only for that individually over-budget sentence.
 
-The adapter rejects a missing or negative start index and validates every final
-chunk using `selected_text[start_char:end_char] == text`. Nested fallback
-offsets are adjusted to document coordinates and revalidated. The production
-default uses spaCy's `en_core_web_sm` pipeline for English `report_text`; callers
-may supply another installed spaCy pipeline for canonical-language experiments.
+Every stage uses `create_documents()` so its maintained splitter supplies
+`start_index`. The adapter rejects missing or negative indexes and, within each
+parent span, requires cursor equality, exact source slices, monotonic spans,
+and full reconstruction (`"".join(chunks) == parent_text`). Nested offsets are
+adjusted to document coordinates and all checks are repeated on the final
+sequence.
+
+The production pipeline mapping is pinned to spaCy 3.8.0 model wheels:
+`eng -> en_core_web_sm`, `spa -> es_core_news_sm`, `rus -> ru_core_news_sm`, and
+`zho -> zh_core_web_sm`; English `report_text` also uses `en_core_web_sm`.
+Callers may override a pipeline name, but the benchmark fails clearly if a
+required pinned model is unavailable.
 
 The selected dependency is recorded only after a fixture benchmark checks
 short text, multiple paragraphs, headings/lists, abbreviations, a very long
@@ -84,7 +103,8 @@ script, not a reusable framework.
 - `language` (the selected representation language; English for report text);
 - stable `chunk_index` and binary `passage_id`;
 - exact `text`, `start_char`, and exclusive `end_char`;
-- sentence start/end indexes when the normal sentence path supplies them;
+- boundary-path metadata: `paragraph_packed`, `sentence_packed`, or
+  `oversized_sentence_fallback`;
 - `previous_passage_id` and `next_passage_id`;
 - binary `content_hash`: SHA-256 bytes of exact passage UTF-8 text;
 - chunker fingerprint and explicit overlap characters/tokens.
@@ -118,22 +138,28 @@ each unique requested 32-byte content hash and rejects missing or extra keys.
 `BAAI/bge-reranker-v2-m3` at revision
 `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`, using raw logits. Device,
 precision, batch size, maximum pair length, query format, library version, and
-model/tokenizer identity are fingerprinted. CPU, CUDA, and ROCm-compatible
-PyTorch device strings are accepted. Before inference, formatted query/passage
-pairs are tokenized without truncation and any overflow is rejected; silent
-truncation would make a score invalid for the recorded passage.
+model/tokenizer identity are fingerprinted. CPU and CUDA PyTorch device strings
+are accepted; a user-facing `rocm` alias normalizes to PyTorch's `cuda` device
+on ROCm builds. Before inference, formatted query/passage pairs are tokenized
+without truncation and any overflow is rejected; silent truncation would make a
+score invalid for the recorded passage.
 
 ### `passage_score_cache.py`
 
-This module owns only the passage-score domain adapter. It imports the issue
-#12 `ArtifactStoreLike` and `ArtifactValidationError` when available and defines
-an interface-compatible fallback solely while that branch has not landed.
+This module owns only the passage-score domain adapter. It references the issue
+#12 `ArtifactStoreLike` under `TYPE_CHECKING` and otherwise uses structural duck
+typing; it does not ship a fallback artifact store or counterfeit the #12
+exception identity. The domain decoder raises
+`PassageScoreArtifactValidationError`. The cache constructor accepts the exact
+artifact-store validation exception type/factory and adapts domain decode
+failures to it, so tests inject the fake-store exception now and callers inject
+#12 `ArtifactValidationError` after that implementation lands.
 
 The object layout is:
 
 ```text
 passage-scores/v1/
-  <scorer-fingerprint>/
+  <effective-score-fingerprint>/
     <query-hash-prefix>/
       <query-hash>.mpk
 ```
@@ -142,16 +168,17 @@ passage-scores/v1/
 stored in the strict MessagePack envelope, not the path, because including it
 in the path would make overlapping score reuse impossible.
 
-The envelope records schema version, scorer fingerprint, exact query digest,
-sorted coverage hashes, coverage digest, and a deterministically ordered
-`dict[bytes, float]`. Reads go through `read_validated`. A true miss begins with
-an empty map; other storage failures propagate. Missing hashes alone are sent
-to the scorer, the returned exact map is validated, and the union is encoded,
-decoded, and domain-validated before one write. Failed or partial scoring never
-writes. The public return value contains exactly the current request's unique
-hashes even when the stored union is larger. One worker owning one query is an
-orchestration invariant; last-writer-wins duplicates remain semantically
-interchangeable.
+The effective score fingerprint covers the cache schema, model scorer
+fingerprint, chunker fingerprint, and selected representation. The envelope
+records those fields, the exact query digest, sorted coverage hashes, coverage
+digest, and a deterministically ordered `dict[bytes, float]`. Reads go through
+`read_validated`. A true miss begins with an empty map; other storage failures
+propagate. Missing hashes alone are sent to the scorer, the returned exact map
+is validated, and the union is encoded, decoded, and domain-validated before
+one write. Failed or partial scoring never writes. The public return value
+contains exactly the current request's unique hashes even when the stored union
+is larger. One worker owning one query is an orchestration invariant;
+last-writer-wins duplicates remain semantically interchangeable.
 
 ### `reranking.py`
 
@@ -168,9 +195,11 @@ status. Organizer rank/score, query, document metadata, passage IDs, chunker
 fingerprint, scorer fingerprint, cache key, representation, and aggregation
 version are retained.
 
-`write_reranking_artifact` writes a stable manifest and per-topic JSONL into a
-new directory atomically and refuses to overwrite an existing run, matching the
-repository's current artifact conventions. This does not alter Control-A/B/C.
+`write_reranking_artifact(..., source_retrieval_ref: str)` requires the immutable
+source retrieval reference explicitly; it never infers provenance from the
+mutable in-memory result. It writes a stable manifest and per-topic JSONL into
+a new directory atomically and refuses to overwrite an existing run, matching
+the repository's current artifact conventions. This does not alter Control-A/B/C.
 
 ### `flash_passage_scorer.py`
 
@@ -179,7 +208,9 @@ The caller still owns validation and artifact writes. It batches by both count
 and actual serialized UTF-8 payload below Flash's 10 MB limit, sends query plus
 hash/text rows, and accepts only hash/finite-score rows. Concurrency, endpoint
 ID, timeout, workers, idle timeout, GPU selection, and batch size are
-configuration values included where result-affecting.
+configuration values. Only result-affecting model/precision/device/batch policy
+is included in the score fingerprint; endpoint ID, worker count, idle timeout,
+request timeout, and transport concurrency are excluded.
 
 An optional endpoint runner uses `Endpoint(id=...)`, `run()`, and
 `job.wait()` rather than the synchronous timeout path. A dedicated private
@@ -204,11 +235,13 @@ or passage text, tokens, hashes tied to text, or credentials.
 ## Verification
 
 Focused tests cover multilingual and translated fixtures, repeated text,
-paragraph/sentence behavior, exact offsets, binary hashes, stable IDs across
-processes, long-sentence fallback, whole-document short chunks, scorer schema,
-local fake-model batching, no truncation, cache fingerprint isolation, warm
-reuse, overlap merge, complete-only writes, deterministic aggregation, fake
-Flash parity, payload/timeout/concurrency bounds, and log redaction.
+paragraph/sentence behavior, exact offsets and reconstruction at every splitter
+level, binary hashes, stable IDs across processes, long-sentence fallback,
+whole-document short chunks, scorer schema, local fake-model batching, no
+truncation, cache fingerprint isolation, warm reuse, overlap merge,
+complete-only writes, deterministic aggregation, exact parity under one
+deterministic local/remote fake, payload/timeout/concurrency bounds, and log
+redaction.
 
 After decrypting `.env`, run every focused test and then:
 
@@ -216,6 +249,14 @@ After decrypting `.env`, run every focused test and then:
 uv run python -m unittest discover -s tests -v
 ```
 
-No model-weight download, live organizer request, HF Bucket mutation, Runpod
-provisioning, `flash dev`, deployment, push, or pull request is part of this
-implementation verification.
+Offline verification does not download model weights, call the organizer,
+mutate HF Bucket, provision Runpod, run `flash dev`, deploy, push, or open a pull
+request. Four acceptance gates require separate authorization or dependencies:
+
+- one real local batch using the pinned cross-encoder (large model download);
+- organizer-only versus canonical versus `report_text` ranking comparison;
+- ephemeral `flash dev` real-worker parity smoke (external GPU cost);
+- L2/cross-machine score reuse after the issue #12 ArtifactStore lands.
+
+The handoff reports these as deferred unless independently authorized and
+evidenced; fake-only tests are not represented as completion of those gates.
