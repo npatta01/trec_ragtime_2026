@@ -308,6 +308,9 @@ def _candidate_record(
 
 def _validated_reference(
     result: RetrievalResult,
+    *,
+    query: str,
+    pipeline: str,
 ) -> dict[str, object] | None:
     """Validate the optional write-backed reference for a complete result.
 
@@ -316,6 +319,8 @@ def _validated_reference(
     still valid; any present reference is retained as optional provenance.
     """
 
+    if result.query != query or result.pipeline != pipeline:
+        raise ValueError("retrieval result does not match the Control-A request")
     if not result.fully_hydrated or result.hydration_failures:
         return None
     reference = result.retrieval_artifact
@@ -397,6 +402,8 @@ def run_control_a(
         try:
             retrieval_artifact = _validated_reference(
                 result,
+                query=query,
+                pipeline=pipeline,
             )
         except ValueError as exc:
             failed_topic_count += 1

@@ -265,13 +265,15 @@ def make_retrieval_result(
     *,
     missing_translation_ids: tuple[str, ...] = (),
     with_reference: bool = True,
+    result_query: str | None = None,
+    pipeline: str = "ragtime2",
 ) -> RetrievalResult:
     request_digest = hashlib.sha256(query.encode("utf-8")).digest()
     fingerprint = hashlib.sha256(b"control-a-test-retriever").digest()
     return RetrievalResult(
         search_result=PipelineResult(
-            query=query,
-            pipeline="ragtime2",
+            query=query if result_query is None else result_query,
+            pipeline=pipeline,
             hits=tuple(
                 SearchHit(
                     rank=document.rank,
@@ -523,6 +525,67 @@ class ControlARunnerTests(unittest.TestCase):
         self.assertNotIn("retrieval_artifact", manifest["topic_status"][1])
         self.assertEqual(manifest["counts"]["candidates"], 1)
         self.assertEqual(retriever.identity_calls, [])
+
+    def test_reference_less_result_with_wrong_query_is_recorded_as_failure(self) -> None:
+        document = RetrievedDocument(
+            rank=1,
+            document_id="doc-wrong-query",
+            score=1.0,
+            text="wrong query text",
+            url=None,
+            date=None,
+            language="eng",
+            content_source="local_corpus",
+            content_local_cache_hit=True,
+        )
+        retriever = FakeRetriever(
+            [
+                make_retrieval_result(
+                    "first problem",
+                    (document,),
+                    result_query="different problem",
+                    with_reference=False,
+                ),
+                make_retrieval_result("second problem", (), with_reference=False),
+            ]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="wrong-query-no-reference",
+        )
+
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["counts"]["failed_topics"], 1)
+        self.assertEqual(manifest["counts"]["candidates"], 0)
+        self.assertEqual(manifest["topic_status"][0]["error"]["type"], "ValueError")
+
+    def test_reference_less_result_with_wrong_pipeline_is_recorded_as_failure(self) -> None:
+        retriever = FakeRetriever(
+            [
+                make_retrieval_result(
+                    "first problem",
+                    (),
+                    pipeline="wrong-pipeline",
+                    with_reference=False,
+                ),
+                make_retrieval_result("second problem", (), with_reference=False),
+            ]
+        )
+
+        run_dir = run_control_a(
+            self.topic_file,
+            retriever=retriever,
+            output_root=self.output_root,
+            run_id="wrong-pipeline-no-reference",
+        )
+
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["counts"]["failed_topics"], 1)
+        self.assertEqual(manifest["counts"]["candidates"], 0)
+        self.assertEqual(manifest["topic_status"][0]["error"]["type"], "ValueError")
 
     def test_incomplete_result_keeps_candidates_and_counts_without_reference(self) -> None:
         unresolved = RetrievedDocument(
