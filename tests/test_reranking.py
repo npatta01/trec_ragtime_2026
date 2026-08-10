@@ -119,9 +119,6 @@ class RecordingScorer:
 
 
 class InMemoryArtifactStore:
-    class ArtifactValidationError(Exception):
-        pass
-
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
 
@@ -133,8 +130,9 @@ class InMemoryArtifactStore:
         payload = self.objects.get(key)
         return None if payload is None else decoder(payload)
 
-    def write(self, key: str, payload: bytes) -> None:
+    def write(self, key: str, payload: bytes) -> bool:
         self.objects[key] = payload
+        return True
 
     def evict_local(self, key: str) -> None:
         self.objects.pop(key, None)
@@ -149,7 +147,6 @@ def _cached_scorer(
         scorer,
         chunker_fingerprint="chunker-v1",
         representation="canonical",
-        artifact_validation_error=InMemoryArtifactStore.ArtifactValidationError,
     )
     return CachedPassageScorer(cache)
 

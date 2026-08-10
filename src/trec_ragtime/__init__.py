@@ -1,6 +1,5 @@
 """Reusable client for the TREC RAGTIME retrieval service."""
 
-from .cache import SQLiteResponseCache, default_cache_path
 from .client import (
     DEFAULT_CONTENT_COLLECTION,
     DEFAULT_PIPELINE,
@@ -10,6 +9,25 @@ from .client import (
     RagtimeError,
     RagtimeProtocolError,
 )
+from .flash_passage_scorer import (
+    DEFAULT_FLASH_BATCH_SIZE,
+    DEFAULT_FLASH_CONCURRENCY,
+    DEFAULT_FLASH_GPU,
+    DEFAULT_FLASH_IDLE_TIMEOUT,
+    DEFAULT_FLASH_REQUEST_TIMEOUT,
+    DEFAULT_FLASH_WORKER_NAME,
+    FLASH_PAYLOAD_LIMIT_BYTES,
+    WIRE_SCHEMA_VERSION,
+    FlashEndpointBatchRunner,
+    FlashScoringError,
+    RunpodFlashConfig,
+    RunpodFlashPassageScorer,
+    decode_flash_request,
+    decode_flash_response,
+    encode_flash_request,
+    encode_flash_response,
+)
+from .flash_worker import FlashPassageWorker, build_flash_worker
 from .huggingface import (
     DEFAULT_HF_BASE_URL,
     DEFAULT_HF_CONFIG,
@@ -46,14 +64,9 @@ from .models import (
     RetrievedDocument,
     SearchHit,
 )
-from .passages import (
-    Boundary,
-    Passage,
-    PassageChunker,
-    PassageChunkingError,
-    Representation,
-    sha256_bytes,
-    validate_passages,
+from .passage_score_cache import (
+    CachedPassageScorer,
+    PassageScoreCache,
 )
 from .passage_scoring import (
     DEFAULT_BATCH_SIZE,
@@ -72,9 +85,19 @@ from .passage_scoring import (
     PassageScoringError,
     validate_passage_scores,
 )
-from .passage_score_cache import (
-    CachedPassageScorer,
-    PassageScoreCache,
+from .passages import (
+    Boundary,
+    Passage,
+    PassageChunker,
+    PassageChunkingError,
+    Representation,
+    sha256_bytes,
+    validate_passages,
+)
+from .paths import (
+    PROJECT_CACHE_DIR_ENV,
+    default_project_cache_dir,
+    ensure_private_cache_dir,
 )
 from .reranking import (
     PassageEvidence,
@@ -84,30 +107,6 @@ from .reranking import (
     max_passage_v1,
     rerank_retrieval,
 )
-from .paths import (
-    PROJECT_CACHE_DIR_ENV,
-    default_project_cache_dir,
-    ensure_private_cache_dir,
-)
-from .flash_passage_scorer import (
-    DEFAULT_FLASH_BATCH_SIZE,
-    DEFAULT_FLASH_CONCURRENCY,
-    DEFAULT_FLASH_GPU,
-    DEFAULT_FLASH_IDLE_TIMEOUT,
-    DEFAULT_FLASH_REQUEST_TIMEOUT,
-    DEFAULT_FLASH_WORKER_NAME,
-    FLASH_PAYLOAD_LIMIT_BYTES,
-    FlashEndpointBatchRunner,
-    FlashScoringError,
-    RunpodFlashConfig,
-    RunpodFlashPassageScorer,
-    WIRE_SCHEMA_VERSION,
-    decode_flash_request,
-    decode_flash_response,
-    encode_flash_request,
-    encode_flash_response,
-)
-from .flash_worker import FlashPassageWorker, build_flash_worker
 from .retriever import (
     DEFAULT_MAX_CONTENT_FALLBACKS,
     DocumentCorpus,
@@ -192,7 +191,6 @@ __all__ = [
     "FLASH_PAYLOAD_LIMIT_BYTES",
     "RunpodFlashConfig",
     "RunpodFlashPassageScorer",
-    "SQLiteResponseCache",
     "SearchHit",
     "WIRE_SCHEMA_VERSION",
     "FlashPassageWorker",
@@ -200,7 +198,6 @@ __all__ = [
     "build_from_parquet",
     "decode_flash_request",
     "decode_flash_response",
-    "default_cache_path",
     "default_local_corpus_path",
     "default_project_cache_dir",
     "ensure_private_cache_dir",

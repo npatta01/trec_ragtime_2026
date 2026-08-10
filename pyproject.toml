@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "duckdb>=1.5.4,<2",
-  "huggingface-hub>=1.0,<2",
+  "fsspec>=2026.6.0",
+  "huggingface-hub>=1.5,<2",
   "ipykernel>=6.30.0",
   "ipython>=9.0.0",
   "jupyter>=1.1.0",
@@ -33,6 +34,8 @@ runpod = ["runpod-flash>=1.18,<2"]
 [project.scripts]
 ragtime-corpus = "trec_ragtime.corpus_cli:main"
 ragtime-query-baseline = "trec_ragtime.query_baselines:main"
+ragtime-cache-import = "trec_ragtime.cache_import:main"
+ragtime-retrieval-import = "trec_ragtime.retrieval_import:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12"]

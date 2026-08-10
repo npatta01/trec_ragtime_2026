@@ -6,17 +6,14 @@ import hashlib
 import math
 import numbers
 import threading
-from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, cast
+from collections.abc import Mapping, Sequence
+from typing import cast
 
 import msgspec
 
-from .passages import Passage, sha256_bytes
+from .artifact_store import ArtifactStoreLike, ArtifactValidationError
 from .passage_scoring import PassageScorer, validate_passage_scores
-
-if TYPE_CHECKING:
-    from .artifact_store import ArtifactStoreLike
-
+from .passages import Passage, sha256_bytes
 
 CACHE_SCHEMA_VERSION = 1
 OBJECT_ROOT = "passage-scores/v1"
@@ -176,16 +173,6 @@ def _unique_requested(
     return tuple(unique.items())
 
 
-def _store_validation_exception(
-    factory: Callable[[str], BaseException],
-    error: PassageScoreArtifactValidationError,
-) -> BaseException:
-    exception = factory(str(error))
-    if not isinstance(exception, BaseException):
-        raise TypeError("artifact_validation_error must create an exception") from error
-    return exception
-
-
 class PassageScoreCache:
     """Cache-aside adapter for complete per-query passage score maps.
 
@@ -200,20 +187,16 @@ class PassageScoreCache:
         "_scorer_fingerprint",
         "_chunker_fingerprint",
         "_representation",
-        "_artifact_validation_error",
     )
 
     def __init__(
         self,
-        store: "ArtifactStoreLike",
+        store: ArtifactStoreLike,
         scorer: PassageScorer,
         *,
         chunker_fingerprint: str,
         representation: str,
-        artifact_validation_error: Callable[[str], BaseException],
     ) -> None:
-        if not callable(artifact_validation_error):
-            raise TypeError("artifact_validation_error must be callable")
         try:
             scorer_fingerprint = getattr(scorer, "fingerprint")
             score_method = getattr(scorer, "score")
@@ -231,7 +214,6 @@ class PassageScoreCache:
             chunker_fingerprint, "chunker_fingerprint"
         )
         self._representation = _representation(representation)
-        self._artifact_validation_error = artifact_validation_error
 
     @property
     def scorer_fingerprint(self) -> str:
@@ -261,10 +243,7 @@ class PassageScoreCache:
         try:
             return decode_score_map(payload)
         except PassageScoreArtifactValidationError as error:
-            raise _store_validation_exception(
-                self._artifact_validation_error,
-                error,
-            ) from error
+            raise ArtifactValidationError(str(error)) from error
 
     def score(
         self,

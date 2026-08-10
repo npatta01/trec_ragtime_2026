@@ -18,6 +18,7 @@ from .client import RagtimeError
 from .huggingface import HuggingFaceError
 from .models import RetrievalResult, RetrievedDocument
 from .paths import default_project_cache_dir
+from .retrieval_cache import RetrievalArtifactReference
 
 
 _REQUIRED_TOPIC_FIELDS = frozenset(
@@ -41,7 +42,7 @@ class Topic:
 class RetrieverLike(Protocol):
     """Minimal retrieval boundary used by the batch runner and its tests."""
 
-    cache_path: Path | None
+    cache_configuration: Mapping[str, object] | None
     corpus_path: Path | None
     corpus: object
 
@@ -53,6 +54,7 @@ class RetrieverLike(Protocol):
         top_k: int | None,
         max_content_fallbacks: int | None,
         fallback_on_hf_error: bool,
+        query_context: Mapping[str, object] | None = None,
     ) -> RetrievalResult: ...
 
 
@@ -304,9 +306,37 @@ def _candidate_record(
     return record
 
 
+def _validated_reference(
+    result: RetrievalResult,
+    *,
+    query: str,
+    pipeline: str,
+) -> dict[str, object] | None:
+    """Validate the optional write-backed reference for a complete result.
+
+    Incomplete hydration is intentionally uncacheable, but remains a valid
+    Control-A candidate snapshot.  Complete results without a reference are
+    still valid; any present reference is retained as optional provenance.
+    """
+
+    if result.query != query or result.pipeline != pipeline:
+        raise ValueError("retrieval result does not match the Control-A request")
+    if not result.fully_hydrated or result.hydration_failures:
+        return None
+    reference = result.retrieval_artifact
+    if reference is None:
+        return None
+    if not isinstance(reference, RetrievalArtifactReference):
+        raise ValueError(
+            "complete Control-A retrieval has an invalid RetrievalArtifactReference"
+        )
+    return reference.as_record()
+
+
 def _corpus_manifest(retriever: RetrieverLike) -> dict[str, object]:
     metadata = getattr(getattr(retriever, "corpus", None), "metadata", None)
     return {
+        "backend": getattr(retriever, "document_backend", "local"),
         "path": (
             str(retriever.corpus_path)
             if retriever.corpus_path is not None
@@ -349,8 +379,12 @@ def run_control_a(
                 top_k=top_k,
                 max_content_fallbacks=0,
                 fallback_on_hf_error=False,
+                query_context={
+                    "kind": "control_a",
+                    "query_construction": "problem_only_v1",
+                },
             )
-        except (RagtimeError, HuggingFaceError) as exc:
+        except (RagtimeError, HuggingFaceError, ValueError) as exc:
             failed_topic_count += 1
             topic_status.append(
                 {
@@ -365,13 +399,31 @@ def run_control_a(
         unresolved_ids = list(result.unresolved_ids)
         unresolved_count += len(unresolved_ids)
         missing_translation_count += len(missing_translation_ids)
-        topic_status.append(
-            {
-                "missing_translation_ids": sorted(missing_translation_ids),
-                "topic_id": topic.topic_id,
-                "unresolved_ids": unresolved_ids,
-            }
-        )
+        try:
+            retrieval_artifact = _validated_reference(
+                result,
+                query=query,
+                pipeline=pipeline,
+            )
+        except ValueError as exc:
+            failed_topic_count += 1
+            topic_status.append(
+                {
+                    "error": {"type": type(exc).__name__},
+                    "missing_translation_ids": [],
+                    "topic_id": topic.topic_id,
+                    "unresolved_ids": [],
+                }
+            )
+            continue
+        status: dict[str, object] = {
+            "missing_translation_ids": sorted(missing_translation_ids),
+            "topic_id": topic.topic_id,
+            "unresolved_ids": unresolved_ids,
+        }
+        if retrieval_artifact is not None:
+            status["retrieval_artifact"] = retrieval_artifact
+        topic_status.append(status)
         records.extend(
             _candidate_record(
                 topic,
@@ -399,8 +451,10 @@ def run_control_a(
             "max_content_fallbacks": 0,
             "fallback_on_hf_error": False,
         },
-        "api_cache_path": (
-            str(retriever.cache_path) if retriever.cache_path is not None else None
+        "api_cache": (
+            dict(retriever.cache_configuration)
+            if retriever.cache_configuration is not None
+            else None
         ),
         "corpus": _corpus_manifest(retriever),
         "counts": {

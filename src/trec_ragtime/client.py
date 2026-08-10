@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import math
 import os
-import sqlite3
 import time
 import warnings
 from collections.abc import Callable, Mapping
-from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
@@ -18,7 +16,14 @@ from requests.adapters import HTTPAdapter
 from requests_ratelimiter import LimiterMixin
 from urllib3.util.retry import Retry
 
-from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, SQLiteResponseCache
+from .artifact_store import (
+    ArtifactStore,
+    ArtifactStoreConfigurationError,
+    ArtifactStoreLike,
+    ArtifactStoreUnavailableError,
+    _legacy_cache_setting_name,
+)
+from .cache import DEFAULT_CACHE_NAMESPACE, ResponseCache, sanitized_cache_configuration
 from .models import Document, PipelineResult, SearchHit
 
 DEFAULT_PIPELINE = "ragtime2"
@@ -107,6 +112,22 @@ def _validate_ttl(name: str, value: float | None) -> None:
         raise RagtimeConfigurationError(f"{name} must be finite and non-negative")
 
 
+def _optional_artifact_store(*, namespace: str) -> ArtifactStore | None:
+    """Build the optional runtime cache, warning once when it is absent."""
+
+    try:
+        return ArtifactStore.from_env(namespace=namespace)
+    except ArtifactStoreUnavailableError:
+        # Explicit use_cache=True is best effort when configuration is absent:
+        # disable with a sanitized warning; present-but-invalid configuration still raises.
+        warnings.warn(
+            "artifact cache configuration is unavailable; caching is disabled",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return None
+
+
 class _RateLimitedSession(LimiterMixin, requests.Session):
     """Requests session with proactive, per-host leaky-bucket limiting."""
 
@@ -122,15 +143,15 @@ def _rate_limited_session(requests_per_second: float) -> requests.Session:
 
 
 class RagtimeClient:
-    """Reusable synchronous RAGTIME client with a shared local cache."""
+    """Reusable synchronous RAGTIME client with a shared artifact cache."""
 
     def __init__(
         self,
         base_url: str,
         bearer_token: str,
         *,
-        cache: SQLiteResponseCache | None = None,
-        cache_path: str | os.PathLike[str] | None = None,
+        cache: ResponseCache | None = None,
+        artifact_store: ArtifactStoreLike | None = None,
         cache_namespace: str = DEFAULT_CACHE_NAMESPACE,
         use_cache: bool = True,
         search_cache_ttl_seconds: float | None = DEFAULT_SEARCH_CACHE_TTL_SECONDS,
@@ -143,6 +164,11 @@ class RagtimeClient:
     ) -> None:
         if not isinstance(use_cache, bool):
             raise RagtimeConfigurationError("use_cache must be a boolean")
+        legacy_setting = _legacy_cache_setting_name()
+        if legacy_setting is not None:
+            raise RagtimeConfigurationError(
+                f"{legacy_setting} is not supported; use RAGTIME_ARTIFACT_CACHE_DIR"
+            )
         if not isinstance(allow_insecure_http, bool):
             raise RagtimeConfigurationError("allow_insecure_http must be a boolean")
         normalized_base_url = base_url.strip().rstrip("/")
@@ -191,23 +217,33 @@ class RagtimeClient:
         )
         self._owns_session = session is None
 
-        if cache is not None and cache_path is not None:
-            raise RagtimeConfigurationError("provide cache or cache_path, not both")
-        if not use_cache and cache is not None:
+        if cache is not None and artifact_store is not None:
+            raise RagtimeConfigurationError("provide cache or artifact_store, not both")
+        if not use_cache and (cache is not None or artifact_store is not None):
             raise RagtimeConfigurationError(
-                "cache cannot be provided when use_cache is false"
+                "cache or artifact_store cannot be provided when use_cache is false"
             )
         if not use_cache:
             self.cache = None
+            self.artifact_store = None
         elif cache is not None:
             self.cache = cache
+            self.artifact_store = getattr(cache, "store", None)
+        elif artifact_store is not None:
+            self.artifact_store = artifact_store
+            self.cache = ResponseCache(artifact_store, namespace=cache_namespace)
         else:
             try:
-                self.cache = SQLiteResponseCache(cache_path, namespace=cache_namespace)
-            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.artifact_store = _optional_artifact_store(namespace=cache_namespace)
+            except ArtifactStoreConfigurationError as exc:
                 raise RagtimeConfigurationError(
                     f"unable to initialize the RAGTIME cache: {exc}"
                 ) from None
+            self.cache = (
+                None
+                if self.artifact_store is None
+                else ResponseCache(self.artifact_store, namespace=cache_namespace)
+            )
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "RagtimeClient":
@@ -237,15 +273,41 @@ class RagtimeClient:
                 "RAGTIME_REQUESTS_PER_SECOND", DEFAULT_REQUESTS_PER_SECOND
             ),
         }
-        cache_path = os.getenv("RAGTIME_CACHE_PATH", "").strip()
-        if cache_path:
-            options["cache_path"] = Path(cache_path).expanduser()
         options.update(overrides)
+        if (
+            options.get("use_cache", True)
+            and options.get("cache") is None
+            and options.get("artifact_store") is None
+        ):
+            try:
+                artifact_store = _optional_artifact_store(
+                    namespace=options["cache_namespace"]
+                )
+            except ArtifactStoreConfigurationError as exc:
+                raise RagtimeConfigurationError(
+                    f"unable to initialize the RAGTIME cache: {exc}"
+                ) from None
+            if artifact_store is None:
+                options["use_cache"] = False
+            else:
+                options["artifact_store"] = artifact_store
         return cls(base_url, bearer_token, **options)
 
     @property
-    def cache_path(self) -> Path | None:
-        return None if self.cache is None else self.cache.path
+    def cache_configuration(self) -> dict[str, object] | None:
+        """Return non-secret artifact-cache provenance for run manifests."""
+
+        if self.cache is None:
+            return None
+        try:
+            return sanitized_cache_configuration(
+                self.cache.namespace,
+                self.artifact_store,
+            )
+        except ValueError:
+            raise RagtimeConfigurationError(
+                "artifact cache metadata is invalid"
+            ) from None
 
     def close(self) -> None:
         if self._owns_session:
@@ -256,76 +318,6 @@ class RagtimeClient:
 
     def __exit__(self, *_: object) -> None:
         self.close()
-
-    def _cache_get(
-        self,
-        *,
-        operation: str,
-        request: Mapping[str, Any],
-        ttl_seconds: float | None,
-        refresh: bool,
-    ) -> CacheEntry | None:
-        if self.cache is None or refresh:
-            return None
-        try:
-            return self.cache.get(
-                base_url=self.base_url,
-                operation=operation,
-                request=request,
-                ttl_seconds=ttl_seconds,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"RAGTIME cache read failed; requesting upstream ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return None
-
-    def _cache_put(
-        self,
-        *,
-        operation: str,
-        request: Mapping[str, Any],
-        response: Mapping[str, Any],
-    ) -> float | None:
-        if self.cache is None:
-            return None
-        try:
-            return self.cache.put(
-                base_url=self.base_url,
-                operation=operation,
-                request=request,
-                response=response,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"RAGTIME cache write failed; returning live response ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return None
-
-    def _cache_delete(
-        self,
-        *,
-        operation: str,
-        request: Mapping[str, Any],
-    ) -> None:
-        if self.cache is None:
-            return
-        try:
-            self.cache.delete(
-                base_url=self.base_url,
-                operation=operation,
-                request=request,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"RAGTIME cache eviction failed; refreshing upstream ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
     def _post(self, endpoint: str, request: Mapping[str, Any]) -> dict[str, Any]:
         response: requests.Response | Any | None = None
@@ -400,24 +392,28 @@ class RagtimeClient:
         refresh: bool,
         validator: Callable[[Mapping[str, Any]], T],
     ) -> tuple[T, bool, float | None]:
-        entry = self._cache_get(
-            operation=operation,
-            request=request,
-            ttl_seconds=ttl_seconds,
-            refresh=refresh,
-        )
-        if entry is not None:
-            try:
-                return validator(entry.payload), True, entry.stored_at
-            except RagtimeProtocolError:
-                self._cache_delete(operation=operation, request=request)
+        if self.cache is not None and not refresh:
+            entry = self.cache.get(
+                base_url=self.base_url,
+                operation=operation,
+                request=request,
+                ttl_seconds=ttl_seconds,
+                validator=validator,
+            )
+            if entry is not None:
+                return entry.value, True, entry.stored_at
 
         payload = self._post(endpoint, request)
         validated = validator(payload)
-        stored_at = self._cache_put(
-            operation=operation,
-            request=request,
-            response=payload,
+        stored_at = (
+            self.cache.put(
+                base_url=self.base_url,
+                operation=operation,
+                request=request,
+                response=payload,
+            )
+            if self.cache is not None
+            else None
         )
         return validated, False, stored_at
 
@@ -546,17 +542,6 @@ class RagtimeClient:
             cache_stored_at=cache_stored_at,
             extra=extra,
         )
-
-    def pipeline(
-        self,
-        query: str,
-        *,
-        pipeline: str = DEFAULT_PIPELINE,
-        refresh: bool = False,
-    ) -> PipelineResult:
-        """Alias for :meth:`search` matching the HTTP endpoint name."""
-
-        return self.search(query, pipeline=pipeline, refresh=refresh)
 
     def get_content(
         self,

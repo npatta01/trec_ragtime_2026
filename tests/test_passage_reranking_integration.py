@@ -30,7 +30,6 @@ from trec_ragtime.models import (
     SearchHit,
 )
 
-
 _INTEGRATION_QUERY = "shared evidence and practical outcomes"
 _SUPPORTED_BASELINE_PUBLIC_EXPORTS = {
     "DEFAULT_CONTENT_COLLECTION",
@@ -108,14 +107,12 @@ _SUPPORTED_BASELINE_PUBLIC_EXPORTS = {
     "RunpodFlashConfig",
     "RunpodFlashPassageScorer",
     "Representation",
-    "SQLiteResponseCache",
     "SearchHit",
     "WIRE_SCHEMA_VERSION",
     "build_flash_worker",
     "build_from_parquet",
     "decode_flash_request",
     "decode_flash_response",
-    "default_cache_path",
     "default_local_corpus_path",
     "default_project_cache_dir",
     "ensure_private_cache_dir",
@@ -181,9 +178,6 @@ def _winning_content_hash(row: RerankedDocument) -> bytes | None:
 class ArtifactStoreFake:
     """Strict test-local structural fake for the future ArtifactStoreLike seam."""
 
-    class ArtifactValidationError(Exception):
-        pass
-
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.read_calls: list[str] = []
@@ -200,9 +194,10 @@ class ArtifactStoreFake:
         payload = self.objects.get(key)
         return None if payload is None else decoder(payload)
 
-    def write(self, key: str, payload: bytes) -> None:
+    def write(self, key: str, payload: bytes) -> bool:
         self.write_calls.append((key, payload))
         self.objects[key] = payload
+        return True
 
     def evict_local(self, key: str) -> None:
         self.evict_local_calls.append(key)
@@ -475,7 +470,6 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             local,
             chunker_fingerprint=chunker.fingerprint,
             representation="report_text",
-            artifact_validation_error=ArtifactStoreFake.ArtifactValidationError,
         )
 
         first = rerank_retrieval(

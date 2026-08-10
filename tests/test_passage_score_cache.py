@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 
 import msgspec
 
-from trec_ragtime.passages import Passage, sha256_bytes
+from trec_ragtime.artifact_store import ArtifactValidationError
 from trec_ragtime.passage_score_cache import (
     CachedPassageScorer,
     PassageScoreArtifactValidationError,
@@ -19,12 +19,10 @@ from trec_ragtime.passage_score_cache import (
     query_hash,
     score_object_key,
 )
+from trec_ragtime.passages import Passage, sha256_bytes
 
 
 class FakeArtifactStore:
-    class ArtifactValidationError(Exception):
-        pass
-
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.read_calls: list[str] = []
@@ -44,9 +42,10 @@ class FakeArtifactStore:
         payload = self.objects.get(key)
         return None if payload is None else decoder(payload)
 
-    def write(self, key: str, payload: bytes) -> None:
+    def write(self, key: str, payload: bytes) -> bool:
         self.write_calls.append((key, payload))
         self.objects[key] = payload
+        return True
 
     def evict_local(self, key: str) -> None:
         self.objects.pop(key, None)
@@ -74,10 +73,10 @@ class FailingArtifactStore(FakeArtifactStore):
         payload = self.objects.get(key)
         return None if payload is None else decoder(payload)
 
-    def write(self, key: str, payload: bytes) -> None:
+    def write(self, key: str, payload: bytes) -> bool:
         if self.write_error is not None:
             raise self.write_error
-        super().write(key, payload)
+        return super().write(key, payload)
 
 
 class RecordingScorer:
@@ -166,7 +165,6 @@ def _cache(
         scorer,
         chunker_fingerprint=chunker_fingerprint,
         representation=representation,
-        artifact_validation_error=FakeArtifactStore.ArtifactValidationError,
     )
 
 
@@ -380,7 +378,7 @@ print(encode_score_map(scores).hex())
                 RecordingScorer(),
                 "chunker-v1",  # type: ignore[call-arg]
                 "canonical",  # type: ignore[call-arg]
-                FakeArtifactStore.ArtifactValidationError,  # type: ignore[call-arg]
+                ArtifactValidationError,  # type: ignore[call-arg]
             )
 
     def test_malformed_truncated_non_map_nonfinite_and_wrong_key_artifacts_fail(
@@ -404,7 +402,7 @@ print(encode_score_map(scores).hex())
                 store.objects[key] = raw
                 scorer = RecordingScorer()
 
-                with self.assertRaises(FakeArtifactStore.ArtifactValidationError):
+                with self.assertRaises(ArtifactValidationError):
                     _cache(store, scorer).score("query", (passage,))
                 self.assertEqual(scorer.calls, [])
                 self.assertEqual(store.write_calls, [])

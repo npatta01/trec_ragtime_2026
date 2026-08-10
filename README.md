@@ -439,13 +439,29 @@ with RagtimeClient.from_env() as client:
     print(document.text)
 ```
 
-Private responses and Dataset Viewer fallback documents share the
-permission-restricted SQLite database at
-`<git-common-dir>/ragtime-cache/api-v1.sqlite3`. The complete local corpus is a
-separate revision-pinned DuckDB database and does not use
-per-document response caching. Both live in Git's untracked common metadata
-area and are shared across worktrees. Cache overrides must be absolute paths
-inside a user-only directory.
+Private responses and Dataset Viewer fallback documents are durable typed
+artifacts in a private Hugging Face Bucket (L2), read through a disposable
+owner-only `fsspec.simplecache` directory (L1). Configure the bucket with
+`RAGTIME_HF_BUCKET_ID`, an optional `RAGTIME_ARTIFACT_PREFIX`, and an optional
+absolute `RAGTIME_ARTIFACT_CACHE_DIR` (defaulting to
+`<git-common-dir>/ragtime-cache/artifacts-v1`). `HF_TOKEN` is optional when the
+normal Hugging Face authentication lookup is available. Runtime artifact
+caching is best effort: a private-bucket authentication, transport, permission,
+server, or write failure emits one credential-safe warning, disables remote
+access for that store instance, and leaves the live result usable as an
+uncached response. A cache miss is therefore normal after the breaker opens.
+L1 artifacts may be discarded and rebuilt from the private bucket; a malformed
+L1 candidate is repaired once from L2, and malformed or mismatched typed
+payloads are never accepted. The adapters use a strict typed `msgspec`
+MessagePack envelope, enforce identity and domain validation, and admit writes
+only for fully validated successful results. Retrieval artifacts are eligible
+only for complete hydrated results without hydration failures. Runner
+checkpoints may include an optional artifact reference and omit it when
+best-effort storage is unavailable; a successful reference-less checkpoint is
+usable only in-process and is recomputed on resume or restart.
+The durable Hugging Face Bucket must remain private. The complete local corpus
+remains a separate revision-pinned DuckDB database and does not use
+per-document response caching.
 
 Private `/pipeline` and `/content` entries do not expire by default because the
 participant endpoint is treated as immutable. Numeric
@@ -475,10 +491,10 @@ semantic retrieval; the remaining operation is an exact lookup by document ID.
 
 Although the private endpoint does not publish an immutable version identifier,
 this project follows the participant guarantee that its results will not
-change. Use `refresh=True`, rotate `RAGTIME_CACHE_NAMESPACE`, or call
-`client.cache.clear()` only for explicit manual invalidation. Cache keys include
-the base URL, operation, namespace, and exact JSON request, but never the bearer
-token.
+change. Use `refresh=True`, rotate `RAGTIME_CACHE_NAMESPACE`, or discard the
+disposable L1 directory only for explicit manual invalidation. Cache keys
+include the base URL, operation, namespace, and exact JSON request, but never
+the bearer token.
 
 ### RAGTIME Contract Details
 
@@ -496,10 +512,75 @@ token.
 - The API returns `scores` as an unordered document-ID-to-score object. The
   client sorts it by descending score and then document ID for stable ties.
 - The client canonicalizes authentication to `Authorization: Bearer <token>`
-  and distinguishes a local SQLite hit from the service's own `cached` field.
+  and distinguishes a local artifact hit from the service's own `cached` field.
 - Cached private queries and responses must be treated as participant data. The
-  cache directory and database are created with user-only permissions and must
-  not be committed.
+  L1 artifact directory is created with user-only permissions and must not be
+  committed; the durable L2 bucket must remain private.
+
+### One-Time Legacy Cache Import
+
+The runtime has no SQLite cache path. If an existing legacy response database
+must be migrated, use the explicit offline importer after configuring the
+private bucket and decrypting `.env`:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env
+uv run ragtime-cache-import \
+  /absolute/path/to/api-v1.sqlite3 \
+  --manifest /absolute/path/to/cache-import-manifest.json
+```
+
+The importer opens the source with SQLite `mode=ro`, accepts only schema `1`,
+namespace `ragtime2-2026-v1`, and the `pipeline`, `content`, and
+`huggingface_document` operations. Every accepted row is checked with the
+production endpoint validator, applies the 30-day Dataset Viewer TTL,
+preserves its finite `stored_at`, and is independently reread from the
+destination. Unsupported, malformed, and expired rows are counted as skipped;
+`write() is False`, an independent verification miss, or an independent
+verification mismatch is a strict migration failure and is never counted as an
+imported or verified row. The importer does not publish a successful manifest
+after any such failure.
+The manifest contains only source hash/size, destination bucket metadata, and
+sanitized counts; it contains no request text, response bodies, URLs with
+credentials, or tokens. The source database is never deleted or modified.
+
+### Reuse Existing Retrieval Runs
+
+Control-A and Baseline B/C runs are mutable JSONL checkpoints for audit and
+resume. Their durable cross-process cache is one complete hydrated query object
+per exact semantic request in the private artifact store:
+
+```text
+retrieval/v1/<retriever-fingerprint>/<request-prefix>/<request-digest>.mpk
+```
+
+The runners first try that object. A warm B/C topic reconstruction loads the
+objects by exact query context and performs no organizer request or DuckDB
+hydration. Baseline C imports every successful facet checkpoint, including IDs
+that were not retained in the fused topic's top-100 candidates.
+
+To migrate an existing immutable run directory, decrypt `.env` first and give
+the importer an explicit local manifest path:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env
+uv run ragtime-retrieval-import \
+  /absolute/path/to/control-a-or-query-baseline-run \
+  --corpus /absolute/path/to/ragtime2-corpus-v2.duckdb \
+  --manifest /absolute/path/to/retrieval-import-manifest.json
+```
+
+The importer accepts only `control_a_v1` and `query_baseline_v1` B/C
+directories. It validates source hashes and pinned corpus identity, hydrates
+exact IDs only through `LocalCorpusIndex.enrich_documents`, writes complete
+objects through `RetrievalArtifactCache`, then evicts its disposable L1 copy
+and independently rereads the private L2 object. Malformed or partial input
+records may be counted as skipped; an unsuccessful write, L2 verification miss,
+or decoded-artifact mismatch is a strict migration failure, never a counted
+success, and produces no successful output manifest. The source run files are
+read-only and the owner-only manifest contains only file hashes, sanitized
+counts, corpus provenance, and retrieval object keys—not queries, document
+bodies, credentials, or local cache secrets.
 
 ## Repository Map
 
