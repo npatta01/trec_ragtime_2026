@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
 
@@ -21,6 +23,7 @@ from trec_ragtime import (
     RagtimeClient,
     RagtimeRetriever,
     ResponseCache,
+    RetrievalArtifactCache,
     SearchHit,
 )
 from trec_ragtime.artifact_store import ArtifactValidationError
@@ -206,12 +209,19 @@ class FakeRagtimeClient:
         self.closed = False
         self.artifact_store = None
         self.cache_configuration = None
+        self.base_url = "https://private.example"
+        self.raise_on_search = False
+        self.raise_on_content = False
 
     def search(self, query: str, *, pipeline: str, refresh: bool) -> PipelineResult:
+        if self.raise_on_search:
+            raise AssertionError("retrieval cache hit must not call search")
         self.search_calls.append({"query": query, "pipeline": pipeline, "refresh": refresh})
         return self.search_result
 
     def get_content(self, document_id: str, *, refresh: bool) -> Document:
+        if self.raise_on_content:
+            raise AssertionError("retrieval cache hit must not call content")
         self.content_calls.append({"document_id": document_id, "refresh": refresh})
         value = self.contents[document_id]
         if isinstance(value, Exception):
@@ -229,8 +239,25 @@ class FakeCorpus:
         self.result = result
         self.calls: list[dict[str, Any]] = []
         self.closed = False
+        self.raise_on_access = False
+        self.corpus_identity = {
+            "backend": "fake",
+            "schema_version": 1,
+            "dataset": "trec-ragtime/ragtime2",
+            "config": "default",
+            "revision": "fake-revision",
+            "document_count": 1,
+            "shard_count": 1,
+            "splits": ["eng", "spa", "rus", "zho"],
+            "translation_config": "mt_docs",
+            "translation_count": 0,
+            "translation_shard_count": 0,
+            "translation_splits": [],
+        }
 
     def get_many(self, document_ids: Any, *, refresh: bool) -> HydrationResult:
+        if self.raise_on_access:
+            raise AssertionError("retrieval cache hit must not hydrate documents")
         self.calls.append({"document_ids": tuple(document_ids), "refresh": refresh})
         return self.result
 
@@ -493,6 +520,221 @@ class HuggingFaceCorpusTests(unittest.TestCase):
 
 
 class RagtimeRetrieverTests(unittest.TestCase):
+    def _cached_retriever(
+        self,
+        store: MemoryArtifactStore,
+        *,
+        text: str = "cached text",
+        document_result: HydrationResult | None = None,
+    ) -> tuple[RagtimeRetriever, FakeRagtimeClient, FakeCorpus]:
+        client = FakeRagtimeClient(pipeline_result(["doc-1"]))
+        corpus = FakeCorpus(
+            document_result
+            if document_result is not None
+            else HydrationResult(
+                documents=(hf_document("doc-1", text),),
+                unresolved_ids=(),
+                failures=(),
+            )
+        )
+        return RagtimeRetriever(
+            client,
+            corpus,
+            retrieval_cache=RetrievalArtifactCache(store, clock=lambda: 100.0),
+        ), client, corpus
+
+    def test_l1_hit_does_not_call_search_or_corpus(self) -> None:
+        store = MemoryArtifactStore()
+        first, _, _ = self._cached_retriever(store, text="first")
+        first_result = first.retrieve("query")
+        self.assertFalse(first_result.retrieval_artifact.cache_hit)
+
+        second, client, corpus = self._cached_retriever(store, text="wrong")
+        client.raise_on_search = True
+        corpus.raise_on_access = True
+        result = second.retrieve("query")
+
+        self.assertTrue(result.retrieval_artifact.cache_hit)
+        self.assertEqual(result.documents[0].text, "first")
+        self.assertEqual(client.search_calls, [])
+        self.assertEqual(corpus.calls, [])
+
+    def test_l2_hit_does_not_call_search_or_corpus_and_populates_l1(self) -> None:
+        store = MemoryArtifactStore()
+        first, _, _ = self._cached_retriever(store, text="from l2")
+        first_result = first.retrieve("query")
+        object_key = first_result.retrieval_artifact.object_key
+        store.local.clear()
+        self.assertIn(object_key, store.remote)
+
+        second, client, corpus = self._cached_retriever(store, text="wrong")
+        client.raise_on_search = True
+        corpus.raise_on_access = True
+        result = second.retrieve("query")
+
+        self.assertTrue(result.retrieval_artifact.cache_hit)
+        self.assertEqual(result.documents[0].text, "from l2")
+        self.assertIn(object_key, store.local)
+        self.assertEqual(client.search_calls, [])
+        self.assertEqual(corpus.calls, [])
+
+    def test_miss_computes_once_validates_writes_and_returns_without_reread(self) -> None:
+        store = MemoryArtifactStore()
+        retriever, client, corpus = self._cached_retriever(store)
+
+        result = retriever.retrieve("query")
+
+        self.assertFalse(result.retrieval_artifact.cache_hit)
+        self.assertEqual(len(store.read_calls), 1)
+        self.assertEqual(len(store.write_calls), 1)
+        self.assertEqual(len(client.search_calls), 1)
+        self.assertEqual(len(corpus.calls), 1)
+
+    def test_unresolved_or_hydration_failure_result_is_never_written(self) -> None:
+        for hydration in (
+            HydrationResult(
+                documents=(), unresolved_ids=("doc-1",), failures=()
+            ),
+            HydrationResult(
+                documents=(),
+                unresolved_ids=("doc-1",),
+                failures=(HydrationFailure(split="eng", message="temporary"),),
+            ),
+        ):
+            with self.subTest(hydration=hydration):
+                store = MemoryArtifactStore()
+                retriever, _, _ = self._cached_retriever(store, document_result=hydration)
+                result = retriever.retrieve(
+                    "query",
+                    fallback_on_hf_error=bool(hydration.failures),
+                    max_content_fallbacks=0,
+                )
+                self.assertFalse(result.fully_hydrated)
+                self.assertEqual(store.write_calls, [])
+
+    def test_missing_translation_with_source_text_is_cacheable(self) -> None:
+        store = MemoryArtifactStore()
+        retriever, _, _ = self._cached_retriever(
+            store,
+            document_result=HydrationResult(
+                documents=(hf_document("doc-1", "texto", split="spa"),),
+                unresolved_ids=(),
+                failures=(),
+                missing_translation_ids=("doc-1",),
+            ),
+        )
+        first = retriever.retrieve("query")
+        self.assertTrue(first.fully_hydrated)
+        self.assertFalse(first.fully_report_ready)
+        self.assertEqual(len(store.write_calls), 1)
+
+        second, client, corpus = self._cached_retriever(store, text="wrong")
+        client.raise_on_search = True
+        corpus.raise_on_access = True
+        cached = second.retrieve("query")
+        self.assertTrue(cached.retrieval_artifact.cache_hit)
+        self.assertEqual(cached.documents[0].text, "texto")
+
+    def test_refresh_bypasses_read_and_overwrites_only_after_complete_success(self) -> None:
+        store = MemoryArtifactStore()
+        first, _, _ = self._cached_retriever(store, text="old")
+        first.retrieve("query")
+
+        refreshed, client, corpus = self._cached_retriever(store, text="new")
+        result = refreshed.retrieve("query", refresh=True)
+
+        self.assertFalse(result.retrieval_artifact.cache_hit)
+        self.assertEqual(len(store.read_calls), 1)
+        self.assertEqual(len(store.write_calls), 2)
+        self.assertTrue(client.search_calls[-1]["refresh"])
+        self.assertTrue(corpus.calls[-1]["refresh"])
+
+        check, check_client, check_corpus = self._cached_retriever(store, text="wrong")
+        check_client.raise_on_search = True
+        check_corpus.raise_on_access = True
+        self.assertEqual(check.retrieve("query").documents[0].text, "new")
+
+    def test_failed_refresh_preserves_existing_retrieval_object(self) -> None:
+        store = MemoryArtifactStore()
+        first, _, _ = self._cached_retriever(store, text="old")
+        first.retrieve("query")
+        failed, _, _ = self._cached_retriever(
+            store,
+            text="not persisted",
+            document_result=HydrationResult(
+                documents=(), unresolved_ids=("doc-1",), failures=()
+            ),
+        )
+        result = failed.retrieve("query", refresh=True, max_content_fallbacks=0)
+        self.assertFalse(result.fully_hydrated)
+        self.assertEqual(len(store.write_calls), 1)
+
+        check, check_client, check_corpus = self._cached_retriever(store, text="wrong")
+        check_client.raise_on_search = True
+        check_corpus.raise_on_access = True
+        cached = check.retrieve("query")
+        self.assertTrue(cached.retrieval_artifact.cache_hit)
+        self.assertEqual(cached.documents[0].text, "old")
+
+    def test_query_context_changes_identity_without_changing_query_bytes(self) -> None:
+        store = MemoryArtifactStore()
+        first, first_client, _ = self._cached_retriever(store, text="first")
+        first_result = first.retrieve(
+            "query", query_context={"kind": "control_a"}
+        )
+        second, second_client, _ = self._cached_retriever(store, text="second")
+        second_result = second.retrieve(
+            "query", query_context={"kind": "baseline_b"}
+        )
+
+        self.assertNotEqual(
+            first_result.retrieval_artifact.object_key,
+            second_result.retrieval_artifact.object_key,
+        )
+        self.assertEqual(first_client.search_calls[0]["query"], "query")
+        self.assertEqual(second_client.search_calls[0]["query"], "query")
+        self.assertEqual(len(store.write_calls), 2)
+
+    def test_retrieval_artifact_store_failures_propagate(self) -> None:
+        store = MemoryArtifactStore()
+        store.read_error = OSError("retrieval artifact read failed")
+        retriever, client, corpus = self._cached_retriever(store)
+        with self.assertRaisesRegex(OSError, "retrieval artifact read failed"):
+            retriever.retrieve("query")
+        self.assertEqual(client.search_calls, [])
+        self.assertEqual(corpus.calls, [])
+
+        store = MemoryArtifactStore()
+        store.write_error = OSError("retrieval artifact write failed")
+        retriever, client, corpus = self._cached_retriever(store)
+        with self.assertRaisesRegex(OSError, "retrieval artifact write failed"):
+            retriever.retrieve("query")
+        self.assertEqual(len(client.search_calls), 1)
+        self.assertEqual(len(corpus.calls), 1)
+        self.assertEqual(store.write_calls, [])
+
+    def test_from_env_shares_clients_configured_artifact_store(self) -> None:
+        store = MemoryArtifactStore()
+        client = FakeRagtimeClient(pipeline_result([]))
+        client.artifact_store = store
+        corpus = FakeCorpus(
+            HydrationResult(documents=(), unresolved_ids=(), failures=())
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            index_path = Path(temporary) / "corpus.duckdb"
+            index_path.touch()
+            with patch(
+                "trec_ragtime.retriever.RagtimeClient.from_env",
+                return_value=client,
+            ), patch(
+                "trec_ragtime.retriever.LocalCorpusIndex",
+                return_value=corpus,
+            ):
+                retriever = RagtimeRetriever.from_env(local_index_path=index_path)
+        self.assertIsNotNone(retriever.retrieval_cache)
+        assert retriever.retrieval_cache is not None
+        self.assertIs(retriever.retrieval_cache.store, store)
+
     def test_enriches_every_api_result_without_a_twenty_document_cap(self) -> None:
         document_ids = [f"doc-{index:03d}" for index in range(137)]
         corpus = FakeCorpus(

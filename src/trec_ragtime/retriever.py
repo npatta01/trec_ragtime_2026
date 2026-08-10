@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
 from .artifact_store import ArtifactStoreLike
-from .client import DEFAULT_PIPELINE, RagtimeClient, RagtimeError
+from .client import (
+    DEFAULT_CONTENT_COLLECTION,
+    DEFAULT_PIPELINE,
+    RagtimeClient,
+    RagtimeError,
+)
 from .huggingface import (
     DEFAULT_HF_DATASET,
     DEFAULT_HF_MT_SPLITS,
@@ -27,6 +32,11 @@ from .models import (
     HydrationResult,
     RetrievalResult,
     RetrievedDocument,
+)
+from .retrieval_cache import (
+    ENDPOINT_DEPTH_BEHAVIOR_VERSION,
+    RetrievalArtifactCache,
+    RetrievalRequestIdentity,
 )
 
 DEFAULT_MAX_CONTENT_FALLBACKS = 5
@@ -61,9 +71,15 @@ class RagtimeRetriever:
         self,
         client: RagtimeClient,
         corpus: DocumentCorpus,
+        retrieval_cache: RetrievalArtifactCache | None = None,
     ) -> None:
         self.client = client
         self.corpus = corpus
+        if retrieval_cache is not None and not isinstance(
+            retrieval_cache, RetrievalArtifactCache
+        ):
+            raise TypeError("retrieval_cache must be a RetrievalArtifactCache or None")
+        self.retrieval_cache = retrieval_cache
 
     @classmethod
     def from_env(
@@ -74,6 +90,8 @@ class RagtimeRetriever:
     ) -> "RagtimeRetriever":
         """Build a cached search client and the required local corpus index."""
 
+        missing = object()
+        retrieval_cache = client_overrides.pop("retrieval_cache", missing)
         client = RagtimeClient.from_env(**client_overrides)
         try:
             index_path = (
@@ -103,7 +121,13 @@ class RagtimeRetriever:
         except Exception:
             client.close()
             raise
-        return cls(client, corpus)
+        if retrieval_cache is missing:
+            retrieval_cache = (
+                None
+                if client.artifact_store is None
+                else RetrievalArtifactCache(client.artifact_store)
+            )
+        return cls(client, corpus, retrieval_cache=retrieval_cache)
 
     @property
     def artifact_store(self) -> ArtifactStoreLike | None:
@@ -146,6 +170,139 @@ class RagtimeRetriever:
             "translation_splits": list(metadata.translation_splits),
         }
 
+    def _retrieval_corpus_identity(self) -> Mapping[str, Any]:
+        """Return corpus provenance without requiring a hydration lookup.
+
+        Production retrievers use the revision-pinned :class:`LocalCorpusIndex`.
+        The structural fallback keeps this identity seam usable by importers and
+        deterministic test corpora that expose their own immutable provenance.
+        """
+
+        try:
+            return self.corpus_identity
+        except LocalCorpusConfigurationError:
+            identity = getattr(self.corpus, "corpus_identity", None)
+            if not isinstance(identity, Mapping):
+                raise
+            return identity
+
+    @staticmethod
+    def _validate_retrieval_arguments(
+        query: str,
+        *,
+        pipeline: str,
+        top_k: int | None,
+        refresh_search: bool,
+        refresh_documents: bool,
+        refresh: bool,
+        max_content_fallbacks: int | None,
+        fallback_on_hf_error: bool,
+        query_context: Mapping[str, object] | None,
+    ) -> None:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if not isinstance(pipeline, str) or not pipeline.strip():
+            raise ValueError("pipeline must be a non-empty string")
+        if top_k is not None and (
+            isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1
+        ):
+            raise ValueError("top_k must be a positive integer or None")
+        for name, value in (
+            ("refresh_search", refresh_search),
+            ("refresh_documents", refresh_documents),
+            ("refresh", refresh),
+            ("fallback_on_hf_error", fallback_on_hf_error),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean")
+        if max_content_fallbacks is not None and (
+            isinstance(max_content_fallbacks, bool)
+            or not isinstance(max_content_fallbacks, int)
+            or max_content_fallbacks < 0
+        ):
+            raise ValueError(
+                "max_content_fallbacks must be a non-negative integer or None"
+            )
+        if fallback_on_hf_error and max_content_fallbacks is None:
+            raise ValueError(
+                "fallback_on_hf_error requires a finite max_content_fallbacks"
+            )
+        if query_context is not None and not isinstance(query_context, Mapping):
+            raise TypeError("query_context must be a mapping or None")
+
+    def build_retrieval_identity(
+        self,
+        query: str,
+        *,
+        pipeline: str = DEFAULT_PIPELINE,
+        top_k: int | None = None,
+        max_content_fallbacks: int | None = DEFAULT_MAX_CONTENT_FALLBACKS,
+        fallback_on_hf_error: bool = False,
+        query_context: Mapping[str, object] | None = None,
+    ) -> RetrievalRequestIdentity:
+        """Build the exact request identity without search or hydration work."""
+
+        self._validate_retrieval_arguments(
+            query,
+            pipeline=pipeline,
+            top_k=top_k,
+            refresh_search=False,
+            refresh_documents=False,
+            refresh=False,
+            max_content_fallbacks=max_content_fallbacks,
+            fallback_on_hf_error=fallback_on_hf_error,
+            query_context=query_context,
+        )
+        base_url = getattr(self.client, "base_url", None)
+        if not isinstance(base_url, str):
+            raise ValueError("client must expose a normalized base_url for retrieval caching")
+        backend_policy = {"document_backend": self.document_backend}
+        return RetrievalRequestIdentity(
+            query=query,
+            pipeline=pipeline,
+            top_k=top_k,
+            endpoint_depth_version=ENDPOINT_DEPTH_BEHAVIOR_VERSION,
+            max_content_fallbacks=max_content_fallbacks,
+            fallback_on_hf_error=fallback_on_hf_error,
+            content_collection=DEFAULT_CONTENT_COLLECTION,
+            backend_policy=backend_policy,
+            query_context=query_context,
+            base_url=base_url,
+            corpus_identity=self._retrieval_corpus_identity(),
+        )
+
+    # Descriptive aliases keep the pure seam discoverable to runner/importer
+    # callers without introducing a second identity implementation.
+    def retrieval_identity(self, *args: Any, **kwargs: Any) -> RetrievalRequestIdentity:
+        return self.build_retrieval_identity(*args, **kwargs)
+
+    def get_cached_retrieval(
+        self,
+        query: str,
+        *,
+        pipeline: str = DEFAULT_PIPELINE,
+        top_k: int | None = None,
+        max_content_fallbacks: int | None = DEFAULT_MAX_CONTENT_FALLBACKS,
+        fallback_on_hf_error: bool = False,
+        query_context: Mapping[str, object] | None = None,
+    ) -> RetrievalResult | None:
+        """Load one exact artifact without organizer or corpus hydration work."""
+
+        identity = self.build_retrieval_identity(
+            query,
+            pipeline=pipeline,
+            top_k=top_k,
+            max_content_fallbacks=max_content_fallbacks,
+            fallback_on_hf_error=fallback_on_hf_error,
+            query_context=query_context,
+        )
+        if self.retrieval_cache is None:
+            return None
+        return self.retrieval_cache.get(identity)
+
+    def retrieve_cached(self, *args: Any, **kwargs: Any) -> RetrievalResult | None:
+        return self.get_cached_retrieval(*args, **kwargs)
+
     def close(self) -> None:
         try:
             self.corpus.close()
@@ -183,6 +340,8 @@ class RagtimeRetriever:
         refresh_documents: bool = False,
         max_content_fallbacks: int | None = DEFAULT_MAX_CONTENT_FALLBACKS,
         fallback_on_hf_error: bool = False,
+        refresh: bool = False,
+        query_context: Mapping[str, object] | None = None,
     ) -> RetrievalResult:
         """Search, then join ranked IDs to original-language corpus text.
 
@@ -195,39 +354,40 @@ class RagtimeRetriever:
         fallback for that remote-backend case.
         """
 
-        if top_k is not None and (
-            isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1
-        ):
-            raise ValueError("top_k must be a positive integer or None")
-        for name, value in (
-            ("refresh_search", refresh_search),
-            ("refresh_documents", refresh_documents),
-            ("fallback_on_hf_error", fallback_on_hf_error),
-        ):
-            if not isinstance(value, bool):
-                raise ValueError(f"{name} must be a boolean")
-        if max_content_fallbacks is not None and (
-            isinstance(max_content_fallbacks, bool)
-            or not isinstance(max_content_fallbacks, int)
-            or max_content_fallbacks < 0
-        ):
-            raise ValueError(
-                "max_content_fallbacks must be a non-negative integer or None"
-            )
-        if fallback_on_hf_error and max_content_fallbacks is None:
-            raise ValueError(
-                "fallback_on_hf_error requires a finite max_content_fallbacks"
-            )
+        self._validate_retrieval_arguments(
+            query,
+            pipeline=pipeline,
+            top_k=top_k,
+            refresh_search=refresh_search,
+            refresh_documents=refresh_documents,
+            refresh=refresh,
+            max_content_fallbacks=max_content_fallbacks,
+            fallback_on_hf_error=fallback_on_hf_error,
+            query_context=query_context,
+        )
+        identity = self.build_retrieval_identity(
+            query,
+            pipeline=pipeline,
+            top_k=top_k,
+            max_content_fallbacks=max_content_fallbacks,
+            fallback_on_hf_error=fallback_on_hf_error,
+            query_context=query_context,
+        )
+        retrieval_refresh = refresh or refresh_search or refresh_documents
+        if self.retrieval_cache is not None and not retrieval_refresh:
+            cached = self.retrieval_cache.get(identity)
+            if cached is not None:
+                return cached
 
         search_result = self.client.search(
             query,
             pipeline=pipeline,
-            refresh=refresh_search,
+            refresh=refresh or refresh_search,
         )
         hits = search_result.hits if top_k is None else search_result.hits[:top_k]
         hydration = self.enrich_documents(
             (hit.document_id for hit in hits),
-            refresh_documents=refresh_documents,
+            refresh_documents=refresh or refresh_documents,
         )
         hydrated_by_id: dict[str, HuggingFaceDocument | Document] = {
             document_id: document for document_id, document in hydration.by_id().items()
@@ -313,7 +473,7 @@ class RagtimeRetriever:
             *hydration.missing_translation_ids,
             *api_fallback_ids,
         }
-        return RetrievalResult(
+        result = RetrievalResult(
             search_result=search_result,
             documents=tuple(documents),
             hydration_failures=tuple(failures),
@@ -323,6 +483,13 @@ class RagtimeRetriever:
                 if hit.document_id in missing_report_text_ids
             ),
         )
+        if (
+            self.retrieval_cache is not None
+            and result.fully_hydrated
+            and not result.hydration_failures
+        ):
+            return self.retrieval_cache.put(identity, result)
+        return result
 
 
 __all__ = [

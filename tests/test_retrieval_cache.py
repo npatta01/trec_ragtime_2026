@@ -17,6 +17,7 @@ from trec_ragtime.models import (
     RetrievedDocument,
     SearchHit,
 )
+from trec_ragtime.retriever import RagtimeRetriever
 from trec_ragtime.retrieval_cache import (
     RETRIEVAL_SCHEMA_VERSION,
     RetrievalArtifactCache,
@@ -116,6 +117,55 @@ def result_fixture(**changes: Any) -> RetrievalResult:
 
 
 class RetrievalCacheTestCase(unittest.TestCase):
+    def test_retriever_identity_builder_and_cache_only_lookup_are_pure(self) -> None:
+        class NoWorkClient:
+            base_url = "https://api.example.test"
+
+            def __init__(self) -> None:
+                self.search_calls = 0
+
+            def search(self, *args: Any, **kwargs: Any) -> None:
+                self.search_calls += 1
+                raise AssertionError("cache-only lookup called organizer search")
+
+        class NoWorkCorpus:
+            backend_name = "local"
+            corpus_identity = request_fixture().corpus_identity
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def enrich_documents(self, *args: Any, **kwargs: Any) -> None:
+                self.calls += 1
+                raise AssertionError("cache-only lookup hydrated corpus documents")
+
+            def close(self) -> None:
+                return None
+
+        client = NoWorkClient()
+        corpus = NoWorkCorpus()
+        retriever = RagtimeRetriever(client, corpus, retrieval_cache=RetrievalArtifactCache(MemoryArtifactStore()))
+        first = retriever.build_retrieval_identity(
+            "¿qué ocurrió? 中文",
+            pipeline="ragtime2%20",
+            query_context={"kind": "control_a"},
+        )
+        second = retriever.build_retrieval_identity(
+            "¿qué ocurrió? 中文",
+            pipeline="ragtime2%20",
+            query_context={"kind": "baseline_b"},
+        )
+        self.assertNotEqual(first.object_key, second.object_key)
+        self.assertIsNone(
+            retriever.get_cached_retrieval(
+                "¿qué ocurrió? 中文",
+                pipeline="ragtime2%20",
+                query_context={"kind": "control_a"},
+            )
+        )
+        self.assertEqual(client.search_calls, 0)
+        self.assertEqual(corpus.calls, 0)
+
     def test_non_integer_or_boolean_schema_versions_are_rejected_everywhere(self) -> None:
         for version in (True, 1.0, "1"):
             with self.subTest(version=version):
