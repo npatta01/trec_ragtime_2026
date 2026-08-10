@@ -50,12 +50,6 @@ class PassageScoringError(ValueError):
     """Raised when a query, passage, tokenizer, model, or score is invalid."""
 
 
-# Kept as an identity alias for the package-level import until downstream
-# cache/transport modules complete their same-task migration.  There is only
-# one scoring exception and all validation raises it directly.
-PassageScoreValidationError = PassageScoringError
-
-
 def _installed_runtime_version(distribution: str) -> str:
     try:
         return importlib.metadata.version(distribution)
