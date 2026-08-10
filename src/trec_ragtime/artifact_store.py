@@ -9,13 +9,16 @@ failure.  All transport, permissions, and filesystem failures are fatal.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import stat
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar, cast
 
 import fsspec
 from huggingface_hub import HfApi
+from huggingface_hub.errors import EntryNotFoundError
 
 from .paths import default_project_cache_dir, ensure_private_cache_dir
 
@@ -24,6 +27,10 @@ T = TypeVar("T")
 
 DEFAULT_ARTIFACT_CACHE_SUBDIRECTORY = "artifacts-v1"
 DEFAULT_CACHE_NAMESPACE = "ragtime2-2026-v1"
+DEFAULT_HYDRATION_RETRY_ATTEMPTS = 3
+DEFAULT_HYDRATION_RETRY_DELAY_SECONDS = 0.25
+MAX_HYDRATION_RETRY_ATTEMPTS = 5
+MAX_HYDRATION_RETRY_DELAY_SECONDS = 5.0
 
 
 class ArtifactStoreError(Exception):
@@ -93,6 +100,9 @@ class ArtifactStore:
         endpoint: str | None = None,
         api_factory: ApiFactory | None = None,
         filesystem_factory: FilesystemFactory | None = None,
+        hydration_retry_attempts: int = DEFAULT_HYDRATION_RETRY_ATTEMPTS,
+        hydration_retry_delay: float = DEFAULT_HYDRATION_RETRY_DELAY_SECONDS,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.bucket_id = self._validate_bucket_id(bucket_id)
         self.prefix = self._validate_prefix(prefix)
@@ -102,6 +112,32 @@ class ArtifactStore:
         self.namespace = namespace.strip()
         self.token = token
         self.endpoint = endpoint
+        if (
+            isinstance(hydration_retry_attempts, bool)
+            or not isinstance(hydration_retry_attempts, int)
+            or not 1 <= hydration_retry_attempts <= MAX_HYDRATION_RETRY_ATTEMPTS
+        ):
+            raise _configuration_error(
+                "hydration retry attempts must be an integer between 1 and 5"
+            )
+        try:
+            hydration_retry_delay_value = float(hydration_retry_delay)
+        except (OverflowError, TypeError, ValueError):
+            hydration_retry_delay_value = math.nan
+        if (
+            isinstance(hydration_retry_delay, bool)
+            or not isinstance(hydration_retry_delay, (int, float))
+            or not math.isfinite(hydration_retry_delay_value)
+            or not 0 <= hydration_retry_delay_value <= MAX_HYDRATION_RETRY_DELAY_SECONDS
+        ):
+            raise _configuration_error(
+                "hydration retry delay must be a finite number between 0 and 5 seconds"
+            )
+        if sleep is not None and not callable(sleep):
+            raise _configuration_error("hydration retry sleep must be callable")
+        self._hydration_retry_attempts = hydration_retry_attempts
+        self._hydration_retry_delay = hydration_retry_delay_value
+        self._sleep = sleep if sleep is not None else time.sleep
         self._api_factory = api_factory or HfApi
         self._filesystem_factory = filesystem_factory or fsspec.filesystem
         self._api: Any | None = None
@@ -341,17 +377,25 @@ class ArtifactStore:
         if not stat.S_ISREG(file_status.st_mode):
             raise ArtifactStoreRemoteError("local artifact cache candidate is not a file")
 
-    def _read_remote(self, object_key: str) -> bytes | None:
-        full_key = self._full_object_key(object_key)
-        self._verify_private_bucket()
+    def _get_paths_info(self, full_key: str) -> list[object]:
         try:
-            paths_info = list(
-                self._get_api().get_bucket_paths_info(self.bucket_id, [full_key])
-            )
+            return list(self._get_api().get_bucket_paths_info(self.bucket_id, [full_key]))
         except Exception:
             raise ArtifactStoreRemoteError(
                 "failed to inspect the Hugging Face artifact path"
             ) from None
+
+    @staticmethod
+    def _is_listing_visibility_miss(error: BaseException) -> bool:
+        if isinstance(error, (EntryNotFoundError, FileNotFoundError)):
+            return True
+        response = getattr(error, "response", None)
+        return getattr(response, "status_code", None) == 404
+
+    def _read_remote(self, object_key: str) -> bytes | None:
+        full_key = self._full_object_key(object_key)
+        self._verify_private_bucket()
+        paths_info = self._get_paths_info(full_key)
         if not paths_info:
             return None
 
@@ -365,12 +409,27 @@ class ArtifactStore:
                 # proved the object exists, so invoke simplecache's hydration
                 # primitive directly and read its exact mapped candidate.
                 stripped_path = filesystem._strip_protocol(self._remote_path(object_key))
-                hydrate(stripped_path)
-                found, payload = self._read_local(candidate)
-                if not found:
-                    raise ArtifactStoreRemoteError(
-                        "artifact filesystem did not retain the local candidate"
-                    )
+                for attempt in range(self._hydration_retry_attempts):
+                    try:
+                        hydrate(stripped_path)
+                    except Exception as error:
+                        self._remove_candidate(candidate)
+                        retryable = self._is_listing_visibility_miss(error)
+                        exhausted = attempt + 1 >= self._hydration_retry_attempts
+                        if not retryable or exhausted:
+                            raise
+                        if not self._get_paths_info(full_key):
+                            raise ArtifactStoreRemoteError(
+                                "artifact path disappeared during hydration retry"
+                            )
+                        self._sleep(self._hydration_retry_delay)
+                        continue
+                    found, payload = self._read_local(candidate)
+                    if not found:
+                        raise ArtifactStoreRemoteError(
+                            "artifact filesystem did not retain the local candidate"
+                        )
+                    break
             else:
                 # Do not fall back to SimpleCacheFileSystem.open(): its stock
                 # read path probes target.exists(), which is not a permitted

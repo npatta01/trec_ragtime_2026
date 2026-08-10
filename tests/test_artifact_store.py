@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import fsspec
+from huggingface_hub.errors import EntryNotFoundError
 from fsspec.spec import AbstractFileSystem
 
 from trec_ragtime.artifact_store import (
@@ -121,6 +122,33 @@ class PartialFailSimpleCache(FakeSimpleCache):
         return super()._get_cached_file_before_open(path, **kwargs)
 
 
+class VisibilityLagSimpleCache(FakeSimpleCache):
+    def __init__(self, *args, hydration_errors: list[BaseException], **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.hydration_errors = list(hydration_errors)
+        self.hydration_calls = 0
+
+    def _get_cached_file_before_open(self, path: str, **kwargs) -> None:
+        self.hydration_calls += 1
+        if self.hydration_errors:
+            candidate = Path(self.storage[-1]) / self._mapper(self._strip_protocol(path))
+            candidate.write_bytes(b"partial")
+            raise self.hydration_errors.pop(0)
+        return super()._get_cached_file_before_open(path, **kwargs)
+
+
+def listing_visibility_miss() -> EntryNotFoundError:
+    error = EntryNotFoundError.__new__(EntryNotFoundError)
+    Exception.__init__(error, "404 listing visibility lag")
+    return error
+
+
+class ResponseStatusError(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.response = SimpleNamespace(status_code=status_code)
+
+
 class BarrierWriteFile(FakeWriteFile):
     def __enter__(self) -> "BarrierWriteFile":
         self.fs.barrier.wait(timeout=2)
@@ -215,12 +243,14 @@ class FakeHfApi:
         token: str | None,
         private: bool = True,
         paths: list[object] | None = None,
+        paths_sequence: list[list[object]] | None = None,
         bucket_error: BaseException | None = None,
         paths_error: BaseException | None = None,
     ) -> None:
         self.token = token
         self.private = private
         self.paths = paths if paths is not None else [SimpleNamespace(path="object")]
+        self.paths_sequence = list(paths_sequence) if paths_sequence is not None else None
         self.bucket_error = bucket_error
         self.paths_error = paths_error
         self.bucket_calls: list[str] = []
@@ -236,6 +266,10 @@ class FakeHfApi:
         self.paths_calls.append((bucket_id, list(paths)))
         if self.paths_error is not None:
             raise self.paths_error
+        if self.paths_sequence is not None:
+            if not self.paths_sequence:
+                raise AssertionError("paths-info sequence exhausted")
+            return list(self.paths_sequence.pop(0))
         return list(self.paths)
 
 
@@ -259,10 +293,14 @@ class ArtifactStoreTestCase(unittest.TestCase):
         token: str | None = "secret-token",
         private: bool = True,
         paths: list[object] | None = None,
+        paths_sequence: list[list[object]] | None = None,
         api_error: BaseException | None = None,
         paths_error: BaseException | None = None,
         download_error: BaseException | None = None,
         upload_error: BaseException | None = None,
+        hydration_retry_attempts: int = 3,
+        hydration_retry_delay: float = 0.1,
+        sleep=None,
         filesystem_factory_override=None,
     ) -> ArtifactStore:
         def api_factory(**kwargs):
@@ -271,6 +309,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
                 token=kwargs.get("token"),
                 private=private,
                 paths=paths,
+                paths_sequence=paths_sequence,
                 bucket_error=api_error,
                 paths_error=paths_error,
             )
@@ -294,6 +333,9 @@ class ArtifactStoreTestCase(unittest.TestCase):
             prefix=prefix,
             local_dir=self.local_dir,
             token=token,
+            hydration_retry_attempts=hydration_retry_attempts,
+            hydration_retry_delay=hydration_retry_delay,
+            sleep=sleep,
             api_factory=api_factory,
             filesystem_factory=filesystem_factory_override or fs_factory,
         )
@@ -347,6 +389,147 @@ class ArtifactStoreTestCase(unittest.TestCase):
         assert self.fs is not None
         self.assertEqual(self.fs.open_calls, [("buckets/owner/bucket/foo/object.mpk", "rb")])
         self.assertEqual(store.local_candidate("object.mpk").read_bytes(), b"remote")
+
+    def test_l2_listing_visibility_lag_retries_after_exact_presence_recheck(self) -> None:
+        delays: list[float] = []
+        lag_fs: VisibilityLagSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal lag_fs
+            lag_fs = VisibilityLagSimpleCache(
+                self.local_dir,
+                self.remote,
+                hydration_errors=[listing_visibility_miss()],
+            )
+            return lag_fs
+
+        present = [SimpleNamespace(path="foo/object.mpk")]
+        store = self.make_store(
+            paths_sequence=[present, present],
+            hydration_retry_attempts=2,
+            hydration_retry_delay=0.25,
+            sleep=delays.append,
+            filesystem_factory_override=factory,
+        )
+
+        self.assertEqual(store.read("object.mpk"), b"remote")
+        assert self.api is not None
+        self.assertEqual(len(self.api.paths_calls), 2)
+        assert lag_fs is not None
+        self.assertEqual(lag_fs.hydration_calls, 2)
+        self.assertEqual(delays, [0.25])
+        self.assertEqual(store.local_candidate("object.mpk").read_bytes(), b"remote")
+
+    def test_exhausted_listing_visibility_lag_is_fatal_and_cleans_candidate(self) -> None:
+        delays: list[float] = []
+        lag_fs: VisibilityLagSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal lag_fs
+            lag_fs = VisibilityLagSimpleCache(
+                self.local_dir,
+                self.remote,
+                hydration_errors=[
+                    listing_visibility_miss(),
+                    listing_visibility_miss(),
+                    listing_visibility_miss(),
+                ],
+            )
+            return lag_fs
+
+        present = [SimpleNamespace(path="foo/object.mpk")]
+        store = self.make_store(
+            paths_sequence=[present, present, present],
+            hydration_retry_attempts=3,
+            hydration_retry_delay=0.1,
+            sleep=delays.append,
+            filesystem_factory_override=factory,
+        )
+
+        with self.assertRaises(ArtifactStoreRemoteError) as raised:
+            store.read("object.mpk")
+
+        self.assertEqual(str(raised.exception), "failed to download the Hugging Face artifact")
+        assert self.api is not None
+        self.assertEqual(len(self.api.paths_calls), 3)
+        assert lag_fs is not None
+        self.assertEqual(lag_fs.hydration_calls, 3)
+        self.assertEqual(delays, [0.1, 0.1])
+        self.assertFalse(store.local_candidate("object.mpk").exists())
+
+    def test_listing_visibility_lag_retry_stops_if_presence_disappears(self) -> None:
+        delays: list[float] = []
+        lag_fs: VisibilityLagSimpleCache | None = None
+
+        def factory(protocol: str, **kwargs):
+            nonlocal lag_fs
+            lag_fs = VisibilityLagSimpleCache(
+                self.local_dir,
+                self.remote,
+                hydration_errors=[listing_visibility_miss()],
+            )
+            return lag_fs
+
+        present = [SimpleNamespace(path="foo/object.mpk")]
+        store = self.make_store(
+            paths_sequence=[present, []],
+            hydration_retry_attempts=3,
+            sleep=delays.append,
+            filesystem_factory_override=factory,
+        )
+
+        with self.assertRaises(ArtifactStoreRemoteError) as raised:
+            store.read("object.mpk")
+
+        self.assertEqual(str(raised.exception), "failed to download the Hugging Face artifact")
+        assert self.api is not None
+        self.assertEqual(len(self.api.paths_calls), 2)
+        assert lag_fs is not None
+        self.assertEqual(lag_fs.hydration_calls, 1)
+        self.assertEqual(delays, [])
+        self.assertFalse(store.local_candidate("object.mpk").exists())
+
+    def test_nonretryable_hydration_error_does_not_retry(self) -> None:
+        errors = (
+            PermissionError("permission denied"),
+            ResponseStatusError(401),
+            ResponseStatusError(403),
+            ResponseStatusError(429),
+            ResponseStatusError(500),
+            RuntimeError("generic transport failure"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__, detail=str(error)):
+                delays: list[float] = []
+                lag_fs: VisibilityLagSimpleCache | None = None
+
+                def factory(protocol: str, **kwargs):
+                    nonlocal lag_fs
+                    lag_fs = VisibilityLagSimpleCache(
+                        self.local_dir,
+                        self.remote,
+                        hydration_errors=[error],
+                    )
+                    return lag_fs
+
+                store = self.make_store(
+                    hydration_retry_attempts=3,
+                    hydration_retry_delay=0.1,
+                    sleep=delays.append,
+                    filesystem_factory_override=factory,
+                )
+
+                with self.assertRaises(ArtifactStoreRemoteError) as raised:
+                    store.read("object.mpk")
+
+                self.assertEqual(
+                    str(raised.exception), "failed to download the Hugging Face artifact"
+                )
+                assert self.api is not None
+                self.assertEqual(len(self.api.paths_calls), 1)
+                assert lag_fs is not None
+                self.assertEqual(lag_fs.hydration_calls, 1)
+                self.assertEqual(delays, [])
 
     def test_empty_paths_info_is_the_only_remote_miss(self) -> None:
         store = self.make_store(paths=[])
@@ -572,6 +755,22 @@ class ArtifactStoreTestCase(unittest.TestCase):
         with patch.dict(os.environ, {"RAGTIME_CACHE_PATH": "", "RAGTIME_CACHE_DIR": "", "RAGTIME_HF_BUCKET_ID": "wrong"}, clear=False):
             with self.assertRaises(ArtifactStoreConfigurationError):
                 ArtifactStore.from_env()
+
+    def test_hydration_retry_configuration_is_finite_and_bounded(self) -> None:
+        for kwargs in (
+            {"hydration_retry_attempts": 0},
+            {"hydration_retry_attempts": 6},
+            {"hydration_retry_attempts": True},
+            {"hydration_retry_delay": -0.1},
+            {"hydration_retry_delay": 5.1},
+            {"hydration_retry_delay": float("inf")},
+            {"hydration_retry_delay": float("nan")},
+            {"hydration_retry_delay": 10**400},
+            {"sleep": object()},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ArtifactStoreConfigurationError):
+                    self.make_store(**kwargs)
 
     def test_object_keys_reject_traversal_absolute_and_empty_segments(self) -> None:
         store = self.make_store()
