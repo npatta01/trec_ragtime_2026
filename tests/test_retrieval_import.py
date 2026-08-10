@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import duckdb
 
-from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.artifact_store import ArtifactStore, ArtifactValidationError
 from trec_ragtime.local_corpus import LocalCorpusIndex, build_from_parquet
 from trec_ragtime.retrieval_cache import RetrievalArtifactCache
 from trec_ragtime.retrieval_import import (
@@ -252,6 +252,92 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertNotIn("one\x00exact", manifest_text)
         self.assertNotIn("token", manifest_text.lower())
         self.assertEqual(self.store.read_sources[-1], "remote")
+
+    def test_default_empty_prefix_finishes_manifest_and_idempotent_resume(self) -> None:
+        run = self._write_control_run()
+        output = self.root / "import-manifest.json"
+        with patch.dict(
+            os.environ,
+            {
+                "RAGTIME_ARTIFACT_PREFIX": "",
+                "RAGTIME_HF_BUCKET_ID": "owner/private-cache",
+                "RAGTIME_ARTIFACT_CACHE_DIR": str(self.root / "artifact-cache"),
+            },
+            clear=False,
+        ):
+            configured_store = ArtifactStore.from_env()
+        # ArtifactStore.from_env() normalizes its omitted prefix to "".
+        self.assertEqual(configured_store.prefix, "")
+        self.store.prefix = configured_store.prefix
+        self.store.local_dir = self.root / "local-cache"
+
+        first = import_retrieval_run(
+            run,
+            corpus=self.corpus,
+            cache=self.cache,
+            manifest_path=output,
+            base_url="https://organizer.example.test",
+        )
+        first_objects = dict(self.store.objects)
+        output.unlink()
+        second = import_retrieval_run(
+            run,
+            corpus=self.corpus,
+            cache=self.cache,
+            manifest_path=output,
+            base_url="https://organizer.example.test",
+        )
+
+        self.assertEqual(first.imported, 1)
+        self.assertEqual(second.imported, 1)
+        self.assertEqual(self.store.objects, first_objects)
+        self.assertEqual(
+            json.loads(output.read_text(encoding="utf-8"))["destination"],
+            {
+                "bucket_id": "owner/private-cache",
+                "namespace": "ragtime2-2026-v1",
+                "prefix": "",
+            },
+        )
+
+    def test_unsafe_destination_metadata_rejected_before_writes_without_echo(self) -> None:
+        cases = (
+            ("bucket_id", ""),
+            ("bucket_id", "owner/credential"),
+            ("bucket_id", "owner/private?query=sensitive"),
+            ("prefix", "query"),
+            ("prefix", '{"body":"private body"}'),
+            ("prefix", "https://private/path"),
+            ("prefix", "../escape"),
+            ("prefix", "private\nvalue"),
+        )
+        run = self._write_control_run()
+        for index, (field, value) in enumerate(cases):
+            with self.subTest(field=field, value=value):
+                output = self.root / f"unsafe-{index}.json"
+                setattr(self.store, field, value)
+                with patch.object(
+                    self.corpus,
+                    "verify_integrity",
+                    side_effect=AssertionError("corpus must not be opened"),
+                ):
+                    with self.assertRaises(RetrievalImportError) as raised:
+                        import_retrieval_run(
+                            run,
+                            corpus=self.corpus,
+                            cache=self.cache,
+                            manifest_path=output,
+                            base_url="https://organizer.example.test",
+                        )
+                if value:
+                    self.assertNotIn(value, str(raised.exception))
+                self.assertEqual(self.store.objects, {})
+                self.assertFalse(output.exists())
+                setattr(
+                    self.store,
+                    field,
+                    "owner/private-cache" if field == "bucket_id" else "retrieval-v1",
+                )
 
     def test_c_imports_facet_hit_missing_from_fused_topics_and_is_idempotent(self) -> None:
         run = self._write_baseline_run()

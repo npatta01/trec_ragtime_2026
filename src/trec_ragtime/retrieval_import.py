@@ -26,7 +26,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .artifact_store import ArtifactStore
-from .cache import DEFAULT_CACHE_NAMESPACE
+from .cache import DEFAULT_CACHE_NAMESPACE, sanitized_cache_configuration
 from .huggingface import (
     DEFAULT_HF_DATASET,
     DEFAULT_HF_MT_SPLITS,
@@ -541,20 +541,26 @@ def _preflight_manifest_path(path: Path, sources: Sequence[_SourceFile]) -> Path
 
 
 def _safe_cache_metadata(cache: RetrievalArtifactCache) -> dict[str, str]:
-    store = cache.store
-    output: dict[str, str] = {}
-    for field in ("namespace", "bucket_id", "prefix"):
-        value = getattr(store, field, None)
-        if value is None:
-            continue
-        if not isinstance(value, str) or not value or any(
-            character.isspace() or ord(character) < 32 for character in value
-        ):
-            raise RetrievalImportError("artifact destination metadata is unsafe")
-        if any(character in value for character in "?#\\=@{}[]<>\"';&:"):
-            raise RetrievalImportError("artifact destination metadata is unsafe")
-        output[field] = value
-    return output
+    try:
+        store_namespace = getattr(cache.store, "namespace", None)
+    except Exception:
+        raise RetrievalImportError("artifact destination metadata is unsafe") from None
+    if store_namespace != DEFAULT_CACHE_NAMESPACE:
+        raise RetrievalImportError("artifact destination metadata is unsafe")
+    try:
+        output = sanitized_cache_configuration(store_namespace, cache.store)
+    except (TypeError, ValueError):
+        raise RetrievalImportError("artifact destination metadata is unsafe") from None
+    if output.get("namespace") != DEFAULT_CACHE_NAMESPACE:
+        raise RetrievalImportError("artifact destination metadata is unsafe")
+    bucket_id = output.get("bucket_id")
+    if not isinstance(bucket_id, str) or not bucket_id:
+        raise RetrievalImportError("artifact destination metadata is unsafe")
+    return {
+        key: output[key]
+        for key in ("namespace", "bucket_id", "prefix")
+        if key in output and isinstance(output[key], str)
+    }
 
 
 def _write_manifest(path: Path, payload: Mapping[str, Any], *, sources: Sequence[_SourceFile]) -> None:
@@ -786,6 +792,7 @@ def import_retrieval_run(
     if not isinstance(cache, RetrievalArtifactCache):
         raise TypeError("cache must be a RetrievalArtifactCache")
     _validate_cache_namespace(cache)
+    destination_metadata = _safe_cache_metadata(cache)
     run = _run_directory(run_dir)
     base_url = _validate_base_url(base_url)
     manifest_source = _source_file("manifest.json", run / "manifest.json")
@@ -843,7 +850,7 @@ def import_retrieval_run(
         "run_schema": schema,
         "source": {"files": summary.source_files},
         "corpus": {key: value for key, value in corpus_identity.items() if key != "path"},
-        "destination": _safe_cache_metadata(cache),
+        "destination": destination_metadata,
         "counts": summary.counts,
         "skipped_reasons": summary.skipped_reasons,
         "objects": {"count": len(summary.object_keys), "keys": list(summary.object_keys)},
