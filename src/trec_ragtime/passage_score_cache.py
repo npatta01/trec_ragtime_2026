@@ -404,7 +404,7 @@ class PassageScoreCache:
             raise PassageScoreArtifactValidationError("artifact query hash does not match request")
 
     def _configured_scorer(self, scorer: PassageScorer | None) -> PassageScorer:
-        selected = scorer or self._scorer
+        selected = scorer if scorer is not None else self._scorer
         if selected is None:
             raise TypeError("a scorer is required when the cache was configured by fingerprint")
         try:
@@ -433,7 +433,6 @@ class PassageScoreCache:
         )
         if not requested:
             return {}
-        selected_scorer = self._configured_scorer(scorer)
         key = self.object_key(query)
         stored = self._store.read_validated(key, self._decoder(query))
         if stored is not None:
@@ -449,7 +448,9 @@ class PassageScoreCache:
             prior_scores = {}
 
         missing = tuple(passage for content_hash, passage in requested if content_hash not in prior_scores)
+        result_scores = dict(prior_scores)
         if missing:
+            selected_scorer = self._configured_scorer(scorer)
             response = selected_scorer.score(query, missing)
             new_scores = validate_passage_scores(missing, response)
             merged = dict(prior_scores)
@@ -471,13 +472,10 @@ class PassageScoreCache:
             decoded = decode_score_envelope(encoded)
             self._validate_for_request(decoded, query_hash(query))
             self._store.write(key, encoded)
+            result_scores = sorted_scores
 
         return {
-            content_hash: (
-                prior_scores[content_hash]
-                if content_hash in prior_scores
-                else new_scores[content_hash]
-            )
+            content_hash: result_scores[content_hash]
             for content_hash, _ in requested
         }
 

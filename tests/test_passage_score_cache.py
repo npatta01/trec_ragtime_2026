@@ -80,6 +80,11 @@ class RecordingScorer:
         return {passage.content_hash: float(index + 1) for index, passage in enumerate(passages)}
 
 
+class FalseyRecordingScorer(RecordingScorer):
+    def __bool__(self) -> bool:
+        return False
+
+
 def _passage(
     text: str,
     *,
@@ -261,6 +266,61 @@ print(encode_score_envelope(envelope).hex())
         self.assertEqual(result, {second.content_hash: 2.0})
         self.assertEqual(warm_scorer.calls, [])
         self.assertEqual(store.write_calls, [])
+
+    def test_fingerprint_only_cache_returns_warm_hit_without_a_scorer(self) -> None:
+        store = FakeArtifactStore()
+        scorer = RecordingScorer()
+        first = _passage("first")
+        second = _passage("second", document_id="second")
+        _cache(store, scorer).score("query", (first, second))
+        store.write_calls.clear()
+
+        fingerprint_only = PassageScoreCache(
+            store,
+            scorer.fingerprint,
+            "chunker-v1",
+            "canonical",
+            FakeArtifactStore.ArtifactValidationError,
+        )
+        result = fingerprint_only.score("query", (second,))
+
+        self.assertEqual(result, {second.content_hash: 2.0})
+        self.assertEqual(len(store.read_validated_calls), 2)
+        self.assertEqual(store.write_calls, [])
+
+    def test_fingerprint_only_cache_miss_requires_scorer_without_writing(self) -> None:
+        store = FakeArtifactStore()
+        fingerprint_only = PassageScoreCache(
+            store,
+            "model-v1",
+            "chunker-v1",
+            "canonical",
+            FakeArtifactStore.ArtifactValidationError,
+        )
+
+        with self.assertRaisesRegex(TypeError, "scorer is required"):
+            fingerprint_only.score("query", (_passage("missing"),))
+
+        self.assertEqual(len(store.read_validated_calls), 1)
+        self.assertEqual(store.write_calls, [])
+
+    def test_falsey_scorer_override_is_honored_on_a_cache_miss(self) -> None:
+        store = FakeArtifactStore()
+        scorer = FalseyRecordingScorer()
+        fingerprint_only = PassageScoreCache(
+            store,
+            scorer.fingerprint,
+            "chunker-v1",
+            "canonical",
+            FakeArtifactStore.ArtifactValidationError,
+        )
+        passage = _passage("falsey")
+
+        result = fingerprint_only.score("query", (passage,), scorer)
+
+        self.assertEqual(result, {passage.content_hash: 1.0})
+        self.assertEqual(scorer.calls, [("query", (passage.content_hash,))])
+        self.assertEqual(len(store.write_calls), 1)
 
     def test_overlapping_query_sets_reuse_one_object_and_rewrite_complete_union(self) -> None:
         store = FakeArtifactStore()
