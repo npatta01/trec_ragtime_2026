@@ -35,6 +35,40 @@ class FixturePairLength:
 
 
 class PassageContractTests(unittest.TestCase):
+    def test_benchmark_records_only_compact_passage_fields(self) -> None:
+        from scripts.benchmark_passage_chunking import record_passages
+
+        passage = Passage(
+            document_id="doc-1",
+            representation="canonical",
+            language="eng",
+            text="One.",
+            start_char=0,
+            end_char=4,
+            content_hash=bytes.fromhex(
+                "70277bfc409b502132d7a48b2a3b386294264b31f7bf024a5fb0cafabb8ac122"
+            ),
+            boundary="sentence",
+        )
+
+        self.assertEqual(
+            record_passages((passage,)),
+            [
+                {
+                    "boundary": "sentence",
+                    "content_hash": (
+                        "70277bfc409b502132d7a48b2a3b386294264b31f7bf024a5fb0cafabb8ac122"
+                    ),
+                    "document_id": "doc-1",
+                    "end_char": 4,
+                    "language": "eng",
+                    "representation": "canonical",
+                    "start_char": 0,
+                    "text": "One.",
+                }
+            ],
+        )
+
     def test_package_exports_compact_passage_api(self) -> None:
         namespace: dict[str, object] = {}
         exec(

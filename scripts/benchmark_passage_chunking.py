@@ -6,20 +6,15 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import time
-import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-
-from langchain_text_splitters.character import (
-    CharacterTextSplitter,
-    RecursiveCharacterTextSplitter,
-)
-from langchain_text_splitters.spacy import SpacyTextSplitter
+from unittest.mock import patch
 
 from trec_ragtime.passages import (
-    ChunkerConfig,
-    LangChainPassageChunker,
     Passage,
+    PassageChunker,
+    sha256_bytes,
     validate_passages,
 )
 
@@ -32,12 +27,35 @@ PACKAGE_NAMES = (
     "sentence-transformers",
     "msgspec",
 )
+PIPELINES_BY_LANGUAGE = {
+    "eng": "en_core_web_sm",
+    "spa": "es_core_news_sm",
+    "rus": "ru_core_news_sm",
+    "zho": "zh_core_web_sm",
+}
+
+
+class FixturePairLength:
+    """Offline pair-length seam matching the fixture contract."""
+
+    passage_length_function = staticmethod(lambda text: len(text.split()))
+
+    def __init__(self, case: dict[str, Any]) -> None:
+        self.fingerprint = f"benchmark-pair-{case['name']}"
+        self.max_length = int(case["max_length"])
+        self.max_passage_length = int(case["max_passage_length"])
+
+    def __call__(self, text: str) -> int:
+        return self.passage_length_function(text) + 2
 
 
 class PairAwareCjkLength:
+    """Fake exact pair budget used without loading a model or tokenizer."""
+
     fingerprint = "benchmark-fake-cross-encoder-pair-v1"
     passage_length_function = len
     max_passage_length = 501
+    max_length = 512
 
     def __call__(self, text: str) -> int:
         return len(text) + 11
@@ -48,8 +66,24 @@ def package_versions() -> dict[str, str]:
 
 
 def required_model_versions(cases: list[dict[str, Any]]) -> dict[str, str]:
+    languages = {str(case["language"]) for case in cases}
+    expected_languages = set(PIPELINES_BY_LANGUAGE)
+    if languages != expected_languages:
+        raise AssertionError(
+            "fixture must cover exactly the four pinned languages: "
+            f"{sorted(expected_languages)!r}"
+        )
+    for case in cases:
+        expected_pipeline = PIPELINES_BY_LANGUAGE[str(case["language"])]
+        if case.get("pipeline_name") != expected_pipeline:
+            raise AssertionError(
+                f"{case['name']}: fixture pipeline does not match its language"
+            )
+
     versions: dict[str, str] = {}
-    for pipeline_name in sorted({case["pipeline_name"] for case in cases}):
+    for pipeline_name in sorted(
+        {str(case["pipeline_name"]) for case in cases}
+    ):
         distribution_name = pipeline_name.replace("_", "-")
         try:
             version = importlib.metadata.version(distribution_name)
@@ -62,138 +96,110 @@ def required_model_versions(cases: list[dict[str, Any]]) -> dict[str, str]:
     return versions
 
 
-def _splitter_documents(splitter: Any, parent_text: str, stage: str) -> list[Any]:
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=r"\[W108\].*")
-        documents = splitter.create_documents([parent_text])
-    cursor = 0
-    for document in documents:
-        content = document.page_content
-        start = document.metadata.get("start_index")
-        if not isinstance(start, int) or isinstance(start, bool) or start != cursor:
-            raise AssertionError(f"{stage}: invalid start_index {start!r}")
-        end = start + len(content)
-        if parent_text[start:end] != content:
-            raise AssertionError(f"{stage}: non-source slice")
-        cursor = end
-    if (
-        cursor != len(parent_text)
-        or "".join(d.page_content for d in documents) != parent_text
-    ):
-        raise AssertionError(f"{stage}: incomplete reconstruction")
-    return documents
-
-
-def verify_splitter_levels(case: dict[str, Any]) -> None:
-    if case.get("length_function_mode") != "boundary-only":
-        raise AssertionError(
-            f"{case['name']}: fixtures must explicitly declare boundary-only length"
-        )
-    selected_text = case["selected_text"]
-    chunk_size = case["chunk_size"]
-    paragraph_splitter = CharacterTextSplitter(
-        separator=r"(?:\r?\n){2,}",
-        is_separator_regex=True,
-        keep_separator="end",
-        strip_whitespace=False,
-        chunk_overlap=0,
-        add_start_index=True,
-        chunk_size=chunk_size,
-        length_function=len,
-    )
-    paragraph_documents = _splitter_documents(
-        paragraph_splitter, selected_text, "paragraph"
-    )
-    sentence_splitter = SpacyTextSplitter(
-        separator="",
-        pipeline=case["pipeline_name"],
-        strip_whitespace=False,
-        chunk_overlap=0,
-        add_start_index=True,
-        chunk_size=chunk_size,
-        length_function=len,
-    )
-    for paragraph in paragraph_documents:
-        if len(paragraph.page_content) <= chunk_size:
-            continue
-        sentence_documents = _splitter_documents(
-            sentence_splitter, paragraph.page_content, "sentence"
-        )
-        recursive_splitter = RecursiveCharacterTextSplitter(
-            separators=[" ", ""],
-            keep_separator="end",
-            strip_whitespace=False,
-            chunk_overlap=0,
-            add_start_index=True,
-            chunk_size=chunk_size,
-            length_function=len,
-        )
-        for sentence in sentence_documents:
-            if len(sentence.page_content) > chunk_size:
-                _splitter_documents(
-                    recursive_splitter, sentence.page_content, "recursive sentence"
-                )
+def assert_benchmark_invariants(
+    selected_text: str,
+    passages: tuple[Passage, ...],
+    pair_length: Callable[[str], int],
+    max_length: int,
+) -> None:
+    validate_passages(selected_text, passages)
+    covered: set[int] = set()
+    for passage in passages:
+        assert selected_text[passage.start_char : passage.end_char] == passage.text
+        assert passage.content_hash == sha256_bytes(passage.text)
+        assert pair_length(passage.text) <= max_length
+        covered.update(range(passage.start_char, passage.end_char))
+    assert covered == set(range(len(selected_text)))
 
 
 def record_passages(passages: tuple[Passage, ...]) -> list[dict[str, Any]]:
     return [
         {
-            "chunk_index": passage.chunk_index,
+            "boundary": passage.boundary,
             "content_hash": passage.content_hash.hex(),
+            "document_id": passage.document_id,
             "end_char": passage.end_char,
-            "next_passage_id": (
-                None
-                if passage.next_passage_id is None
-                else passage.next_passage_id.hex()
-            ),
-            "passage_id": passage.passage_id.hex(),
-            "previous_passage_id": (
-                None
-                if passage.previous_passage_id is None
-                else passage.previous_passage_id.hex()
-            ),
-            "representation_hash": passage.representation_hash.hex(),
-            "source_content_hash": passage.source_content_hash.hex(),
+            "language": passage.language,
+            "representation": passage.representation,
             "start_char": passage.start_char,
             "text": passage.text,
-            "boundary": passage.boundary,
         }
         for passage in passages
     ]
+
+
+def assert_fixture_expectations(
+    case: dict[str, Any], passages: tuple[Passage, ...]
+) -> None:
+    actual_spans = [(passage.start_char, passage.end_char) for passage in passages]
+    expected_spans = [tuple(span) for span in case["expected_spans"]]
+    if actual_spans != expected_spans:
+        raise AssertionError(f"{case['name']}: literal fixture span mismatch")
+
+    actual_boundaries = [passage.boundary for passage in passages]
+    if actual_boundaries != case["expected_boundaries"]:
+        raise AssertionError(f"{case['name']}: literal fixture boundary mismatch")
+
+    if case["name"] == "overlap":
+        expected_overlaps = [tuple(span) for span in case["sentence_spans"]]
+        actual_overlaps: list[tuple[int, int]] = []
+        selected_text = str(case["selected_text"])
+        for first, second in zip(passages, passages[1:]):
+            start = max(first.start_char, second.start_char)
+            end = min(first.end_char, second.end_char)
+            if start >= end:
+                raise AssertionError("overlap fixture did not produce an overlap")
+            overlap = (start, end)
+            actual_overlaps.append(overlap)
+            if overlap not in expected_overlaps:
+                raise AssertionError(
+                    f"overlap fixture intersects at non-sentence span {overlap!r}"
+                )
+            sentence_index = expected_overlaps.index(overlap)
+            if selected_text[start:end] != case["sentences"][sentence_index]:
+                raise AssertionError("overlap fixture changed a sentence unit")
+        if actual_overlaps != expected_overlaps:
+            raise AssertionError(
+                f"overlap fixture mismatch: {actual_overlaps!r} != {expected_overlaps!r}"
+            )
 
 
 def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
     records: list[bytes] = []
     passage_count = 0
     started = time.perf_counter()
-    chunkers: dict[tuple[int, str], LangChainPassageChunker] = {}
+    chunkers: dict[tuple[str, str, int, int, int], PassageChunker] = {}
     for case in cases:
-        key = (case["chunk_size"], case["pipeline_name"])
+        key = (
+            str(case["language"]),
+            str(case["pipeline_name"]),
+            int(case["max_length"]),
+            int(case["max_passage_length"]),
+            int(case["overlap_tokens"]),
+        )
+        pair_length = FixturePairLength(case)
         chunker = chunkers.setdefault(
             key,
-            LangChainPassageChunker(
-                ChunkerConfig(
-                    chunk_size=case["chunk_size"],
-                    length_function=len,
-                    pipeline_name=case["pipeline_name"],
-                )
+            PassageChunker(
+                pair_length,
+                overlap_tokens=int(case["overlap_tokens"]),
             ),
         )
-        verify_splitter_levels(case)
+        selected_text = str(case["selected_text"])
         passages = chunker.chunk(
-            document_id=case["document_id"],
-            canonical_text=case["canonical_text"],
-            selected_text=case["selected_text"],
-            representation=case["representation"],
-            language=case["language"],
+            document_id=str(case["document_id"]),
+            canonical_text=str(case["canonical_text"]),
+            selected_text=selected_text,
+            representation=str(case["representation"]),  # type: ignore[arg-type]
+            language=str(case["language"]),
         )
-        validate_passages(case["selected_text"], passages)
-        if [(p.start_char, p.end_char) for p in passages] != [
-            tuple(span) for span in case["expected_spans"]
-        ]:
-            raise AssertionError(f"{case['name']}: literal fixture span mismatch")
-        if any(len(p.text) > case["chunk_size"] for p in passages):
-            raise AssertionError(f"{case['name']}: configured ceiling exceeded")
+        assert_benchmark_invariants(
+            selected_text,
+            passages,
+            pair_length,
+            int(case["max_length"]),
+        )
+        assert_fixture_expectations(case, passages)
         records.append(
             json.dumps(
                 {
@@ -209,41 +215,99 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
     return records, passage_count, time.perf_counter() - started
 
 
+class _FakeDocument:
+    def __init__(self, text: str, start_char: int) -> None:
+        self.page_content = text
+        self.metadata = {"start_index": start_char}
+
+
+class _FakeSentence:
+    def __init__(self, text: str) -> None:
+        self.start_char = 0
+        self.text_with_ws = text
+
+
+class _FakeTokenizerDocument:
+    def __init__(self, text: str) -> None:
+        self.sents = (_FakeSentence(text),)
+
+
+class _PinnedTokenizerSplitter:
+    pipelines: list[str] = []
+
+    def __init__(self, *, pipeline: str, **_: Any) -> None:
+        self.pipelines.append(pipeline)
+
+    def _tokenizer(self, text: str) -> _FakeTokenizerDocument:
+        return _FakeTokenizerDocument(text)
+
+    def create_documents(self, texts: list[str]) -> list[_FakeDocument]:
+        return [_FakeDocument(texts[0], 0)]
+
+
+class _FakeRecursiveSplitter:
+    def __init__(self, *, chunk_size: int, **_: Any) -> None:
+        self.chunk_size = chunk_size
+
+    def create_documents(self, texts: list[str]) -> list[_FakeDocument]:
+        text = texts[0]
+        return [
+            _FakeDocument(text[start : start + self.chunk_size], start)
+            for start in range(0, len(text), self.chunk_size)
+        ]
+
+
 def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
+    import spacy
+    import trec_ragtime.passages as passages_module
+
     text = "中" * 502
-    length_function = PairAwareCjkLength()
-    chunk_size = 512
-    if len(text) > chunk_size or length_function(text) <= chunk_size:
+    pair_length = PairAwareCjkLength()
+    if len(text) > pair_length.max_length or pair_length(text) <= pair_length.max_length:
         raise AssertionError(
             "pair-aware fixture must fit by characters but exceed by pairs"
         )
-    chunker = LangChainPassageChunker(
-        ChunkerConfig(
-            chunk_size=chunk_size,
-            length_function=length_function,
-            pipeline_name="zh_core_web_sm",
-        )
-    )
-    passages = chunker.chunk(
-        document_id="benchmark-pair-aware-cjk",
-        canonical_text=text,
-        selected_text=text,
-        representation="canonical",
-        language="zho",
-    )
-    validate_passages(text, passages)
-    if not all(length_function(passage.text) <= chunk_size for passage in passages):
-        raise AssertionError("pair-aware fixture exceeded its configured ceiling")
-    if not all(
-        passage.boundary == "oversized_sentence_fallback" for passage in passages
+
+    _PinnedTokenizerSplitter.pipelines = []
+    model_loader_calls: list[str] = []
+    splitter_loader_calls = 0
+
+    def fake_splitter_loader() -> tuple[type[Any], type[Any]]:
+        nonlocal splitter_loader_calls
+        splitter_loader_calls += 1
+        return _PinnedTokenizerSplitter, _FakeRecursiveSplitter
+
+    with (
+        patch.object(
+            passages_module,
+            "_load_splitters",
+            side_effect=fake_splitter_loader,
+        ),
+        patch.object(
+            spacy,
+            "load",
+            side_effect=lambda pipeline: model_loader_calls.append(pipeline),
+        ),
     ):
-        raise AssertionError("pair-aware fixture did not use sentence fallback")
+        chunker = PassageChunker(pair_length, overlap_tokens=0)
+        passages = chunker.chunk(
+            document_id="benchmark-pair-aware-cjk",
+            canonical_text=text,
+            selected_text=text,
+            representation="canonical",
+            language="zho",
+        )
+
+    assert _PinnedTokenizerSplitter.pipelines == ["zh_core_web_sm"]
+    assert splitter_loader_calls == 2
+    assert model_loader_calls == []
+    assert_benchmark_invariants(text, passages, pair_length, pair_length.max_length)
+    assert all(passage.boundary == "oversized_sentence" for passage in passages)
     records = tuple(
         (passage.start_char, passage.end_char, passage.text) for passage in passages
     )
     expected = ((0, 501, text[:501]), (501, 502, text[501:]))
-    if records != expected:
-        raise AssertionError(f"pair-aware fixture under-packed: {records!r}")
+    assert records == expected, f"pair-aware fixture under-packed: {records!r}"
     return records
 
 
@@ -263,14 +327,23 @@ def main() -> int:
             "pair-aware benchmark runs produced different passage records"
         )
 
+    oversized_cases = [
+        case for case in cases if case["name"] == "oversized_sentence"
+    ]
+    if len(oversized_cases) != 1:
+        raise AssertionError("fixture must contain one oversized_sentence case")
+
     print("package_versions=" + json.dumps(package_versions(), sort_keys=True))
     print("spacy_model_versions=" + json.dumps(models, sort_keys=True))
     print(f"fixture_cases={len(cases)}")
-    print(
-        "fixture_length_function=explicit builtin len (boundary-only; not model-safe)"
-    )
     print(f"passes={len(cases) * 2}")
     print("failures=0")
+    print("full_source_coverage=true")
+    print("sentence_only_overlap=true")
+    print("oversized_sentence_rcts_only=true")
+    print("pair_ceiling=true")
+    print("deterministic_records=true")
+    print("pair_aware_model_loader_calls=0")
     print(f"startup_seconds={startup_seconds:.6f}")
     print(f"run1_seconds={first_seconds:.6f}")
     print(f"run2_seconds={second_seconds:.6f}")
@@ -279,7 +352,6 @@ def main() -> int:
     print(f"passages_per_second={first_passages / first_seconds:.3f}")
     print("pair_aware_fake_ceiling=true")
     print(f"pair_aware_passages={len(first_pair_record)}")
-    print("deterministic_records=true")
     return 0
 
 
