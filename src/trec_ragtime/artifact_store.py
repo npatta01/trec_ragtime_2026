@@ -387,10 +387,28 @@ class ArtifactStore:
 
     @staticmethod
     def _is_listing_visibility_miss(error: BaseException) -> bool:
-        if isinstance(error, (EntryNotFoundError, FileNotFoundError)):
-            return True
         response = getattr(error, "response", None)
-        return getattr(response, "status_code", None) == 404
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(error, "status_code", None)
+        if status is not None:
+            return status == 404
+        return isinstance(error, (EntryNotFoundError, FileNotFoundError))
+
+    @staticmethod
+    def _invalidate_target_cache(filesystem: Any, path: str) -> None:
+        target = getattr(filesystem, "fs", None)
+        invalidate = getattr(target, "invalidate_cache", None)
+        if not callable(invalidate):
+            raise ArtifactStoreRemoteError(
+                "artifact target cache invalidation is unavailable"
+            )
+        try:
+            invalidate(path)
+        except Exception:
+            raise ArtifactStoreRemoteError(
+                "failed to invalidate the artifact target cache"
+            ) from None
 
     def _read_remote(self, object_key: str) -> bytes | None:
         full_key = self._full_object_key(object_key)
@@ -418,6 +436,7 @@ class ArtifactStore:
                         exhausted = attempt + 1 >= self._hydration_retry_attempts
                         if not retryable or exhausted:
                             raise
+                        self._invalidate_target_cache(filesystem, stripped_path)
                         if not self._get_paths_info(full_key):
                             raise ArtifactStoreRemoteError(
                                 "artifact path disappeared during hydration retry"

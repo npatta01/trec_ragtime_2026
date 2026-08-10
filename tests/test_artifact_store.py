@@ -73,6 +73,8 @@ class FakeSimpleCache:
         self.fail_download = fail_download
         self.fail_upload = fail_upload
         self.open_calls: list[tuple[str, str]] = []
+        self.fs = self
+        self.invalidate_calls: list[str | None] = []
 
     @staticmethod
     def _strip_protocol(path: str) -> str:
@@ -80,6 +82,9 @@ class FakeSimpleCache:
 
     def _mapper(self, path: str) -> str:
         return hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+    def invalidate_cache(self, path: str | None = None) -> None:
+        self.invalidate_calls.append(path)
 
     def _get_cached_file_before_open(self, path: str, **kwargs) -> None:
         self.open_calls.append((path, "rb"))
@@ -147,6 +152,71 @@ class ResponseStatusError(Exception):
     def __init__(self, status_code: int) -> None:
         super().__init__(f"HTTP {status_code}")
         self.response = SimpleNamespace(status_code=status_code)
+
+
+def status_entry_not_found(status_code: int) -> EntryNotFoundError:
+    error = EntryNotFoundError.__new__(EntryNotFoundError)
+    Exception.__init__(error, f"HTTP {status_code} entry not found")
+    error.response = SimpleNamespace(status_code=status_code)
+    return error
+
+
+class StatusFileNotFoundError(FileNotFoundError):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code} file not found")
+        self.response = SimpleNamespace(status_code=status_code)
+
+
+class StaleListingTarget(AbstractFileSystem):
+    """Target with a cached sibling-only listing until exact invalidation."""
+
+    protocol = "hf"
+
+    def __init__(self, remote: dict[str, bytes]) -> None:
+        self.remote = remote
+        self.dircache: dict[str, list[dict[str, str]]] = {}
+        self.list_calls: list[str] = []
+        self.invalidate_calls: list[str | None] = []
+
+    @classmethod
+    def _strip_protocol(cls, path: str) -> str:
+        return path.removeprefix("hf://")
+
+    def _entries(self, parent: str) -> list[dict[str, str]]:
+        remote_parent = parent.removeprefix("buckets/")
+        return [
+            {"name": f"{parent}/{key.rsplit('/', 1)[-1]}", "type": "file"}
+            for key in sorted(self.remote)
+            if key.rsplit("/", 1)[0] == remote_parent
+        ]
+
+    def ls(self, path: str, detail: bool = True, **kwargs):
+        parent = self._strip_protocol(path).rstrip("/")
+        if parent not in self.dircache:
+            self.list_calls.append(parent)
+            entries = self._entries(parent)
+            if len(self.list_calls) == 1:
+                entries = [entry for entry in entries if not entry["name"].endswith("/object.mpk")]
+            self.dircache[parent] = entries
+        entries = self.dircache[parent]
+        return entries if detail else [entry["name"] for entry in entries]
+
+    def invalidate_cache(self, path: str | None = None) -> None:
+        self.invalidate_calls.append(path)
+        if path is None:
+            self.dircache.clear()
+            return
+        stripped = self._strip_protocol(path).rstrip("/")
+        self.dircache.pop(stripped.rsplit("/", 1)[0], None)
+
+    def get_file(self, rpath: str, lpath: str, **kwargs) -> None:
+        path = self._strip_protocol(rpath).rstrip("/")
+        parent = path.rsplit("/", 1)[0]
+        names = {entry["name"] for entry in self.ls(parent, detail=True)}
+        if path not in names:
+            raise listing_visibility_miss()
+        key = path.removeprefix("buckets/")
+        Path(lpath).write_bytes(self.remote[key])
 
 
 class BarrierWriteFile(FakeWriteFile):
@@ -420,6 +490,46 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(delays, [0.25])
         self.assertEqual(store.local_candidate("object.mpk").read_bytes(), b"remote")
 
+    def test_l2_retry_invalidates_stale_target_parent_listing_and_later_read_is_clean(self) -> None:
+        self.remote["owner/bucket/foo/sibling.mpk"] = b"sibling"
+        target: StaleListingTarget | None = None
+        delays: list[float] = []
+
+        def factory(protocol: str, **kwargs):
+            nonlocal target
+            self.assertEqual(protocol, "simplecache")
+            target = StaleListingTarget(self.remote)
+            target.dircache["buckets/owner/bucket/other"] = [
+                {"name": "buckets/owner/bucket/other/keep.mpk", "type": "file"}
+            ]
+            return fsspec.filesystem(
+                "simplecache",
+                fs=target,
+                cache_storage=str(self.local_dir),
+            )
+
+        present = [SimpleNamespace(path="foo/object.mpk")]
+        store = self.make_store(
+            paths_sequence=[present, present, present],
+            hydration_retry_attempts=2,
+            hydration_retry_delay=0.25,
+            sleep=delays.append,
+            filesystem_factory_override=factory,
+        )
+
+        self.assertEqual(store.read("object.mpk"), b"remote")
+        assert target is not None
+        parent = "buckets/owner/bucket/foo"
+        exact_path = f"{parent}/object.mpk"
+        self.assertEqual(target.list_calls, [parent, parent])
+        self.assertEqual(target.invalidate_calls, [exact_path])
+        self.assertIn("buckets/owner/bucket/other", target.dircache)
+        self.assertEqual(delays, [0.25])
+
+        store.evict_local("object.mpk")
+        self.assertEqual(store.read("sibling.mpk"), b"sibling")
+        self.assertEqual(target.list_calls, [parent, parent])
+
     def test_exhausted_listing_visibility_lag_is_fatal_and_cleans_candidate(self) -> None:
         delays: list[float] = []
         lag_fs: VisibilityLagSimpleCache | None = None
@@ -496,6 +606,14 @@ class ArtifactStoreTestCase(unittest.TestCase):
             ResponseStatusError(403),
             ResponseStatusError(429),
             ResponseStatusError(500),
+            status_entry_not_found(401),
+            status_entry_not_found(403),
+            status_entry_not_found(429),
+            status_entry_not_found(500),
+            StatusFileNotFoundError(401),
+            StatusFileNotFoundError(403),
+            StatusFileNotFoundError(429),
+            StatusFileNotFoundError(500),
             RuntimeError("generic transport failure"),
         )
         for error in errors:
@@ -518,6 +636,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
                     sleep=delays.append,
                     filesystem_factory_override=factory,
                 )
+                store.evict_local("object.mpk")
 
                 with self.assertRaises(ArtifactStoreRemoteError) as raised:
                     store.read("object.mpk")
@@ -530,6 +649,15 @@ class ArtifactStoreTestCase(unittest.TestCase):
                 assert lag_fs is not None
                 self.assertEqual(lag_fs.hydration_calls, 1)
                 self.assertEqual(delays, [])
+
+    def test_status_404_not_found_errors_are_retryable(self) -> None:
+        for error in (
+            ResponseStatusError(404),
+            status_entry_not_found(404),
+            StatusFileNotFoundError(404),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.assertTrue(ArtifactStore._is_listing_visibility_miss(error))
 
     def test_empty_paths_info_is_the_only_remote_miss(self) -> None:
         store = self.make_store(paths=[])
