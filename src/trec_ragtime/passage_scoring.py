@@ -29,6 +29,7 @@ DEFAULT_QUERY_POLICY = "literal-v1"
 _HASH_LENGTH = 32
 _FINGERPRINT_PREFIX = "local-cross-encoder-v2/"
 _PAIR_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-pair-length-v1/"
+_PASSAGE_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-passage-length-v1/"
 _RUNTIME_DISTRIBUTIONS = (
     ("sentence_transformers_version", "sentence-transformers"),
     ("transformers_version", "transformers"),
@@ -392,10 +393,10 @@ def _default_tokenizer_loader(config: LocalCrossEncoderConfig) -> Any:
 
 
 def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
-    """Load the pinned local model and assign its explicitly pinned tokenizer."""
+    """Load a pinned local model with its explicitly pinned tokenizer module."""
 
-    tokenizer = _default_tokenizer_loader(config)
     from sentence_transformers import CrossEncoder
+    from sentence_transformers.sentence_transformer.modules import Transformer
     import torch
 
     dtype = {
@@ -403,19 +404,30 @@ def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[config.effective_precision]
-    model = CrossEncoder(
+    transformer = Transformer(
         config.model_name,
-        revision=config.revision,
-        device=config.effective_device,
-        max_length=config.max_length,
-        model_kwargs={"torch_dtype": dtype},
+        transformer_task="sequence-classification",
+        model_kwargs={
+            "revision": config.revision,
+            "torch_dtype": dtype,
+        },
+        processor_kwargs={
+            "revision": config.tokenizer_revision,
+            "model_max_length": config.max_length,
+        },
+        config_kwargs={"revision": config.revision},
+        max_seq_length=config.max_length,
+        tokenizer_name_or_path=config.tokenizer_name,
     )
-    try:
-        model.tokenizer = tokenizer
-    except Exception as error:
+    model = CrossEncoder(
+        modules=[transformer],
+        device=config.effective_device,
+    )
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None or not callable(tokenizer):
         raise PassageScoringError(
-            "loaded CrossEncoder does not accept the pinned tokenizer"
-        ) from error
+            "loaded CrossEncoder does not expose its pinned tokenizer"
+        )
     return model, tokenizer
 
 
@@ -476,6 +488,39 @@ def _token_length(encoded: object) -> int:
     return length
 
 
+class _PassageLengthFunction:
+    """Stable additive passage-length view over one pair-length callable."""
+
+    __slots__ = ("_owner", "_fingerprint")
+
+    def __init__(self, owner: "CrossEncoderPairLengthFunction") -> None:
+        material = msgspec.msgpack.encode(
+            (
+                "cross-encoder-passage-length-v1",
+                owner.fingerprint,
+            )
+        )
+        self._owner = owner
+        self._fingerprint = (
+            _PASSAGE_LENGTH_FINGERPRINT_PREFIX + hashlib.sha256(material).hexdigest()
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        """Return the stable identity for the additive splitter callable."""
+
+        return self._fingerprint
+
+    @property
+    def length_function_fingerprint(self) -> str:
+        """Alias usable as a chunker's length-function fingerprint."""
+
+        return self._fingerprint
+
+    def __call__(self, passage: str) -> int:
+        return self._owner._passage_length(passage)
+
+
 class CrossEncoderPairLengthFunction:
     """Lazily count complete pinned-tokenizer tokens for one formatted query."""
 
@@ -486,6 +531,8 @@ class CrossEncoderPairLengthFunction:
         "_loader",
         "_load_lock",
         "_tokenizer",
+        "_empty_passage_pair_length",
+        "_passage_length_function",
         "_fingerprint",
     )
 
@@ -521,9 +568,11 @@ class CrossEncoderPairLengthFunction:
         self._loader = tokenizer_loader or loader or _default_tokenizer_loader
         self._load_lock = threading.Lock()
         self._tokenizer: Any | None = None
+        self._empty_passage_pair_length: int | None = None
         self._fingerprint = (
             _PAIR_LENGTH_FINGERPRINT_PREFIX + hashlib.sha256(material).hexdigest()
         )
+        self._passage_length_function = _PassageLengthFunction(self)
 
     @property
     def config(self) -> LocalCrossEncoderConfig:
@@ -554,6 +603,31 @@ class CrossEncoderPairLengthFunction:
         """Alias usable as ChunkerConfig.length_function_fingerprint."""
 
         return self._fingerprint
+
+    @property
+    def passage_length_function(self) -> Callable[[str], int]:
+        """Return the additive passage-only callable for text splitters."""
+
+        return self._passage_length_function
+
+    @property
+    def max_passage_length(self) -> int:
+        """Return the budget after the exact formatted-query pair overhead."""
+
+        budget = self._config.max_length - self._empty_pair_length()
+        if budget <= 0:
+            raise PassageScoringError(
+                "max_length leaves no positive passage token budget"
+            )
+        return budget
+
+    def _empty_pair_length(self) -> int:
+        if self._empty_passage_pair_length is None:
+            self._empty_passage_pair_length = self("")
+        return self._empty_passage_pair_length
+
+    def _passage_length(self, passage: str) -> int:
+        return self(passage) - self._empty_pair_length()
 
     def _ensure_tokenizer(self) -> Any:
         if self._tokenizer is not None:
@@ -592,7 +666,10 @@ class CrossEncoderPairLengthFunction:
             raise PassageScoringError(
                 "tokenizer failed while counting a passage pair"
             ) from error
-        return _token_length(encoded)
+        length = _token_length(encoded)
+        if passage == "":
+            self._empty_passage_pair_length = length
+        return length
 
 
 def _prediction_values(result: object, expected_count: int) -> list[object]:

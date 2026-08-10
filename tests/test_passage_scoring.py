@@ -294,7 +294,98 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
         )
         self.assertEqual(
             tokenizer.calls,
-            [("Q: exact 你", "中文", {"truncation": False, "return_length": True})],
+            [
+                ("Q: exact 你", "中文", {"truncation": False, "return_length": True}),
+                ("Q: exact 你", "", {"truncation": False, "return_length": True}),
+            ],
+        )
+
+    def test_splitter_budget_is_additive_and_uses_exact_empty_pair_overhead(
+        self,
+    ) -> None:
+        config = LocalCrossEncoderConfig(max_length=16, query_format="Q: {query}")
+        tokenizer = PairCountingTokenizer()
+        length_function = CrossEncoderPairLengthFunction(
+            config,
+            "exact 你",
+            tokenizer_loader=lambda _: tokenizer,
+        )
+
+        self.assertEqual(length_function(""), 14)
+        self.assertEqual(length_function.passage_length_function("中文"), 3)
+        self.assertEqual(length_function.max_passage_length, 2)
+        self.assertGreater(length_function.max_passage_length, 0)
+        self.assertLessEqual(length_function.max_passage_length, config.max_length)
+        self.assertEqual(
+            tokenizer.calls,
+            [
+                ("Q: exact 你", "", {"truncation": False, "return_length": True}),
+                (
+                    "Q: exact 你",
+                    "中文",
+                    {"truncation": False, "return_length": True},
+                ),
+            ],
+        )
+
+        chunker_config = ChunkerConfig(
+            chunk_size=length_function.max_passage_length,
+            length_function=length_function.passage_length_function,
+        )
+        self.assertEqual(
+            chunker_config.resolved_length_function_fingerprint,
+            length_function.passage_length_function.fingerprint,
+        )
+
+    def test_splitter_budget_matches_reviewed_pinned_query_case(self) -> None:
+        config = LocalCrossEncoderConfig(max_length=512)
+        length_function = CrossEncoderPairLengthFunction(
+            config,
+            "exact 你",
+            tokenizer_loader=lambda _: PairCountingTokenizer(),
+        )
+
+        self.assertEqual(length_function(""), 11)
+        self.assertEqual(length_function.max_passage_length, 501)
+        self.assertGreater(length_function.max_passage_length, 0)
+        self.assertLessEqual(length_function.max_passage_length, config.max_length)
+
+    def test_splitter_budget_rejects_a_query_with_no_positive_passage_budget(
+        self,
+    ) -> None:
+        config = LocalCrossEncoderConfig(max_length=11)
+        length_function = CrossEncoderPairLengthFunction(
+            config,
+            "exact 你",
+            tokenizer_loader=lambda _: PairCountingTokenizer(),
+        )
+
+        with self.assertRaisesRegex(PassageScoringError, "positive"):
+            _ = length_function.max_passage_length
+
+    def test_splitter_budget_fingerprint_is_stable_and_distinct_from_pair_length(
+        self,
+    ) -> None:
+        config = LocalCrossEncoderConfig(max_length=16, query_format="Q: {query}")
+        first = CrossEncoderPairLengthFunction(
+            config,
+            "exact 你",
+            tokenizer_loader=lambda _: PairCountingTokenizer(),
+        )
+        second = CrossEncoderPairLengthFunction(
+            config,
+            "exact 你",
+            tokenizer_loader=lambda _: PairCountingTokenizer(),
+        )
+
+        self.assertIs(first.passage_length_function, first.passage_length_function)
+        self.assertEqual(
+            first.passage_length_function.fingerprint,
+            second.passage_length_function.fingerprint,
+        )
+        self.assertNotEqual(
+            first.passage_length_function.fingerprint,
+            first.fingerprint,
         )
 
     def test_pair_length_loader_is_tokenizer_only_and_never_imports_model_stack(
@@ -419,6 +510,7 @@ assert 'torch' not in sys.modules
     def test_default_loader_and_predict_path_uses_pinned_runtime_seam(self) -> None:
         passage = _passage("passage")
         constructor_calls: list[tuple[str, dict[str, Any]]] = []
+        transformer_constructor_calls: list[tuple[str, dict[str, Any]]] = []
         tokenizer_loader_calls: list[tuple[str, dict[str, Any]]] = []
         loaded_tokenizers: list[Any] = []
         tokenizer_calls: list[tuple[str, str, dict[str, Any]]] = []
@@ -439,11 +531,44 @@ assert 'torch' not in sys.modules
         class FakeIdentity:
             pass
 
+        class GetterOnlyTransformer:
+            def __init__(self, tokenizer: Any) -> None:
+                self.processor = tokenizer
+
+            @property
+            def tokenizer(self) -> Any:
+                return self.processor
+
+        class FakeTransformer(GetterOnlyTransformer):
+            def __init__(self, model_name_or_path: str, **kwargs: Any) -> None:
+                transformer_constructor_calls.append((model_name_or_path, kwargs))
+                tokenizer = FakeAutoTokenizer.from_pretrained(
+                    kwargs["tokenizer_name_or_path"],
+                    **kwargs["processor_kwargs"],
+                )
+                super().__init__(tokenizer)
+
         class FakeCrossEncoder:
-            def __init__(self, model_name: str, **kwargs: Any) -> None:
-                constructor_calls.append((model_name, kwargs))
-                self.tokenizer = object()
+            def __init__(
+                self,
+                model_name: str | None = None,
+                *,
+                modules: list[GetterOnlyTransformer] | None = None,
+                **kwargs: Any,
+            ) -> None:
+                constructor_calls.append((model_name, {"modules": modules, **kwargs}))
+                self._first_module = (
+                    modules[0] if modules else GetterOnlyTransformer(object())
+                )
                 models.append(self)
+
+            @property
+            def tokenizer(self) -> Any:
+                return self._first_module.tokenizer
+
+            @tokenizer.setter
+            def tokenizer(self, value: Any) -> None:
+                self._first_module.tokenizer = value
 
             def predict(
                 self, inputs: list[tuple[str, str]], **kwargs: Any
@@ -461,6 +586,10 @@ assert 'torch' not in sys.modules
 
         fake_sentence_transformers = types.ModuleType("sentence_transformers")
         fake_sentence_transformers.CrossEncoder = FakeCrossEncoder  # type: ignore[attr-defined]
+        fake_sentence_transformers_modules = types.ModuleType(
+            "sentence_transformers.sentence_transformer.modules"
+        )
+        fake_sentence_transformers_modules.Transformer = FakeTransformer  # type: ignore[attr-defined]
         fake_transformers = types.ModuleType("transformers")
         fake_transformers.AutoTokenizer = FakeAutoTokenizer  # type: ignore[attr-defined]
         fake_torch = types.ModuleType("torch")
@@ -482,6 +611,7 @@ assert 'torch' not in sys.modules
             sys.modules,
             {
                 "sentence_transformers": fake_sentence_transformers,
+                "sentence_transformers.sentence_transformer.modules": fake_sentence_transformers_modules,
                 "transformers": fake_transformers,
                 "torch": fake_torch,
             },
@@ -492,20 +622,43 @@ assert 'torch' not in sys.modules
         self.assertEqual(scores, {passage.content_hash: 4.75})
         self.assertEqual(len(constructor_calls), 1)
         model_name, constructor_kwargs = constructor_calls[0]
-        self.assertEqual(model_name, DEFAULT_MODEL_NAME)
+        self.assertIsNone(model_name)
+        self.assertEqual(constructor_kwargs["device"], "cuda")
+        self.assertEqual(len(constructor_kwargs["modules"]), 1)
+        self.assertEqual(
+            transformer_constructor_calls,
+            [
+                (
+                    DEFAULT_MODEL_NAME,
+                    {
+                        "transformer_task": "sequence-classification",
+                        "model_kwargs": {
+                            "revision": DEFAULT_MODEL_REVISION,
+                            "torch_dtype": dtype,
+                        },
+                        "processor_kwargs": {
+                            "revision": "tokenizer-revision",
+                            "model_max_length": 17,
+                        },
+                        "config_kwargs": {"revision": DEFAULT_MODEL_REVISION},
+                        "max_seq_length": 17,
+                        "tokenizer_name_or_path": "explicit/tokenizer",
+                    },
+                )
+            ],
+        )
         self.assertEqual(
             tokenizer_loader_calls,
             [
                 (
                     "explicit/tokenizer",
-                    {"revision": "tokenizer-revision"},
+                    {
+                        "revision": "tokenizer-revision",
+                        "model_max_length": 17,
+                    },
                 )
             ],
         )
-        self.assertEqual(constructor_kwargs["revision"], DEFAULT_MODEL_REVISION)
-        self.assertEqual(constructor_kwargs["device"], "cuda")
-        self.assertEqual(constructor_kwargs["max_length"], 17)
-        self.assertEqual(constructor_kwargs["model_kwargs"], {"torch_dtype": dtype})
         self.assertEqual(len(tokenizer_calls), 1)
         self.assertIs(models[0].tokenizer, loaded_tokenizers[0])
         self.assertEqual(tokenizer_calls[0][0:2], ("Q: query", "passage"))
