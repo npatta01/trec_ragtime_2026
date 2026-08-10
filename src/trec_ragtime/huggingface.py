@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import math
 import os
-import sqlite3
 import warnings
 from collections.abc import Iterable, Mapping
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -16,7 +14,8 @@ from requests.adapters import HTTPAdapter
 from requests.auth import AuthBase
 from urllib3.util.retry import Retry
 
-from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, SQLiteResponseCache
+from .artifact_store import ArtifactStore, ArtifactStoreLike
+from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, ResponseCache
 from .models import (
     HuggingFaceDocument,
     HydrationFailure,
@@ -144,7 +143,7 @@ def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
 class HuggingFaceCorpus:
     """Deprecated Dataset Viewer hydration backend.
 
-    Documents are cached individually in the same SQLite store used by the
+    Documents are cached individually in the same artifact store used by the
     private search client. The private bearer token is neither needed nor sent.
     Use :class:`LocalCorpusIndex` through :class:`RagtimeRetriever` instead.
     """
@@ -158,8 +157,8 @@ class HuggingFaceCorpus:
         dataset: str = DEFAULT_HF_DATASET,
         config: str = DEFAULT_HF_CONFIG,
         splits: tuple[str, ...] = DEFAULT_HF_SPLITS,
-        cache: SQLiteResponseCache | None = None,
-        cache_path: str | os.PathLike[str] | None = None,
+        cache: ResponseCache | None = None,
+        artifact_store: ArtifactStoreLike | None = None,
         cache_namespace: str = DEFAULT_CACHE_NAMESPACE,
         use_cache: bool = True,
         cache_ttl_seconds: float | None = DEFAULT_HF_DOCUMENT_CACHE_TTL_SECONDS,
@@ -223,30 +222,46 @@ class HuggingFaceCorpus:
         self._session = session if session is not None else _retrying_session(retries)
         self._owns_session = session is None
 
-        if cache is not None and cache_path is not None:
-            raise HuggingFaceConfigurationError("provide cache or cache_path, not both")
-        if not use_cache and cache is not None:
+        if cache is not None and artifact_store is not None:
             raise HuggingFaceConfigurationError(
-                "cache cannot be provided when use_cache is false"
+                "provide cache or artifact_store, not both"
+            )
+        if not use_cache and (cache is not None or artifact_store is not None):
+            raise HuggingFaceConfigurationError(
+                "cache or artifact_store cannot be provided when use_cache is false"
             )
         if not use_cache:
             self.cache = None
+            self.artifact_store = None
         elif cache is not None:
             self.cache = cache
+            self.artifact_store = getattr(cache, "store", None)
+        elif artifact_store is not None:
+            self.artifact_store = artifact_store
+            self.cache = ResponseCache(artifact_store, namespace=cache_namespace)
         else:
             try:
-                self.cache = SQLiteResponseCache(
-                    Path(cache_path).expanduser() if cache_path is not None else None,
-                    namespace=cache_namespace,
+                self.artifact_store = ArtifactStore.from_env(namespace=cache_namespace)
+                self.cache = ResponseCache(
+                    self.artifact_store, namespace=cache_namespace
                 )
-            except (OSError, sqlite3.Error, ValueError) as exc:
+            except Exception as exc:
                 raise HuggingFaceConfigurationError(
                     f"unable to initialize the shared cache: {exc}"
                 ) from None
 
     @property
-    def cache_path(self) -> Path | None:
-        return None if self.cache is None else self.cache.path
+    def cache_configuration(self) -> dict[str, object] | None:
+        """Return non-secret artifact-cache provenance for callers."""
+
+        if self.cache is None:
+            return None
+        configuration: dict[str, object] = {"namespace": self.cache.namespace}
+        for field in ("bucket_id", "prefix", "local_dir"):
+            value = getattr(self.artifact_store, field, None)
+            if value is not None:
+                configuration[field] = str(value) if field == "local_dir" else value
+        return configuration
 
     def close(self) -> None:
         if self._owns_session:
@@ -273,34 +288,18 @@ class HuggingFaceCorpus:
         if self.cache is None or refresh:
             return None
         request = self._cache_request(document_id)
-        try:
-            entry = self.cache.get(
-                base_url=self.base_url,
-                operation=HF_CACHE_OPERATION,
-                request=request,
-                ttl_seconds=self.cache_ttl_seconds,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"Hugging Face cache read failed; requesting upstream ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return None
+        entry = self.cache.get(
+            base_url=self.base_url,
+            operation=HF_CACHE_OPERATION,
+            request=request,
+            ttl_seconds=self.cache_ttl_seconds,
+            validator=lambda payload: self._parse_cached_payload(
+                payload, expected_document_id=document_id
+            ),
+        )
         if entry is None:
             return None
-        try:
-            return self._parse_cached_document(entry, expected_document_id=document_id)
-        except HuggingFaceProtocolError:
-            try:
-                self.cache.delete(
-                    base_url=self.base_url,
-                    operation=HF_CACHE_OPERATION,
-                    request=request,
-                )
-            except (OSError, sqlite3.Error):
-                pass
-            return None
+        return self._parse_cached_document(entry, expected_document_id=document_id)
 
     def _cache_put(self, document: HuggingFaceDocument) -> HuggingFaceDocument:
         if self.cache is None:
@@ -314,20 +313,12 @@ class HuggingFaceCorpus:
             "url": document.url,
             "date": document.date,
         }
-        try:
-            stored_at = self.cache.put(
-                base_url=self.base_url,
-                operation=HF_CACHE_OPERATION,
-                request=self._cache_request(document.document_id),
-                response=payload,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"Hugging Face cache write failed; returning live content ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return document
+        stored_at = self.cache.put(
+            base_url=self.base_url,
+            operation=HF_CACHE_OPERATION,
+            request=self._cache_request(document.document_id),
+            response=payload,
+        )
         return HuggingFaceDocument(
             dataset=document.dataset,
             config=document.config,
@@ -343,7 +334,19 @@ class HuggingFaceCorpus:
     def _parse_cached_document(
         self, entry: CacheEntry, *, expected_document_id: str
     ) -> HuggingFaceDocument:
-        payload = entry.payload
+        return self._parse_cached_payload(
+            entry.payload,
+            expected_document_id=expected_document_id,
+            stored_at=entry.stored_at,
+        )
+
+    def _parse_cached_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        expected_document_id: str,
+        stored_at: float = 0.0,
+    ) -> HuggingFaceDocument:
         if payload.get("dataset") != self.dataset:
             raise HuggingFaceProtocolError("cached document has a different dataset")
         if payload.get("config") != self.config:
@@ -367,7 +370,7 @@ class HuggingFaceCorpus:
             url=url,
             date=date,
             local_cache_hit=True,
-            cache_stored_at=entry.stored_at,
+            cache_stored_at=stored_at,
         )
 
     @staticmethod

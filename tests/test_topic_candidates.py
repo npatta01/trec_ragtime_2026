@@ -200,7 +200,12 @@ class FakeRetriever:
     def __init__(self, results: list[object]) -> None:
         self.results = iter(results)
         self.calls: list[dict[str, object]] = []
-        self.cache_path = Path("/shared/ragtime-cache/api-v1.sqlite3")
+        self.cache_configuration = {
+            "namespace": "ragtime2-2026-v1",
+            "bucket_id": "owner/ragtime-cache",
+            "prefix": "responses",
+            "local_dir": "/shared/ragtime-cache/artifacts-v1",
+        }
         self.corpus_path = Path("/shared/ragtime-cache/ragtime2-corpus-v2.duckdb")
         self.corpus = SimpleNamespace(
             metadata=SimpleNamespace(revision="corpus-revision-1")
@@ -357,6 +362,16 @@ class ControlARunnerTests(unittest.TestCase):
         self.assertEqual(manifest["pipeline"], "ragtime2")
         self.assertEqual(manifest["query_construction"], "problem_only_v1")
         self.assertEqual(manifest["retrieval"]["top_k"], 100)
+        self.assertEqual(
+            manifest["api_cache"],
+            {
+                "bucket_id": "owner/ragtime-cache",
+                "local_dir": "/shared/ragtime-cache/artifacts-v1",
+                "namespace": "ragtime2-2026-v1",
+                "prefix": "responses",
+            },
+        )
+        self.assertNotIn("api_cache_path", manifest)
         self.assertEqual(manifest["git_revision"], "git-revision-1")
         self.assertEqual(manifest["corpus"]["revision"], "corpus-revision-1")
         self.assertEqual(manifest["counts"]["topics"], 2)

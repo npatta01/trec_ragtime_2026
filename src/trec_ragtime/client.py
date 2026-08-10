@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import math
 import os
-import sqlite3
 import time
-import warnings
 from collections.abc import Callable, Mapping
-from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
@@ -18,7 +15,8 @@ from requests.adapters import HTTPAdapter
 from requests_ratelimiter import LimiterMixin
 from urllib3.util.retry import Retry
 
-from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, SQLiteResponseCache
+from .artifact_store import ArtifactStore, ArtifactStoreLike
+from .cache import DEFAULT_CACHE_NAMESPACE, CacheEntry, ResponseCache
 from .models import Document, PipelineResult, SearchHit
 
 DEFAULT_PIPELINE = "ragtime2"
@@ -122,15 +120,15 @@ def _rate_limited_session(requests_per_second: float) -> requests.Session:
 
 
 class RagtimeClient:
-    """Reusable synchronous RAGTIME client with a shared local cache."""
+    """Reusable synchronous RAGTIME client with a shared artifact cache."""
 
     def __init__(
         self,
         base_url: str,
         bearer_token: str,
         *,
-        cache: SQLiteResponseCache | None = None,
-        cache_path: str | os.PathLike[str] | None = None,
+        cache: ResponseCache | None = None,
+        artifact_store: ArtifactStoreLike | None = None,
         cache_namespace: str = DEFAULT_CACHE_NAMESPACE,
         use_cache: bool = True,
         search_cache_ttl_seconds: float | None = DEFAULT_SEARCH_CACHE_TTL_SECONDS,
@@ -191,20 +189,28 @@ class RagtimeClient:
         )
         self._owns_session = session is None
 
-        if cache is not None and cache_path is not None:
-            raise RagtimeConfigurationError("provide cache or cache_path, not both")
-        if not use_cache and cache is not None:
+        if cache is not None and artifact_store is not None:
+            raise RagtimeConfigurationError("provide cache or artifact_store, not both")
+        if not use_cache and (cache is not None or artifact_store is not None):
             raise RagtimeConfigurationError(
-                "cache cannot be provided when use_cache is false"
+                "cache or artifact_store cannot be provided when use_cache is false"
             )
         if not use_cache:
             self.cache = None
+            self.artifact_store = None
         elif cache is not None:
             self.cache = cache
+            self.artifact_store = getattr(cache, "store", None)
+        elif artifact_store is not None:
+            self.artifact_store = artifact_store
+            self.cache = ResponseCache(artifact_store, namespace=cache_namespace)
         else:
             try:
-                self.cache = SQLiteResponseCache(cache_path, namespace=cache_namespace)
-            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.artifact_store = ArtifactStore.from_env(namespace=cache_namespace)
+                self.cache = ResponseCache(
+                    self.artifact_store, namespace=cache_namespace
+                )
+            except Exception as exc:
                 raise RagtimeConfigurationError(
                     f"unable to initialize the RAGTIME cache: {exc}"
                 ) from None
@@ -237,15 +243,37 @@ class RagtimeClient:
                 "RAGTIME_REQUESTS_PER_SECOND", DEFAULT_REQUESTS_PER_SECOND
             ),
         }
-        cache_path = os.getenv("RAGTIME_CACHE_PATH", "").strip()
-        if cache_path:
-            options["cache_path"] = Path(cache_path).expanduser()
         options.update(overrides)
+        if (
+            options.get("use_cache", True)
+            and options.get("cache") is None
+            and options.get("artifact_store") is None
+        ):
+            try:
+                options["artifact_store"] = ArtifactStore.from_env(
+                    namespace=options["cache_namespace"]
+                )
+            except Exception as exc:
+                raise RagtimeConfigurationError(
+                    f"unable to initialize the RAGTIME cache: {exc}"
+                ) from None
         return cls(base_url, bearer_token, **options)
 
     @property
-    def cache_path(self) -> Path | None:
-        return None if self.cache is None else self.cache.path
+    def cache_configuration(self) -> dict[str, object] | None:
+        """Return non-secret artifact-cache provenance for run manifests."""
+
+        if self.cache is None:
+            return None
+        configuration: dict[str, object] = {
+            "namespace": self.cache.namespace,
+        }
+        store = self.artifact_store
+        for field in ("bucket_id", "prefix", "local_dir"):
+            value = getattr(store, field, None)
+            if value is not None:
+                configuration[field] = str(value) if field == "local_dir" else value
+        return configuration
 
     def close(self) -> None:
         if self._owns_session:
@@ -264,23 +292,17 @@ class RagtimeClient:
         request: Mapping[str, Any],
         ttl_seconds: float | None,
         refresh: bool,
+        validator: Callable[[Mapping[str, Any]], T],
     ) -> CacheEntry | None:
         if self.cache is None or refresh:
             return None
-        try:
-            return self.cache.get(
-                base_url=self.base_url,
-                operation=operation,
-                request=request,
-                ttl_seconds=ttl_seconds,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"RAGTIME cache read failed; requesting upstream ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return None
+        return self.cache.get(
+            base_url=self.base_url,
+            operation=operation,
+            request=request,
+            ttl_seconds=ttl_seconds,
+            validator=validator,
+        )
 
     def _cache_put(
         self,
@@ -291,41 +313,12 @@ class RagtimeClient:
     ) -> float | None:
         if self.cache is None:
             return None
-        try:
-            return self.cache.put(
-                base_url=self.base_url,
-                operation=operation,
-                request=request,
-                response=response,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"RAGTIME cache write failed; returning live response ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return None
-
-    def _cache_delete(
-        self,
-        *,
-        operation: str,
-        request: Mapping[str, Any],
-    ) -> None:
-        if self.cache is None:
-            return
-        try:
-            self.cache.delete(
-                base_url=self.base_url,
-                operation=operation,
-                request=request,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            warnings.warn(
-                f"RAGTIME cache eviction failed; refreshing upstream ({exc.__class__.__name__})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        return self.cache.put(
+            base_url=self.base_url,
+            operation=operation,
+            request=request,
+            response=response,
+        )
 
     def _post(self, endpoint: str, request: Mapping[str, Any]) -> dict[str, Any]:
         response: requests.Response | Any | None = None
@@ -405,12 +398,10 @@ class RagtimeClient:
             request=request,
             ttl_seconds=ttl_seconds,
             refresh=refresh,
+            validator=validator,
         )
         if entry is not None:
-            try:
-                return validator(entry.payload), True, entry.stored_at
-            except RagtimeProtocolError:
-                self._cache_delete(operation=operation, request=request)
+            return validator(entry.payload), True, entry.stored_at
 
         payload = self._post(endpoint, request)
         validated = validator(payload)

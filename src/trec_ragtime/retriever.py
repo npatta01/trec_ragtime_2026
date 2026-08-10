@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Protocol
 
+from .artifact_store import ArtifactStoreLike
 from .client import DEFAULT_PIPELINE, RagtimeClient, RagtimeError
 from .huggingface import (
     DEFAULT_HF_DATASET,
@@ -105,8 +106,12 @@ class RagtimeRetriever:
         return cls(client, corpus)
 
     @property
-    def cache_path(self) -> Path | None:
-        return self.client.cache_path
+    def artifact_store(self) -> ArtifactStoreLike | None:
+        return self.client.artifact_store
+
+    @property
+    def cache_configuration(self) -> dict[str, object] | None:
+        return self.client.cache_configuration
 
     @property
     def document_backend(self) -> str:

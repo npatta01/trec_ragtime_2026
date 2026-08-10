@@ -41,7 +41,7 @@ class Topic:
 class RetrieverLike(Protocol):
     """Minimal retrieval boundary used by the batch runner and its tests."""
 
-    cache_path: Path | None
+    cache_configuration: Mapping[str, object] | None
     corpus_path: Path | None
     corpus: object
 
@@ -399,8 +399,10 @@ def run_control_a(
             "max_content_fallbacks": 0,
             "fallback_on_hf_error": False,
         },
-        "api_cache_path": (
-            str(retriever.cache_path) if retriever.cache_path is not None else None
+        "api_cache": (
+            dict(retriever.cache_configuration)
+            if retriever.cache_configuration is not None
+            else None
         ),
         "corpus": _corpus_manifest(retriever),
         "counts": {

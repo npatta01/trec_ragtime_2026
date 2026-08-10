@@ -20,12 +20,12 @@ from trec_ragtime.corpus_cli import (
     resolve_parquet_revision,
     verify_parquet_snapshot,
 )
-from trec_ragtime.cache import SQLiteResponseCache
 from trec_ragtime.local_corpus import (
     LocalCorpusValidationError,
     build_from_parquet,
     default_local_corpus_path,
 )
+from trec_ragtime.paths import ensure_private_cache_dir
 from tests.test_local_corpus import write_parquet
 
 CONFIG_SPLITS = {
@@ -204,7 +204,7 @@ class CorpusCliTests(unittest.TestCase):
                 ),
             ):
                 download_parquet_snapshot(revision, manifest=manifest)
-                SQLiteResponseCache(project_cache / "api-v1.sqlite3")
+                ensure_private_cache_dir(project_cache / "artifacts-v1")
 
             self.assertEqual(stat.S_IMODE(project_cache.stat().st_mode), 0o700)
             self.assertEqual(

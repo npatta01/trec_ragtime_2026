@@ -14,8 +14,6 @@ from .cache import (
     request_digest,
     request_identity_digest,
     response_object_key,
-    SQLiteResponseCache,
-    default_cache_path,
 )
 from .client import (
     DEFAULT_CONTENT_COLLECTION,
@@ -118,13 +116,11 @@ __all__ = [
     "RetrievalResult",
     "RetrievedDocument",
     "SearchHit",
-    "SQLiteResponseCache",
     "base_url_digest",
     "build_from_parquet",
     "canonical_request",
     "canonical_request_bytes",
     "canonicalize_json",
-    "default_cache_path",
     "default_local_corpus_path",
     "default_project_cache_dir",
     "ensure_private_cache_dir",
