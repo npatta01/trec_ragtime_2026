@@ -1146,6 +1146,8 @@ def _write_fsync(path: Path, payload: bytes) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if sys.platform.startswith("win"):
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor = os.open(path, flags)
     try:
@@ -1229,11 +1231,14 @@ def _publish_noreplace_darwin(source: Path, destination: Path) -> None:
 def _publish_noreplace_windows(source: Path, destination: Path) -> None:
     """Publish with same-volume MoveFileExW without replacement flags."""
 
-    windll = getattr(ctypes, "windll", None)
-    kernel32 = getattr(windll, "kernel32", None)
-    move_file_ex = getattr(kernel32, "MoveFileExW", None)
-    if not callable(move_file_ex):
-        _unsupported_noreplace("MoveFileExW is unavailable on Windows")
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move_file_ex = kernel32.MoveFileExW
+    except (AttributeError, OSError) as error:
+        raise OSError(
+            _ENOTSUP,
+            "MoveFileExW is unavailable on Windows",
+        ) from error
     move_file_ex.argtypes = (
         ctypes.c_wchar_p,
         ctypes.c_wchar_p,

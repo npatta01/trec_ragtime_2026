@@ -959,13 +959,14 @@ class RerankingArtifactTests(unittest.TestCase):
         kernel32 = SimpleNamespace(MoveFileExW=move_file_ex)
         with patch.object(
             reranking_module.ctypes,
-            "windll",
-            SimpleNamespace(kernel32=kernel32),
+            "WinDLL",
+            return_value=kernel32,
             create=True,
-        ):
+        ) as win_dll:
             reranking_module._publish_noreplace_windows(
                 Path("source"), Path("destination")
             )
+        win_dll.assert_called_once_with("kernel32", use_last_error=True)
         move_file_ex.assert_called_once_with("source", "destination", 0)
 
         for windows_error in (80, 183):
@@ -974,10 +975,10 @@ class RerankingArtifactTests(unittest.TestCase):
                 kernel32 = SimpleNamespace(MoveFileExW=move_file_ex)
                 with patch.object(
                     reranking_module.ctypes,
-                    "windll",
-                    SimpleNamespace(kernel32=kernel32),
+                    "WinDLL",
+                    return_value=kernel32,
                     create=True,
-                ), patch.object(
+                ) as win_dll, patch.object(
                     reranking_module.ctypes,
                     "get_last_error",
                     return_value=windows_error,
@@ -987,6 +988,21 @@ class RerankingArtifactTests(unittest.TestCase):
                         reranking_module._publish_noreplace_windows(
                             Path("source"), Path("destination")
                         )
+                win_dll.assert_called_once_with("kernel32", use_last_error=True)
+                move_file_ex.assert_called_once_with("source", "destination", 0)
+
+    def test_windows_directory_fsync_is_skipped_but_file_fsync_remains(self) -> None:
+        with patch.object(reranking_module.sys, "platform", "win32"), patch.object(
+            reranking_module.os, "open"
+        ) as directory_open, patch.object(reranking_module.os, "fsync") as fsync:
+            reranking_module._fsync_directory(Path("directory"))
+        directory_open.assert_not_called()
+        fsync.assert_not_called()
+
+        file_path = Path(self.temporary_directory.name) / "file"
+        with patch.object(reranking_module.os, "fsync") as file_fsync:
+            reranking_module._write_fsync(file_path, b"payload")
+        file_fsync.assert_called_once()
 
 
 if __name__ == "__main__":
