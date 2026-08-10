@@ -114,7 +114,7 @@ from trec_ragtime import (
 )
 
 chunker = LangChainPassageChunker(
-    ChunkerConfig(chunk_size=512, length_function=len)
+    ChunkerConfig(chunk_size=512)
 )
 scorer = LocalCrossEncoderScorer(
     LocalCrossEncoderConfig(device="cpu")
