@@ -52,6 +52,7 @@ from .retriever import (
     RagtimeRetriever,
 )
 __all__ = [
+    "CachedChatCompletions",
     "DEFAULT_CONTENT_COLLECTION",
     "DEFAULT_HF_BASE_URL",
     "DEFAULT_HF_CONFIG",
@@ -62,7 +63,6 @@ __all__ = [
     "DEFAULT_HF_SPLITS",
     "DEFAULT_MAX_CONTENT_FALLBACKS",
     "DEFAULT_PIPELINE",
-    "CachedChatCompletions",
     "Document",
     "DocumentCorpus",
     "HuggingFaceApiError",

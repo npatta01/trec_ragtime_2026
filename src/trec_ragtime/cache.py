@@ -51,10 +51,12 @@ class CacheEntry(Generic[T]):
     value: T
     stored_at: float
 
-# These names are never part of a result-bearing request.  Rejecting them at
-# canonicalization is a defense-in-depth boundary: an accidentally forwarded
-# Authorization/token field cannot silently create an identity collision or
-# be persisted in an artifact.
+# These names are never valid top-level result-bearing request fields.
+# Rejecting them at the canonicalization boundary is defense in depth: an
+# accidentally forwarded Authorization/token field cannot silently create an
+# identity collision or be persisted in an artifact. Structured request bodies
+# may opt out of nested-name rejection because schemas can legitimately define
+# properties such as ``password`` or ``auth_token``.
 _CREDENTIAL_FIELDS = frozenset(
     {
         "authorization",
@@ -248,41 +250,50 @@ def _validate_operation(operation: str) -> str:
     return operation
 
 
-def canonicalize_json(value: Any, *, filter_credentials: bool = True) -> Any:
+def canonicalize_json(
+    value: Any,
+    *,
+    filter_credentials: bool = True,
+    reject_nested_credentials: bool = True,
+) -> Any:
     """Return recursively sorted JSON-like data suitable for MessagePack.
 
     Mapping keys must be strings, mapping order is discarded recursively, list
     order is retained, and credential-bearing fields are rejected before an
     identity or persisted artifact is produced unless response canonicalization
-    explicitly opts out of credential filtering.
+    explicitly opts out of credential filtering.  Callers that own a structured
+    request body may disable only the nested-name rejection while retaining the
+    top-level credential boundary.
     Unsupported values and non-finite floats are rejected before encoding.
     """
 
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("cache values must contain only finite numbers")
-        return value
-    if isinstance(value, Mapping):
-        normalized: dict[str, Any] = {}
-        for key, nested in value.items():
-            if not isinstance(key, str):
-                raise TypeError("cache mapping keys must be strings")
-            if filter_credentials and _is_credential_field(key):
-                raise ValueError("cache mappings must not contain credential fields")
-            normalized[key] = canonicalize_json(
-                nested, filter_credentials=filter_credentials
-            )
-        return {key: normalized[key] for key in sorted(normalized)}
-    if isinstance(value, list):
-        return [
-            canonicalize_json(item, filter_credentials=filter_credentials)
-            for item in value
-        ]
-    raise TypeError(
-        "cache values must be JSON-like (null, boolean, number, string, list, or object)"
-    )
+    def _canonicalize(current: Any, *, root: bool) -> Any:
+        if current is None or isinstance(current, (str, bool, int)):
+            return current
+        if isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError("cache values must contain only finite numbers")
+            return current
+        if isinstance(current, Mapping):
+            normalized: dict[str, Any] = {}
+            for key, nested in current.items():
+                if not isinstance(key, str):
+                    raise TypeError("cache mapping keys must be strings")
+                if (
+                    filter_credentials
+                    and _is_credential_field(key)
+                    and (root or reject_nested_credentials)
+                ):
+                    raise ValueError("cache mappings must not contain credential fields")
+                normalized[key] = _canonicalize(nested, root=False)
+            return {key: normalized[key] for key in sorted(normalized)}
+        if isinstance(current, list):
+            return [_canonicalize(item, root=False) for item in current]
+        raise TypeError(
+            "cache values must be JSON-like (null, boolean, number, string, list, or object)"
+        )
+
+    return _canonicalize(value, root=True)
 
 
 def canonical_request_bytes(
@@ -290,13 +301,18 @@ def canonical_request_bytes(
     operation: str,
     request: Mapping[str, Any],
     namespace: str = DEFAULT_CACHE_NAMESPACE,
+    *,
+    reject_nested_credentials: bool = True,
 ) -> bytes:
     """Encode the canonical request identity as deterministic MessagePack."""
 
     normalized_namespace = _validate_namespace(namespace)
     normalized_base_url = _normalize_base_url(base_url)
     normalized_operation = _validate_operation(operation)
-    canonical_request = canonicalize_json(request)
+    canonical_request = canonicalize_json(
+        request,
+        reject_nested_credentials=reject_nested_credentials,
+    )
     if not isinstance(canonical_request, dict):  # Mapping is checked defensively.
         raise TypeError("cache request must be an object")
     identity = {
@@ -314,11 +330,19 @@ def request_digest(
     operation: str,
     request: Mapping[str, Any],
     namespace: str = DEFAULT_CACHE_NAMESPACE,
+    *,
+    reject_nested_credentials: bool = True,
 ) -> bytes:
     """Return the binary SHA-256 digest of a canonical request identity."""
 
     return hashlib.sha256(
-        canonical_request_bytes(base_url, operation, request, namespace)
+        canonical_request_bytes(
+            base_url,
+            operation,
+            request,
+            namespace,
+            reject_nested_credentials=reject_nested_credentials,
+        )
     ).digest()
 
 
@@ -366,13 +390,17 @@ class ResponseCache:
         namespace: str = DEFAULT_CACHE_NAMESPACE,
         clock: Callable[[], float] = time.time,
         filter_response_credentials: bool = True,
+        reject_nested_request_credentials: bool = True,
     ) -> None:
         if not isinstance(filter_response_credentials, bool):
             raise TypeError("filter_response_credentials must be a boolean")
+        if not isinstance(reject_nested_request_credentials, bool):
+            raise TypeError("reject_nested_request_credentials must be a boolean")
         self.store = store
         self.namespace = _validate_namespace(namespace)
         self._clock = clock
         self.filter_response_credentials = filter_response_credentials
+        self.reject_nested_request_credentials = reject_nested_request_credentials
 
     def object_key(
         self,
@@ -390,6 +418,7 @@ class ResponseCache:
                 operation,
                 request,
                 self.namespace,
+                reject_nested_credentials=self.reject_nested_request_credentials,
             ),
         )
 
@@ -407,6 +436,7 @@ class ResponseCache:
             normalized_operation,
             request,
             self.namespace,
+            reject_nested_credentials=self.reject_nested_request_credentials,
         )
         return base_url_digest(normalized_base_url), digest
 

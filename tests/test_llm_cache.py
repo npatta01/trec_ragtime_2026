@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import unittest
 from collections.abc import Callable
+from datetime import date
+from enum import Enum
 from typing import Any
 from unittest.mock import Mock
 
 from openai.types.chat import ChatCompletion
+from pydantic import BaseModel
 
 from trec_ragtime.artifact_store import ArtifactStoreRemoteError, ArtifactValidationError
 from trec_ragtime.llm_cache import (
@@ -98,6 +101,14 @@ class FakeClient:
         self.chat.completions = FakeCompletions(responses)
 
 
+class ProviderMode(str, Enum):
+    FAST = "fast"
+
+
+class ProviderOptions(BaseModel):
+    retries: int
+
+
 class CachedChatCompletionsTestCase(unittest.TestCase):
     messages = [{"role": "user", "content": "Say hello"}]
 
@@ -142,6 +153,84 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         self.assertEqual(reversed_messages.id, "live-2")
         self.assertEqual(len(self.client.chat.completions.calls), 2)
         self.assertEqual(len(self.store.write_calls), 2)
+
+    def test_nested_schema_property_names_are_not_treated_as_client_credentials(self) -> None:
+        request = {
+            "model": "test-model",
+            "messages": self.messages,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"auth_token": {"type": "string"}},
+                    },
+                },
+            }],
+        }
+        first = self.cached.create(**request)
+        second = self.cached.create(**request)
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(len(self.client.chat.completions.calls), 1)
+
+    def test_sdk_request_values_are_normalized_before_identity_and_provider(self) -> None:
+        from openai import not_given
+
+        self.cached.create(
+            model="test-model",
+            messages=({"role": "user", "content": "hello"},),
+            metadata={"requested_on": date(2026, 8, 10)},
+            extra_body={
+                "mode": ProviderMode.FAST,
+                "options": ProviderOptions(retries=2),
+            },
+            max_tokens=not_given,
+        )
+        provider_request = self.client.chat.completions.calls[0]
+        self.assertEqual(
+            provider_request["messages"],
+            [{"content": "hello", "role": "user"}],
+        )
+        self.assertEqual(provider_request["metadata"], {"requested_on": "2026-08-10"})
+        self.assertEqual(
+            provider_request["extra_body"],
+            {"mode": "fast", "options": {"retries": 2}},
+        )
+        self.assertNotIn("max_tokens", provider_request)
+        self.cached.create(
+            model="test-model",
+            messages=[{"content": "hello", "role": "user"}],
+            metadata={"requested_on": "2026-08-10"},
+            extra_body={
+                "mode": "fast",
+                "options": {"retries": 2},
+            },
+        )
+        self.assertEqual(len(self.client.chat.completions.calls), 1)
+
+    def test_unordered_request_collections_are_rejected_before_provider(self) -> None:
+        with self.assertRaisesRegex(TypeError, "unordered"):
+            self.cached.create(
+                model="test-model",
+                messages=self.messages,
+                extra_body={"choices": {"one", "two"}},
+            )
+        self.assertEqual(self.client.chat.completions.calls, [])
+        self.assertEqual(self.store.read_validated_calls, [])
+        self.assertEqual(self.store.write_calls, [])
+
+    def test_set_like_request_collections_are_rejected_before_provider(self) -> None:
+        choices = {"one": 1, "two": 2}.keys()
+        with self.assertRaisesRegex(TypeError, "unordered"):
+            self.cached.create(
+                model="test-model",
+                messages=self.messages,
+                extra_body={"choices": choices},
+            )
+        self.assertEqual(self.client.chat.completions.calls, [])
+        self.assertEqual(self.store.read_validated_calls, [])
+        self.assertEqual(self.store.write_calls, [])
 
     def test_output_affecting_fields_are_identity(self) -> None:
         base = {
@@ -260,6 +349,32 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         self.assertEqual(self.store.write_calls, [])
         self.assertEqual(len(self.client.chat.completions.calls), 2)
 
+    def test_truthy_stream_delegates_without_cache_io(self) -> None:
+        stream = object()
+        self.client.chat.completions.responses = [stream]
+        result = self.cached.create(model="m", messages=[], stream=1)
+        self.assertIs(result, stream)
+        self.assertEqual(self.store.read_validated_calls, [])
+        self.assertEqual(self.store.write_calls, [])
+
+    def test_streaming_request_rejects_top_level_credentials_before_provider(self) -> None:
+        with self.assertRaisesRegex(ValueError, "credential fields"):
+            self.cached.create(
+                model="m",
+                messages=[],
+                stream=True,
+                api_key="sentinel-secret",
+            )
+        self.assertEqual(self.client.chat.completions.calls, [])
+        self.assertEqual(self.store.read_validated_calls, [])
+        self.assertEqual(self.store.write_calls, [])
+
+    def test_async_openai_clients_are_rejected(self) -> None:
+        from openai import AsyncOpenAI
+
+        with self.assertRaisesRegex(TypeError, "synchronous"):
+            CachedChatCompletions(AsyncOpenAI(api_key="test-key"), self.store)
+
     def test_invalid_request_fails_before_provider(self) -> None:
         with self.assertRaises((TypeError, ValueError)):
             self.cached.create(model="m", messages=[], api_key="sentinel-secret")
@@ -320,6 +435,14 @@ class CachedChatCompletionsTestCase(unittest.TestCase):
         self.assertEqual(replayed.model_dump(mode="json"), live.model_dump(mode="json"))
         self.assertEqual(replayed.provider_extension, {"token_label": "preserved"})
         self.assertEqual(len(self.client.chat.completions.calls), 1)
+
+    def test_uncacheable_large_provider_integer_preserves_live_response(self) -> None:
+        live = completion("large integer", completion_id="large-integer-1")
+        live.provider_extension = {"counter": 10**100}
+        self.client.chat.completions.responses = [live]
+        result = self.cached.create(model="m", messages=[])
+        self.assertIs(result, live)
+        self.assertEqual(self.store.write_calls, [])
 
     def test_unexpected_non_stream_response_type_is_rejected(self) -> None:
         self.client.chat.completions.responses = [{"id": "not-a-completion"}]

@@ -205,6 +205,45 @@ class ResponseCacheTestCase(unittest.TestCase):
         self.assertEqual(self.store.read_validated_calls, [])
         self.assertEqual(self.store.write_calls, [])
 
+    def test_nested_request_credentials_can_be_allowed_without_relaxing_top_level(self) -> None:
+        cache = ResponseCache(
+            self.store,
+            reject_nested_request_credentials=False,
+        )
+        request = {
+            "schema": {
+                "properties": {"password": {"type": "string"}},
+            }
+        }
+        cache.put(
+            base_url=self.base_url,
+            operation="llm-chat-completions-v1",
+            request=request,
+            response={"ok": True},
+        )
+        self.assertIsNotNone(
+            cache.get(
+                base_url=self.base_url,
+                operation="llm-chat-completions-v1",
+                request=request,
+                ttl_seconds=None,
+                validator=dict,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "credential fields"):
+            cache.object_key(
+                base_url=self.base_url,
+                operation="llm-chat-completions-v1",
+                request={"api_key": "never-store-this"},
+            )
+
+    def test_nested_request_credential_scope_requires_a_boolean(self) -> None:
+        for value in (0, 1, None, "false"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                TypeError, "reject_nested_request_credentials must be a boolean"
+            ):
+                ResponseCache(self.store, reject_nested_request_credentials=value)
+
     def test_complete_response_mode_does_not_relax_request_identity(self) -> None:
         cache = ResponseCache(self.store, filter_response_credentials=False)
         with self.assertRaisesRegex(ValueError, "credential fields"):

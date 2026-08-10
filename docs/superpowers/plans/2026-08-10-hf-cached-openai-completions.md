@@ -4,7 +4,7 @@
 
 **Goal:** Add a thin cache-aside wrapper around `OpenAI.chat.completions.create` that reuses exact, validated responses from the existing private Hugging Face Artifact Store.
 
-**Architecture:** `CachedChatCompletions` accepts an already-configured synchronous `OpenAI` client and an existing `ArtifactStoreLike`. It reuses `ResponseCache` for request identity and artifact storage, delegates streams unchanged, and returns the SDK's normal `ChatCompletion` on both live and cached paths. A narrowly configured `ResponseCache` mode preserves the entire typed LLM response payload without response-field-name filtering while request identity remains credential-safe.
+**Architecture:** `CachedChatCompletions` accepts an already-configured synchronous `OpenAI` client and an existing `ArtifactStoreLike`. It reuses `ResponseCache` for request identity and artifact storage, delegates streams unchanged, normalizes common typed SDK request values, and returns the SDK's normal `ChatCompletion` on both live and cached paths. Narrowly configured `ResponseCache` modes preserve the entire typed LLM response payload and permit legitimate nested schema property names while retaining top-level request credential rejection.
 
 **Tech Stack:** Python 3.11+, `openai>=2.47.0,<3`, `msgspec`, existing `ArtifactStore`/`ResponseCache`, `unittest`, `uv`.
 
@@ -15,7 +15,7 @@
 - Use operation `llm-chat-completions-v1`, `ttl_seconds=None`, and explicit `refresh=True` for replacement.
 - Identity includes normalized base URL, namespace, and every explicit JSON request-body argument, including `extra_body`.
 - Identity excludes `refresh`, `timeout`, `extra_headers`, and `extra_query`; client API keys and transport credentials never enter cache identity or payload.
-- Preserve list order and canonicalize mapping order. Omitted and explicitly supplied defaults remain distinct exact requests.
+- Preserve list order and canonicalize mapping order. Omitted and explicitly supplied defaults remain distinct exact requests, except `NotGiven`/`Omit` sentinels, which are treated as absent.
 - Cache the entire validated `ChatCompletion.model_dump(mode="json")`, including usage and provider-extension fields.
 - Cache only complete non-streaming successes. Provider errors, unexpected response types, and streams remain uncached.
 - Cache failures must not discard a valid live response.
@@ -31,7 +31,7 @@
 
 **Interfaces:**
 - Consumes: existing `ResponseCache(store, *, namespace, clock)`.
-- Produces: `ResponseCache(store, *, namespace, clock, filter_response_credentials: bool = True)`. Request identity always retains credential rejection; only response payload canonicalization honors this option.
+- Produces: `ResponseCache(store, *, namespace, clock, filter_response_credentials: bool = True, reject_nested_request_credentials: bool = True)`. Defaults retain recursive request credential rejection; the LLM adapter may permit nested schema property names while preserving top-level rejection.
 
 - [ ] **Step 1: Write failing tests**
 

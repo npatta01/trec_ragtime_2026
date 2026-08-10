@@ -340,13 +340,20 @@ pass `refresh=True` to bypass the hit and replace that exact entry with a fresh
 provider response. Responses are round-tripped as fully typed
 `openai.types.chat.ChatCompletion` objects, including provider extension fields.
 Streaming requests (`stream=True`) always delegate directly and are not cached.
+Common OpenAI SDK request values, including omitted-value sentinels, Pydantic
+models, enums, dates, iterables, and tuples, are normalized to their JSON form;
+unordered collections are rejected because they cannot produce stable keys.
 
 Artifact caching is best effort: a cache read or write failure leaves the live
-provider response usable as an uncached result. The OpenAI client's API key is
-never part of a cache key or stored payload; transport-only options such as
+provider response usable as an uncached result. If a refresh write fails, the
+fresh response is still returned but the previous durable entry may remain
+readable. The OpenAI client's API key is never part of a cache key or stored
+payload; transport-only options such as
 `timeout`, `extra_headers`, and `extra_query` are also excluded from identity.
-Credential-shaped request fields are rejected before a provider call so they
-cannot be persisted accidentally.
+Top-level credential-shaped request fields are rejected before a provider call
+so they cannot be persisted accidentally. Nested structured request data is
+canonicalized as supplied, allowing tool schemas and provider extensions to
+legitimately use property names such as `password` or `auth_token`.
 
 Private `/pipeline` and `/content` entries do not expire by default because the
 participant endpoint is treated as immutable. Numeric

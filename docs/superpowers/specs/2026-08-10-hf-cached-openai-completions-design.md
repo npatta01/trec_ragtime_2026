@@ -34,10 +34,11 @@ response = completions.create(
 )
 ```
 
-`CachedChatCompletions.create` accepts the normal JSON-like chat-completion
+`CachedChatCompletions.create` accepts normal synchronous chat-completion
 request arguments plus the wrapper-only `refresh=False` flag and returns an
-OpenAI `ChatCompletion`. Callers that need another endpoint continue using the
-underlying client directly.
+OpenAI `ChatCompletion`. Common typed SDK values are normalized to their JSON
+form before hashing and dispatch. Callers that need another endpoint continue
+using the underlying client directly.
 
 ## Cache identity and storage
 
@@ -55,14 +56,18 @@ The cache identity contains:
 
 The identity preserves list order and canonicalizes mapping order through
 `ResponseCache`. Omitted defaults and explicitly supplied defaults are distinct
-exact requests. `refresh` is control metadata and is not part of the identity.
+exact requests, except the SDK's `NotGiven`/`Omit` sentinels, which are treated
+as absent. `refresh` is control metadata and is not part of the identity.
 Transport-only OpenAI options such as timeout, extra headers, and extra query
 parameters are passed to the live call but excluded from the response identity.
 
 Client API keys, authorization headers, bearer tokens, and other transport
 credentials must never enter the identity, artifact payload, warning, or
 exception text.
-Request identity retains the existing recursive credential-field rejection.
+Top-level request identity retains credential-field rejection. Nested tool
+schemas and provider bodies preserve their property names because names such as
+`password` or `auth_token` can be legitimate schema fields; client credentials
+and transport options are never merged into those bodies by the wrapper.
 The complete validated `ChatCompletion.model_dump(mode="json")` response is
 cached without response-field-name filtering so usage data and provider
 extensions are preserved. The wrapper never merges client configuration,
@@ -75,12 +80,12 @@ call, and replaces the same exact entry after successful validation.
 
 For a non-streaming request with `refresh=False`:
 
-1. Separate cache-control and transport-only arguments from the JSON request
-   body used for identity.
+1. Normalize common SDK request values, then separate cache-control and
+   transport-only arguments from the JSON request body used for identity.
 2. Ask `ResponseCache` for the exact request with `ttl_seconds=None`.
 3. On a valid hit, reconstruct and return `openai.types.chat.ChatCompletion`.
-4. On a miss, call `client.chat.completions.create` once with the caller's
-   original arguments.
+4. On a miss, call `client.chat.completions.create` once with the normalized
+   provider arguments plus untouched transport-only options.
 5. Require a non-streaming `ChatCompletion`, serialize it with
    `model_dump(mode="json")`, and best-effort write it through `ResponseCache`.
 6. Return the live response whether or not the cache write succeeds.
@@ -99,9 +104,10 @@ Provider exceptions propagate unchanged and are never cached. Artifact Store
 authentication, transport, permission, server, or write failures retain the
 repository's best-effort behavior: a read failure becomes a miss, a live call
 may proceed, and a write failure does not discard a valid live response.
-Request values that cannot be represented as credential-safe canonical JSON
-fail before any provider call so the wrapper never creates an ambiguous cache
-identity.
+Common SDK typed values are normalized deterministically. Values that still
+cannot be represented as credential-safe canonical JSON, including unordered
+collections, fail before any provider call so the wrapper never creates an
+ambiguous cache identity.
 
 The wrapper adds no retry policy. Provider retry behavior remains whatever the
 caller configured on the underlying OpenAI client.
