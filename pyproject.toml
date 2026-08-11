@@ -28,6 +28,7 @@ ragtime-query-baseline = "trec_ragtime.query_baselines:main"
 ragtime-cache-import = "trec_ragtime.cache_import:main"
 ragtime-retrieval-import = "trec_ragtime.retrieval_import:main"
 ragtime-report-validate = "trec_ragtime.report_submission:main"
+ragtime-report = "trec_ragtime.report_runner:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12"]

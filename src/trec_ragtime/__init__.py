@@ -36,6 +36,15 @@ from .local_corpus import (
     build_from_parquet,
     default_local_corpus_path,
 )
+from .evidence_bundle import (
+    EvidenceBundle,
+    EvidenceBundleError,
+    EvidenceFacet,
+    EvidencePassage,
+    UnknownEvidenceHandleError,
+    build_evidence_bundles,
+    load_evidence_run,
+)
 from .models import (
     Document,
     HuggingFaceDocument,
@@ -46,12 +55,31 @@ from .models import (
     RetrievedDocument,
     SearchHit,
 )
+from .report_cache import (
+    GenerationSettings,
+    ReportArtifactCache,
+    ReportRequestIdentity,
+    ReportValidationError,
+    TopicReport,
+    generator_fingerprint,
+)
+from .report_generation import (
+    ReportGenerationError,
+    generate_topic_report,
+)
+from .report_submission import (
+    SubmissionValidationError,
+    submission_record,
+    validate_submission_file,
+)
 from .retriever import (
     DEFAULT_MAX_CONTENT_FALLBACKS,
     DocumentCorpus,
     RagtimeRetriever,
 )
 __all__ = [
+    "build_evidence_bundles",
+    "build_from_parquet",
     "CachedChatCompletions",
     "DEFAULT_CONTENT_COLLECTION",
     "DEFAULT_HF_BASE_URL",
@@ -61,10 +89,18 @@ __all__ = [
     "DEFAULT_HF_MT_CONFIG",
     "DEFAULT_HF_MT_SPLITS",
     "DEFAULT_HF_SPLITS",
+    "default_local_corpus_path",
     "DEFAULT_MAX_CONTENT_FALLBACKS",
     "DEFAULT_PIPELINE",
     "Document",
     "DocumentCorpus",
+    "EvidenceBundle",
+    "EvidenceBundleError",
+    "EvidenceFacet",
+    "EvidencePassage",
+    "generate_topic_report",
+    "GenerationSettings",
+    "generator_fingerprint",
     "HuggingFaceApiError",
     "HuggingFaceConfigurationError",
     "HuggingFaceCorpus",
@@ -74,6 +110,7 @@ __all__ = [
     "HuggingFaceProtocolError",
     "HydrationFailure",
     "HydrationResult",
+    "load_evidence_run",
     "LocalCorpusBuildError",
     "LocalCorpusConfigurationError",
     "LocalCorpusError",
@@ -88,9 +125,16 @@ __all__ = [
     "RagtimeError",
     "RagtimeProtocolError",
     "RagtimeRetriever",
+    "ReportArtifactCache",
+    "ReportGenerationError",
+    "ReportRequestIdentity",
+    "ReportValidationError",
     "RetrievalResult",
     "RetrievedDocument",
     "SearchHit",
-    "build_from_parquet",
-    "default_local_corpus_path",
+    "submission_record",
+    "SubmissionValidationError",
+    "TopicReport",
+    "UnknownEvidenceHandleError",
+    "validate_submission_file",
 ]
