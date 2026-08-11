@@ -446,8 +446,13 @@ def _token_length(encoded: object) -> int:
     overflow = _as_sequence(encoded.get("overflowing_tokens"))
     if overflow not in (None, [], (), False):
         raise PassageScoringError("tokenizer reported overflow")
-    truncated = encoded.get("num_truncated_tokens")
-    if truncated not in (None, 0, [0], (0,)):
+    truncated = _as_sequence(encoded.get("num_truncated_tokens"))
+    if not (
+        truncated is None
+        or (type(truncated) is int and truncated == 0)
+        or (type(truncated) is list and truncated == [0])
+        or (type(truncated) is tuple and truncated == (0,))
+    ):
         raise PassageScoringError("tokenizer reported truncation")
     return length
 

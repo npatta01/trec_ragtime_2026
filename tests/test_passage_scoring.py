@@ -706,6 +706,50 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
 
 
 class LocalCrossEncoderScorerTests(unittest.TestCase):
+    def test_score_matches_worker_truncation_sentinel_contract(self) -> None:
+        passage = _passage("passage")
+
+        class MetadataTokenizer(RecordingTokenizer):
+            def __init__(self, truncated: object) -> None:
+                super().__init__()
+                self.truncated = truncated
+
+            def __call__(
+                self,
+                query: str,
+                passage: str,
+                **kwargs: Any,
+            ) -> dict[str, object]:
+                encoded = super().__call__(query, passage, **kwargs)
+                encoded["num_truncated_tokens"] = self.truncated
+                return encoded
+
+        def scorer_with(
+            truncated: object,
+        ) -> tuple[LocalCrossEncoderScorer, RecordingModel]:
+            model = RecordingModel({"passage": 1.0})
+            scorer = LocalCrossEncoderScorer(
+                _config(max_length=100),
+                loader=lambda _: (model, MetadataTokenizer(truncated)),
+            )
+            return scorer, model
+
+        for truncated in (None, 0, [0], (0,)):
+            with self.subTest(truncated=truncated):
+                scorer, model = scorer_with(truncated)
+                self.assertEqual(
+                    scorer.score("query", (passage,)),
+                    {passage.content_hash: 1.0},
+                )
+                self.assertEqual(len(model.predict_calls), 1)
+
+        for truncated in (False, [], ()):
+            with self.subTest(truncated=truncated):
+                scorer, model = scorer_with(truncated)
+                with self.assertRaisesRegex(PassageScoringError, "truncation"):
+                    scorer.score("query", (passage,))
+                self.assertEqual(model.predict_calls, [])
+
     def test_score_deduplicates_equal_content_and_returns_finite_float_map(
         self,
     ) -> None:

@@ -14,7 +14,7 @@ import unittest
 from collections import UserDict
 from collections.abc import Callable
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from trec_ragtime.flash_passage_scorer import (
     FLASH_PAYLOAD_LIMIT_BYTES,
@@ -364,12 +364,19 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 "_runpod_request_body",
                 count_request_body_builds,
             ),
+            patch.object(
+                RunpodFlashConfig,
+                "effective_batch_size",
+                new_callable=PropertyMock,
+                return_value=7,
+            ) as effective_batch_size,
             patch.object(flash_passage_scorer, "sum", reject_sequence_sum, create=True),
         ):
             batches = RunpodFlashPassageScorer._build_batches("query", unique, config)
 
         self.assertEqual(len(body_size_calls), len(unique) + len(batches))
         self.assertEqual(request_body_calls, len(batches))
+        self.assertEqual(effective_batch_size.call_count, 1)
 
     def test_adapter_and_worker_failures_do_not_emit_sensitive_literals(self) -> None:
         query = "query-sensitive-7f"
@@ -533,6 +540,44 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         self.assertGreaterEqual(runner.cancelled, 1)
         self.assertEqual(runner.active, 0)
 
+    def test_cancelled_batch_runner_is_wrapped_as_flash_scoring_error(self) -> None:
+        class QuiescingCancellationRunner:
+            def __init__(self) -> None:
+                self.dispatches = 0
+                self.cancelled = 0
+                self.completed = 0
+
+            async def run_batch(self, payload: bytes) -> bytes:
+                self.dispatches += 1
+                if self.dispatches == 1:
+                    raise asyncio.CancelledError
+                try:
+                    await asyncio.sleep(60.0)
+                except asyncio.CancelledError:
+                    self.cancelled += 1
+                    raise
+                self.completed += 1
+                raise AssertionError("sibling was not cancelled")
+
+        runner = QuiescingCancellationRunner()
+        passages = tuple(_passage(f"text-{index}") for index in range(2))
+        scorer = RunpodFlashPassageScorer(
+            RunpodFlashConfig(
+                endpoint_id="fake",
+                batch_size=1,
+                concurrency=2,
+                request_timeout=0.05,
+            ),
+            runner,
+        )
+        self.addCleanup(scorer.close)
+
+        with self.assertRaisesRegex(FlashScoringError, "Flash batch cancelled"):
+            scorer.score("query", passages)
+        self.assertGreaterEqual(runner.dispatches, 2)
+        self.assertEqual(runner.cancelled, 1)
+        self.assertEqual(runner.completed, 0)
+
     def test_timeout_and_response_fingerprint_or_coverage_drift_fail(self) -> None:
         passage = _passage("passage")
         timeout_scorer = RunpodFlashPassageScorer(
@@ -667,6 +712,70 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
 
 class StaticFlashWorkerTests(unittest.TestCase):
+    def test_worker_tokenizer_metadata_matches_local_token_length_contract(
+        self,
+    ) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+
+        class MetadataTokenizer(BatchEncodingTokenizer):
+            def __init__(
+                self,
+                truncated: object,
+                *,
+                include_length: bool = True,
+                reported_length: int | None = None,
+            ) -> None:
+                super().__init__()
+                self.truncated = truncated
+                self.include_length = include_length
+                self.reported_length = reported_length
+
+            def __call__(
+                self, query: str, text: str, **kwargs: object
+            ) -> UserDict[str, object]:
+                encoded = super().__call__(query, text, **kwargs)
+                encoded["num_truncated_tokens"] = self.truncated
+                if not self.include_length:
+                    del encoded["length"]
+                elif self.reported_length is not None:
+                    encoded["length"] = [self.reported_length]
+                return encoded
+
+        def worker_with(tokenizer: MetadataTokenizer) -> tuple[FakeModel, object]:
+            model = FakeModel()
+            worker = build_flash_worker(
+                policy,
+            )(loader=CountingLoader(model, tokenizer))
+            return model, worker
+
+        for truncated in (None, 0, [0], (0,)):
+            with self.subTest(truncated=truncated):
+                model, worker = worker_with(MetadataTokenizer(truncated))
+                response = worker.score(_request_for_config(policy))
+                self.assertEqual(
+                    response["scores"],
+                    [{"hash": sha256_bytes("text").hex(), "score": 4.0}],
+                )
+                self.assertEqual(len(model.predict_calls), 1)
+        for truncated in (False, [], ()):
+            with self.subTest(truncated=truncated):
+                model, worker = worker_with(MetadataTokenizer(truncated))
+                with self.assertRaises(ValueError):
+                    worker.score(_request_for_config(policy))
+                self.assertEqual(model.predict_calls, [])
+        model, worker = worker_with(MetadataTokenizer(0, include_length=False))
+        response = worker.score(_request_for_config(policy))
+        self.assertEqual(
+            response["scores"],
+            [{"hash": sha256_bytes("text").hex(), "score": 4.0}],
+        )
+        self.assertEqual(len(model.predict_calls), 1)
+
+        model, worker = worker_with(MetadataTokenizer(0, reported_length=999))
+        with self.assertRaises(ValueError):
+            worker.score(_request_for_config(policy))
+        self.assertEqual(model.predict_calls, [])
+
     def test_runtime_validation_accepts_installed_torch_local_version_suffix(
         self,
     ) -> None:

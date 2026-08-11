@@ -340,7 +340,12 @@ class FlashPassageWorker:
         if overflow not in (None, [], (), False):
             raise cls._error("tokenizer reported overflow")
         truncated = cls._as_sequence(encoded.get("num_truncated_tokens"))
-        if truncated not in (None, 0, [], (), False, [0], (0,)):
+        if not (
+            truncated is None
+            or (type(truncated) is int and truncated == 0)
+            or (type(truncated) is list and truncated == [0])
+            or (type(truncated) is tuple and truncated == (0,))
+        ):
             raise cls._error("tokenizer reported truncation")
         return length
 

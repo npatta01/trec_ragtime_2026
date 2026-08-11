@@ -783,6 +783,7 @@ class RunpodFlashPassageScorer:
         current_serialized_row_bytes = 0
         current_row_count = 0
         limit = min(config.max_payload_bytes, FLASH_PAYLOAD_LIMIT_BYTES)
+        batch_size = config.effective_batch_size
 
         def fits(serialized_row_bytes: int) -> bool:
             return body_sizer.body_size(serialized_row_bytes) < limit
@@ -813,7 +814,7 @@ class RunpodFlashPassageScorer:
             current_row_count = 0
 
         for content_hash, text in unique.items():
-            if current_row_count >= config.effective_batch_size:
+            if current_row_count >= batch_size:
                 flush()
             candidate_row_size = row_sizes[content_hash]
             candidate_serialized_row_bytes = (
@@ -851,6 +852,8 @@ class RunpodFlashPassageScorer:
             response = decode_flash_response(raw)  # type: ignore[arg-type]
         except asyncio.TimeoutError as error:
             raise FlashScoringError("Flash batch timed out") from error
+        except asyncio.CancelledError as error:
+            raise FlashScoringError("Flash batch cancelled") from error
         except FlashScoringError:
             raise
         except Exception as error:
