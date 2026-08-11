@@ -108,6 +108,26 @@ class FlashPassageWorker:
         if fields != ["query"]:
             raise cls._error("query_format must contain exactly one {query} field")
 
+    @staticmethod
+    def _runtime_version_matches(declared: object, installed: object) -> bool:
+        if declared == installed:
+            return True
+        if not isinstance(declared, str) or not isinstance(installed, str):
+            return False
+
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            declared_version = Version(declared)
+            installed_version = Version(installed)
+        except InvalidVersion:
+            return False
+        return (
+            declared_version.local is None
+            and installed_version.local is not None
+            and Version(installed_version.public) == declared_version
+        )
+
     @classmethod
     def _validate_runtime_versions(cls, values: dict[str, object]) -> None:
         import importlib.metadata
@@ -126,7 +146,7 @@ class FlashPassageWorker:
                 raise cls._error(
                     f"{field_name} cannot be validated because the pinned dependency is unavailable"
                 ) from error
-            if declared != installed:
+            if not cls._runtime_version_matches(declared, installed):
                 raise cls._error(
                     f"{field_name} does not match the installed pinned dependency"
                 )
@@ -557,12 +577,17 @@ def _pinned_dependencies(config: object) -> list[str]:
         msgspec_version = importlib.metadata.version("msgspec")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError("msgspec is required by the Flash worker") from error
+    try:
+        packaging_version = importlib.metadata.version("packaging")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError("packaging is required by the Flash worker") from error
     return [
         f"sentence-transformers=={config.sentence_transformers_version}",
         f"transformers=={config.transformers_version}",
         f"tokenizers=={config.tokenizers_version}",
         f"torch=={config.torch_version}",
         f"msgspec=={msgspec_version}",
+        f"packaging=={packaging_version}",
     ]
 
 

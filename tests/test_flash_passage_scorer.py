@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import redirect_stderr, redirect_stdout
+import importlib.metadata
 import json
 import inspect
 from io import StringIO
@@ -666,6 +667,77 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
 
 class StaticFlashWorkerTests(unittest.TestCase):
+    def test_runtime_validation_accepts_installed_torch_local_version_suffix(
+        self,
+    ) -> None:
+        values = {
+            "sentence_transformers_version": "1.0.0",
+            "transformers_version": "1.0.0",
+            "tokenizers_version": "1.0.0",
+            "torch_version": "2.9.1",
+        }
+        installed = {
+            "sentence-transformers": "1.0.0",
+            "transformers": "1.0.0",
+            "tokenizers": "1.0.0",
+            "torch": "2.9.1+cu128",
+        }
+
+        with patch.object(
+            importlib.metadata,
+            "version",
+            side_effect=installed.__getitem__,
+        ):
+            FlashPassageWorker._validate_runtime_versions(values)
+
+    def test_runtime_validation_accepts_normalized_public_version_with_local_suffix(
+        self,
+    ) -> None:
+        values = {
+            "sentence_transformers_version": "1.0.0",
+            "transformers_version": "1.0.0",
+            "tokenizers_version": "1.0.0",
+            "torch_version": "1.0",
+        }
+        installed = {
+            "sentence-transformers": "1.0.0",
+            "transformers": "1.0.0",
+            "tokenizers": "1.0.0",
+            "torch": "1.0.0+vendor",
+        }
+
+        with patch.object(
+            importlib.metadata,
+            "version",
+            side_effect=installed.__getitem__,
+        ):
+            FlashPassageWorker._validate_runtime_versions(values)
+
+    def test_runtime_validation_rejects_public_version_drift_for_each_pinned_distribution(
+        self,
+    ) -> None:
+        fields_and_distributions = (
+            ("sentence_transformers_version", "sentence-transformers"),
+            ("transformers_version", "transformers"),
+            ("tokenizers_version", "tokenizers"),
+            ("torch_version", "torch"),
+        )
+        values = {field_name: "1.0.0" for field_name, _ in fields_and_distributions}
+
+        for field_name, distribution in fields_and_distributions:
+            with self.subTest(field_name=field_name):
+                installed = {name: "1.0.0" for _, name in fields_and_distributions}
+                installed[distribution] = "1.0.1+local"
+                with (
+                    patch.object(
+                        importlib.metadata,
+                        "version",
+                        side_effect=installed.__getitem__,
+                    ),
+                    self.assertRaisesRegex(ValueError, field_name),
+                ):
+                    FlashPassageWorker._validate_runtime_versions(values)
+
     def test_repeated_builds_do_not_mutate_static_worker_error_type(self) -> None:
         policy_a = LocalCrossEncoderConfig(query_policy="policy-a")
         policy_b = replace(policy_a, query_policy="policy-b")
@@ -1108,6 +1180,7 @@ class FlashDecorationTests(unittest.TestCase):
                 f"tokenizers=={policy.tokenizers_version}",
                 f"torch=={policy.torch_version}",
                 "msgspec==0.21.1",
+                f"packaging=={importlib.metadata.version('packaging')}",
             ],
         )
 
