@@ -27,6 +27,7 @@ from trec_ragtime.flash_passage_scorer import (
     encode_flash_request,
     encode_flash_response,
 )
+import trec_ragtime.flash_passage_scorer as flash_passage_scorer
 from trec_ragtime.flash_worker import FlashPassageWorker, build_flash_worker
 from trec_ragtime.passage_scoring import (
     LocalCrossEncoderConfig,
@@ -327,6 +328,48 @@ class RunpodFlashConfigTests(unittest.TestCase):
 
 
 class RunpodFlashPassageScorerTests(unittest.TestCase):
+    def test_batch_sizing_uses_scalar_totals_and_builds_body_only_on_flush(
+        self,
+    ) -> None:
+        config = RunpodFlashConfig(endpoint_id="fake", batch_size=7)
+        unique = {sha256_bytes(f"text-{index}"): f"text-{index}" for index in range(7)}
+        original_body_size = flash_passage_scorer._RunpodRequestBodySizer.body_size
+        original_request_body = flash_passage_scorer._runpod_request_body
+        body_size_calls: list[int] = []
+        request_body_calls = 0
+
+        def record_body_size(sizer: object, serialized_row_bytes: int) -> int:
+            if not isinstance(serialized_row_bytes, int):
+                raise AssertionError("batch sizing must pass a scalar row-byte total")
+            body_size_calls.append(serialized_row_bytes)
+            return original_body_size(sizer, serialized_row_bytes)
+
+        def count_request_body_builds(payload: bytes) -> bytes:
+            nonlocal request_body_calls
+            request_body_calls += 1
+            return original_request_body(payload)
+
+        def reject_sequence_sum(_: object) -> int:
+            raise AssertionError("batch sizing must not sum candidate row sequences")
+
+        with (
+            patch.object(
+                flash_passage_scorer._RunpodRequestBodySizer,
+                "body_size",
+                record_body_size,
+            ),
+            patch.object(
+                flash_passage_scorer,
+                "_runpod_request_body",
+                count_request_body_builds,
+            ),
+            patch.object(flash_passage_scorer, "sum", reject_sequence_sum, create=True),
+        ):
+            batches = RunpodFlashPassageScorer._build_batches("query", unique, config)
+
+        self.assertEqual(len(body_size_calls), len(unique) + len(batches))
+        self.assertEqual(request_body_calls, len(batches))
+
     def test_adapter_and_worker_failures_do_not_emit_sensitive_literals(self) -> None:
         query = "query-sensitive-7f"
         text = "passage-sensitive-8g"
@@ -355,7 +398,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 scorer.close()
 
             worker = build_flash_worker(config)(loader=failing_loader)
-            with self.assertRaises(FlashScoringError):
+            with self.assertRaises(ValueError):
                 worker.score(_request_for_config(config, query=query, text=text))
 
         output = stdout.getvalue() + stderr.getvalue()
@@ -623,6 +666,19 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
 
 class StaticFlashWorkerTests(unittest.TestCase):
+    def test_repeated_builds_do_not_mutate_static_worker_error_type(self) -> None:
+        policy_a = LocalCrossEncoderConfig(query_policy="policy-a")
+        policy_b = replace(policy_a, query_policy="policy-b")
+
+        first = build_flash_worker(policy_a)
+        second = build_flash_worker(policy_b)
+
+        self.assertIs(first, FlashPassageWorker)
+        self.assertIs(second, FlashPassageWorker)
+        self.assertIs(FlashPassageWorker._ERROR, ValueError)
+        self.assertNotIn("FlashScoringError", inspect.getsource(FlashPassageWorker))
+        self.assertNotIn("FlashScoringError", inspect.getsource(build_flash_worker))
+
     def test_worker_fingerprint_matches_rotated_local_identity(self) -> None:
         policy = LocalCrossEncoderConfig()
 
@@ -733,7 +789,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
         worker.score(request)
         self.assertEqual(len(loader.calls), 1)
         drifted = replace(policy, query_policy="drifted")
-        with self.assertRaises(FlashScoringError):
+        with self.assertRaises(ValueError):
             worker.score(_request_for_config(drifted))
         self.assertEqual(len(loader.calls), 1)
 
@@ -880,9 +936,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
         loader = CountingLoader(model, tokenizer)
         worker = build_flash_worker(policy_a)(loader=loader)
 
-        with self.assertRaises(FlashScoringError):
+        with self.assertRaises(ValueError):
             worker.score(_request_for_config(policy_a))
-        with self.assertRaises(FlashScoringError):
+        with self.assertRaises(ValueError):
             worker.score(_request_for_config(policy_b))
 
         self.assertEqual(len(loader.calls), 1)
@@ -894,11 +950,11 @@ class StaticFlashWorkerTests(unittest.TestCase):
         worker = build_flash_worker(policy)(loader=loader)
         request = _request_for_config(policy)
 
-        with self.assertRaises(FlashScoringError):
+        with self.assertRaises(ValueError):
             worker.score({**request, "extra": True})
-        with self.assertRaises(FlashScoringError):
+        with self.assertRaises(ValueError):
             worker.score({**request, "scorer_fingerprint": "wrong"})
-        with self.assertRaises(FlashScoringError):
+        with self.assertRaises(ValueError):
             worker.score(_request_for_config(policy, text="overflow"))
         self.assertEqual(len(loader.calls), 1)
 

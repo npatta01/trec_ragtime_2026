@@ -8,8 +8,10 @@ import sys
 import threading
 import unittest
 from collections.abc import Callable, Mapping, Sequence
+from unittest import mock
 
 import msgspec
+import trec_ragtime.passage_score_cache as passage_score_cache_module
 
 from trec_ragtime.artifact_store import (
     ArtifactStoreRemoteError,
@@ -89,6 +91,12 @@ class UnsuccessfulWriteArtifactStore(FakeArtifactStore):
     def write(self, key: str, payload: bytes) -> bool:
         self.write_calls.append((key, payload))
         return False
+
+
+class TruthyNonBooleanWriteArtifactStore(FakeArtifactStore):
+    def write(self, key: str, payload: bytes) -> object:
+        self.write_calls.append((key, payload))
+        return 1
 
 
 class RecordingScorer:
@@ -298,6 +306,30 @@ print(encode_score_map(scores).hex())
             score_object_key("query", "model-v1", "chunker-v1", "canonical"),
             score_object_key("query ", "model-v1", "chunker-v1", "canonical"),
         )
+
+    def test_score_identity_uses_schema_constant_without_rotating_current_v1_key(
+        self,
+    ) -> None:
+        key_v1 = score_object_key("exact query", "model-v1", "chunker-v1", "canonical")
+
+        with mock.patch.object(
+            passage_score_cache_module,
+            "CACHE_SCHEMA_VERSION",
+            2,
+        ):
+            key_v2 = score_object_key(
+                "exact query", "model-v1", "chunker-v1", "canonical"
+            )
+
+        self.assertEqual(passage_score_cache_module.CACHE_SCHEMA_VERSION, 1)
+        self.assertEqual(
+            key_v1,
+            "passage-scores/v1/"
+            "bc1c48d73ed13a576ceffd98f086462649e21723071ce688e631def66ecdd89e/"
+            "38/382a3aa4e4212f03dfe6584350f40bc3772f5c3544e10373375ee6c70083e5db.mpk",
+        )
+        self.assertTrue(key_v1.startswith("passage-scores/v1/"))
+        self.assertNotEqual(key_v1, key_v2)
 
     def test_scorer_chunker_and_representation_isolate_objects(self) -> None:
         keys = {
@@ -700,6 +732,16 @@ print(encode_score_map(scores).hex())
             _cache(store, scorer).score("query", (passage,))
 
         self.assertEqual(scorer.calls, [("query", (passage.content_hash,))])
+        self.assertEqual(len(store.write_calls), 1)
+        self.assertEqual(store.objects, {})
+
+    def test_truthy_non_boolean_write_result_is_fatal(self) -> None:
+        passage = _passage("first")
+        store = TruthyNonBooleanWriteArtifactStore()
+
+        with self.assertRaises(ArtifactStoreRemoteError):
+            _cache(store, RecordingScorer()).score("query", (passage,))
+
         self.assertEqual(len(store.write_calls), 1)
         self.assertEqual(store.objects, {})
 

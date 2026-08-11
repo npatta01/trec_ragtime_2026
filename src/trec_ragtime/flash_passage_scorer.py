@@ -707,6 +707,38 @@ def _runpod_request_body(payload: bytes) -> bytes:
     ).encode("utf-8")
 
 
+class _RunpodRequestBodySizer:
+    """Measure wrapped request bodies from already validated request parts."""
+
+    __slots__ = ("_prefix", "_suffix")
+
+    def __init__(
+        self,
+        query: str,
+        model_config: Mapping[str, object],
+        scorer_fingerprint: str,
+    ) -> None:
+        self._prefix = (
+            b'{"input":{"request":{"schema_version":'
+            + _json_bytes(WIRE_SCHEMA_VERSION)
+            + b',"scorer_fingerprint":'
+            + _json_bytes(scorer_fingerprint)
+            + b',"model_config":'
+            + _json_bytes(model_config)
+            + b',"query":'
+            + _json_bytes(query)
+            + b',"rows":['
+        )
+        self._suffix = b"]}}}"
+
+    @staticmethod
+    def row_size(content_hash: bytes, text: str) -> int:
+        return len(_json_bytes({"hash": content_hash.hex(), "text": text}))
+
+    def body_size(self, serialized_row_bytes: int) -> int:
+        return len(self._prefix) + len(self._suffix) + serialized_row_bytes
+
+
 class RunpodFlashPassageScorer:
     """Synchronous exact scorer backed by bounded asynchronous Flash batches."""
 
@@ -742,24 +774,34 @@ class RunpodFlashPassageScorer:
     ) -> tuple[tuple[bytes, frozenset[bytes]], ...]:
         batches: list[tuple[bytes, frozenset[bytes]]] = []
         current: list[tuple[bytes, str]] = []
+        model_config = _model_config_mapping(config.effective_model_config)
+        body_sizer = _RunpodRequestBodySizer(query, model_config, config.fingerprint)
+        row_sizes = {
+            content_hash: body_sizer.row_size(content_hash, text)
+            for content_hash, text in unique.items()
+        }
+        current_serialized_row_bytes = 0
+        current_row_count = 0
+        limit = min(config.max_payload_bytes, FLASH_PAYLOAD_LIMIT_BYTES)
 
-        def fits(payload: bytes) -> bool:
-            request_body = _runpod_request_body(payload)
-            return (
-                len(request_body) < config.max_payload_bytes
-                and len(request_body) < FLASH_PAYLOAD_LIMIT_BYTES
-            )
+        def fits(serialized_row_bytes: int) -> bool:
+            return body_sizer.body_size(serialized_row_bytes) < limit
 
         def flush() -> None:
+            nonlocal current_serialized_row_bytes, current_row_count
             if not current:
                 return
             payload = encode_flash_request(
                 query,
                 current,
-                model_config=_model_config_mapping(config.effective_model_config),
+                model_config=model_config,
                 scorer_fingerprint=config.fingerprint,
             )
-            if not fits(payload):
+            request_body = _runpod_request_body(payload)
+            if (
+                len(request_body) != body_sizer.body_size(current_serialized_row_bytes)
+                or len(request_body) >= limit
+            ):
                 raise FlashScoringError(
                     "Flash payload must be strictly below its byte limit"
                 )
@@ -767,33 +809,32 @@ class RunpodFlashPassageScorer:
                 (payload, frozenset(content_hash for content_hash, _ in current))
             )
             current.clear()
+            current_serialized_row_bytes = 0
+            current_row_count = 0
 
         for content_hash, text in unique.items():
-            if len(current) >= config.effective_batch_size:
+            if current_row_count >= config.effective_batch_size:
                 flush()
-            candidate = current + [(content_hash, text)]
-            candidate_payload = encode_flash_request(
-                query,
-                candidate,
-                model_config=_model_config_mapping(config.effective_model_config),
-                scorer_fingerprint=config.fingerprint,
+            candidate_row_size = row_sizes[content_hash]
+            candidate_serialized_row_bytes = (
+                current_serialized_row_bytes
+                + candidate_row_size
+                + (1 if current_row_count else 0)
             )
-            if fits(candidate_payload):
+            if fits(candidate_serialized_row_bytes):
                 current.append((content_hash, text))
+                current_serialized_row_bytes = candidate_serialized_row_bytes
+                current_row_count += 1
                 continue
             if current:
                 flush()
-                single_payload = encode_flash_request(
-                    query,
-                    [(content_hash, text)],
-                    model_config=_model_config_mapping(config.effective_model_config),
-                    scorer_fingerprint=config.fingerprint,
-                )
-                if not fits(single_payload):
+                if not fits(candidate_row_size):
                     raise FlashScoringError(
                         "one passage exceeds the Flash JSON payload limit"
                     )
                 current.append((content_hash, text))
+                current_serialized_row_bytes = candidate_row_size
+                current_row_count = 1
                 continue
             raise FlashScoringError("one passage exceeds the Flash JSON payload limit")
         flush()

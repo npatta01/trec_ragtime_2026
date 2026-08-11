@@ -91,7 +91,7 @@ def _score_identity(
 ) -> str:
     material = msgspec.msgpack.encode(
         (
-            "passage-score-cache-v1",
+            f"passage-score-cache-v{CACHE_SCHEMA_VERSION}",
             _non_blank(scorer_fingerprint, "scorer_fingerprint"),
             _non_blank(chunker_fingerprint, "chunker_fingerprint"),
             _representation(representation),
@@ -205,14 +205,14 @@ def _unique_requested(
 class PassageScoreCache:
     """Cache-aside adapter for complete per-query passage score maps.
 
-    Cache instances serialize the complete read/score/merge/write transaction
-    for the same object key when the injected store exposes only the basic
-    ``ArtifactStoreLike`` seam. A store that supports shared writers may also
-    expose ``atomic_update(key, transform) -> bytes``; the transform receives
-    the latest raw payload and must be applied and published atomically by the
-    store. This optional capability prevents cross-process and cross-machine
-    disjoint score updates from being lost without expanding this adapter's
-    public interface.
+    With only the basic ``ArtifactStoreLike`` seam, cache instances serialize
+    the complete read/score/merge/write transaction for the same object key
+    within this process. Callers must use one worker per query across processes
+    or machines; otherwise disjoint updates are last-writer-wins and may be
+    lost. A store that supports shared writers may also expose
+    ``atomic_update(key, transform) -> bytes``; the transform receives the
+    latest raw payload and is applied and published atomically only when the
+    store actually provides that guarantee.
     """
 
     __slots__ = (

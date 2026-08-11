@@ -616,9 +616,6 @@ def build_flash_worker(
     model_config, worker_name, gpu_name, workers, idle_timeout = _effective_config(
         config
     )
-    from .flash_passage_scorer import FlashScoringError
-
-    FlashPassageWorker._ERROR = FlashScoringError
     if endpoint_factory is None:
         return FlashPassageWorker
 
