@@ -2,7 +2,9 @@
 
 This repository is a small working companion for TREC RAGTIME 2026. It combines
 an at-a-glance track reference with a runnable notebook that previews the
-RAGTIME2 data without downloading the full collection.
+RAGTIME2 data without downloading the full collection. Passage reranking starts
+with the local scorer; the optional Flash path is only an explicit transport
+seam.
 
 ## Start Here
 
@@ -78,6 +80,175 @@ sops decrypt --output .env config/secrets.sops.env
 For an unshared local configuration, copy `.env.example` to `.env` and fill in
 the token. The plaintext `.env` file is ignored by Git.
 
+## Passage Reranking
+
+Passage reranking is a local-first layer over an existing `RetrievalResult`.
+The normal English report path selects each document's `report_text`: verified
+English translation for Spanish, Russian, and Chinese source documents, or the
+canonical text for an English source. `representation="canonical"` selects the
+original-language source instead. Missing report translations and unresolved
+documents remain in the result with explicit statuses.
+
+The pinned local model is `mixedbread-ai/mxbai-rerank-base-v2` at revision
+`3ea9d4dffa7d12a4f366be8e275c349de9fc9865`, loaded through the supported direct
+`sentence_transformers.CrossEncoder` path. The model-owned tokenizer name and
+revision must match the model name and revision. The tokenizer-only
+`CrossEncoderPairLengthFunction` captures the retrieval query and loads no
+model weights. `LocalCrossEncoderScorer` loads model weights lazily, on the
+first score call, and returns raw cross-encoder logits.
+The supported local flow is below. `retrieval` is an existing hydrated
+`RetrievalResult`, such as the value returned by
+[Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration).
+
+```python
+from trec_ragtime import (
+    CachedPassageScorer,
+    CrossEncoderPairLengthFunction,
+    LocalCrossEncoderConfig,
+    LocalCrossEncoderScorer,
+    PassageChunker,
+    PassageScoreCache,
+    rerank_retrieval,
+)
+
+policy = LocalCrossEncoderConfig(device="cpu")
+pair_length = CrossEncoderPairLengthFunction(policy, retrieval.query)
+chunker = PassageChunker(pair_length, overlap_tokens=64)
+scorer = LocalCrossEncoderScorer(policy)
+
+# Optional complete per-query cache. `store` may be the landed `ArtifactStore`
+# or an `ArtifactStoreLike` fake supplied by the caller.
+cache = PassageScoreCache(
+    store,
+    scorer,
+    chunker_fingerprint=chunker.fingerprint,
+    representation="report_text",
+)
+scorer = CachedPassageScorer(cache)
+
+report_result = rerank_retrieval(
+    retrieval,
+    chunker=chunker,
+    scorer=scorer,
+    representation="report_text",
+)
+```
+
+`PassageChunker` uses the pinned language-specific spaCy pipelines through
+LangChain's sentence splitter. It preserves exact Python-character offsets,
+exact UTF-8 SHA-256 content hashes, and complete selected-text coverage. Normal
+overlap contains complete sentence units only; it never splits a sentence to
+manufacture overlap. If one sentence exceeds the full pair budget, only that
+sentence is passed to `RecursiveCharacterTextSplitter` (RCTS), and every
+fragment is rechecked against the exact pair ceiling. Keep the pair-length
+callable aligned with the scorer: a character count can admit a passage that
+overflows after query and special tokens are included.
+
+Use `device="cuda"` for CUDA PyTorch, or the user-facing `device="rocm"`
+alias on ROCm builds; `rocm` is normalized to PyTorch's `cuda` device. The
+scorer and chunker fingerprints include result-affecting model, tokenizer,
+device, precision, batching, query format, query policy, and pair-length
+settings. Changing one of these settings isolates its score cache.
+
+`PassageScoreCache` stores one complete validated `dict[bytes, float]` per
+query. It accepts the concrete `ArtifactStore` or an `ArtifactStoreLike` fake.
+The small protocol includes `read`, `read_validated`, `write`, and `evict_local`.
+Cache reads return the requested hashes from a complete union, and a successful
+miss merges new scores into that union. Partial or failed scoring is never
+written.
+
+Reranking aggregates each document by its maximum passage score. Evidence is
+deduplicated by positional `(document_id, start_char, end_char)` identity, so
+identical text at distinct offsets remains distinct evidence while sharing a
+safe content-hash score. Ordering is deterministic by descending score,
+organizer rank, and document ID; evidence is ordered by source offsets.
+
+Flash remains an optional transport for the same `PassageScorer` contract; the
+local path above is the primary complete execution path. Install Flash
+separately with `uv sync --extra runpod`. Bounded payload size, batch size,
+concurrency, request timeout, worker count, and idle timeout remain explicit.
+The adapter accepts the same complete score map, and the static worker accepts
+mapping-compatible Transformers `BatchEncoding` values. An existing endpoint
+caller and a later worker definition use the same pinned model policy:
+
+```python
+from trec_ragtime import (
+    CrossEncoderPairLengthFunction,
+    FlashEndpointBatchRunner,
+    PassageChunker,
+    RunpodFlashPassageScorer,
+    RunpodFlashConfig,
+    build_flash_worker,
+    rerank_retrieval,
+)
+
+flash_policy = RunpodFlashConfig(
+    endpoint_id="existing-endpoint-id",
+    model_config=policy,
+    device="cuda",
+    batch_size=32,
+    max_payload_bytes=9_000_000,
+    concurrency=4,
+    request_timeout=60.0,
+    workers=1,
+    idle_timeout=300,
+)
+
+remote_policy = flash_policy.effective_model_config
+remote_pair_length = CrossEncoderPairLengthFunction(remote_policy, retrieval.query)
+remote_chunker = PassageChunker(remote_pair_length, overlap_tokens=64)
+
+# Caller and scorer for an endpoint that already exists.
+with FlashEndpointBatchRunner(flash_policy) as endpoint_runner:
+    with RunpodFlashPassageScorer(flash_policy, endpoint_runner) as flash_scorer:
+        flash_result = rerank_retrieval(
+            retrieval,
+            chunker=remote_chunker,
+            scorer=flash_scorer,
+            representation="report_text",
+        )
+
+# Definition seam for a later, explicit worker-definition workflow.
+from runpod_flash import Endpoint
+
+worker_definition = build_flash_worker(
+    flash_policy,
+    endpoint_factory=Endpoint,
+)
+```
+
+`FlashEndpointBatchRunner` constructs an `Endpoint(id=...)`, submits with
+`run()`, and waits with `job.wait()`. `build_flash_worker` only returns the
+static worker or applies the explicit endpoint decorator with pinned
+dependencies. Building a worker definition does not deploy, provision, or
+make a paid request. No paid or deployment action is authorized by this
+refactor.
+
+Offline reranking verification starts after decrypting `.env` and makes no
+organizer, Hugging Face, Runpod, or model-download calls:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest tests.test_passage_reranking_integration -v
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest \
+  tests.test_passages \
+  tests.test_passage_scoring \
+  tests.test_passage_score_cache \
+  tests.test_reranking \
+  tests.test_flash_passage_scorer \
+  tests.test_passage_reranking_integration -v
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python scripts/benchmark_passage_chunking.py
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest discover -s tests -v
+```
+
+Offline fakes and an in-memory Flash wire runner intentionally replace all
+organizer, Dataset Viewer, endpoint, deployment, and model-weight calls in
+these checks. A real local model batch and live endpoint behavior remain
+explicit external acceptance gates.
+
 ## Hosted Retrieval Model
 
 The official participant endpoint currently uses
@@ -131,13 +302,13 @@ public [Hugging Face corpus](https://huggingface.co/datasets/trec-ragtime/ragtim
 from trec_ragtime import RagtimeRetriever
 
 with RagtimeRetriever.from_env() as retriever:
-    result = retriever.retrieve(
+    retrieval = retriever.retrieve(
         "health benefits of Nordic walking",
         pipeline="ragtime2%100",
         top_k=None,
     )
 
-for document in result.documents:
+for document in retrieval.documents:
     print(
         document.rank,
         document.document_id,
