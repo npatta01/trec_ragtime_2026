@@ -138,6 +138,22 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   Hub revision. Keep it only for environments without the complete local
   index. Do not build another FAISS/vector index for hydration; document IDs
   are exact lookup keys after hosted retrieval.
+- `trec_ragtime.nuggetizer_adapter` is the only module that may import
+  `nuggetizer`. Keep the pin at the published `nuggetizer==0.0.5`: later
+  upstream commits move the prompts into `src/nuggetizer/prompts/` without
+  adding that package to the setuptools `include` list, so a Git-pinned build
+  installs and then fails on `from ..prompts import ...`. Provider routing is
+  environment driven through `OPENAI_API_KEY` and `OPENAI_BASE_URL`; never pass
+  credentials through the adapter. Upstream retries a failed call forever, so
+  every topic runs under a finite provider-call budget.
+- Nugget source linkage comes from the package's assigner, never from a model
+  echoing a document ID. A claim no passage supports is quarantined, and a topic
+  where nothing survives fails without writing an artifact. Upstream
+  `vital`/`okay` and support labels are signals, not qrels or human judgments.
+- A nugget bundle never stores passage text. Offsets plus `content_hash` prove
+  which text was used and the text stays recoverable from the retrieval
+  artifact. The request identity pins the ordered alias table, so an altered
+  alias, document, or offset cannot be read back under the same key.
 - Cache keys must include the endpoint, operation, namespace, and exact request,
   but never the bearer token. Cache only validated successful responses.
 - The OpenAI-compatible chat-completion cache stores the complete validated
