@@ -89,9 +89,10 @@ canonical text for an English source. `representation="canonical"` selects the
 original-language source instead. Missing report translations and unresolved
 documents remain in the result with explicit statuses.
 
-The pinned local model is `BAAI/bge-reranker-v2-m3` at revision
-`953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`, with the tokenizer name and revision
-pinned to the same checkpoint. The tokenizer-only
+The pinned local model is `mixedbread-ai/mxbai-rerank-base-v2` at revision
+`3ea9d4dffa7d12a4f366be8e275c349de9fc9865`, loaded through the supported direct
+`sentence_transformers.CrossEncoder` path. The model-owned tokenizer name and
+revision must match the model name and revision. The tokenizer-only
 `CrossEncoderPairLengthFunction` captures the retrieval query and loads no
 model weights. `LocalCrossEncoderScorer` loads model weights lazily, on the
 first score call, and returns raw cross-encoder logits.
@@ -115,14 +116,13 @@ pair_length = CrossEncoderPairLengthFunction(policy, retrieval.query)
 chunker = PassageChunker(pair_length, overlap_tokens=64)
 scorer = LocalCrossEncoderScorer(policy)
 
-# Optional complete per-query cache. `store` is an ArtifactStoreLike supplied
-# by the caller; this project does not provide a concrete ArtifactStore.
+# Optional complete per-query cache. `store` may be the landed `ArtifactStore`
+# or an `ArtifactStoreLike` fake supplied by the caller.
 cache = PassageScoreCache(
     store,
     scorer,
     chunker_fingerprint=chunker.fingerprint,
     representation="report_text",
-    artifact_validation_error=ValueError,
 )
 scorer = CachedPassageScorer(cache)
 
@@ -151,11 +151,11 @@ device, precision, batching, query format, query policy, and pair-length
 settings. Changing one of these settings isolates its score cache.
 
 `PassageScoreCache` stores one complete validated `dict[bytes, float]` per
-query. It uses the future `ArtifactStoreLike` seam with `read`,
-`read_validated`, `write`, and `evict_local`; there is no concrete store in
-this refactor. Cache reads return the requested hashes from a complete union,
-and a successful miss merges new scores into that union. Partial or failed
-scoring is never written.
+query. It accepts the concrete `ArtifactStore` or an `ArtifactStoreLike` fake.
+The small protocol includes `read`, `read_validated`, `write`, and `evict_local`.
+Cache reads return the requested hashes from a complete union, and a successful
+miss merges new scores into that union. Partial or failed scoring is never
+written.
 
 Reranking aggregates each document by its maximum passage score. Evidence is
 deduplicated by positional `(document_id, start_char, end_char)` identity, so
@@ -191,7 +191,7 @@ flash_policy = RunpodFlashConfig(
     concurrency=4,
     request_timeout=60.0,
     workers=1,
-    idle_timeout=300.0,
+    idle_timeout=300,
 )
 
 remote_policy = flash_policy.effective_model_config

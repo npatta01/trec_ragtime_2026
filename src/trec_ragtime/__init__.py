@@ -95,11 +95,6 @@ from .passages import (
     sha256_bytes,
     validate_passages,
 )
-from .paths import (
-    PROJECT_CACHE_DIR_ENV,
-    default_project_cache_dir,
-    ensure_private_cache_dir,
-)
 from .reranking import (
     PassageEvidence,
     RerankedDocument,
@@ -174,7 +169,6 @@ __all__ = [
     "CachedPassageScorer",
     "PassageScoreCache",
     "PipelineResult",
-    "PROJECT_CACHE_DIR_ENV",
     "RagtimeApiError",
     "RagtimeClient",
     "RagtimeConfigurationError",
@@ -201,8 +195,6 @@ __all__ = [
     "decode_flash_request",
     "decode_flash_response",
     "default_local_corpus_path",
-    "default_project_cache_dir",
-    "ensure_private_cache_dir",
     "encode_flash_request",
     "encode_flash_response",
     "max_passage_v1",

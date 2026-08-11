@@ -22,6 +22,22 @@ def load_cases() -> list[dict[str, object]]:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["cases"]
 
 
+PARAGRAPH_PREFERENCE_CASE: dict[str, object] = {
+    "name": "paragraph_preference",
+    "document_id": "doc-paragraph-preference-001",
+    "canonical_text": ("First alpha. First beta.\n\nSecond alpha. Second beta."),
+    "selected_text": "First alpha. First beta.\n\nSecond alpha. Second beta.",
+    "representation": "canonical",
+    "language": "eng",
+    "pipeline_name": "en_core_web_sm",
+    "max_length": 8,
+    "max_passage_length": 6,
+    "overlap_tokens": 0,
+    "expected_spans": [[0, 26], [26, 52]],
+    "expected_boundaries": ["sentence", "sentence"],
+}
+
+
 class FixturePairLength:
     passage_length_function = staticmethod(lambda text: len(text.split()))
 
@@ -35,11 +51,6 @@ class FixturePairLength:
 
 
 class PassageContractTests(unittest.TestCase):
-    def test_benchmark_guard_rejects_multi_sentence_rcts(self) -> None:
-        from scripts.benchmark_passage_chunking import verify_multi_sentence_guard
-
-        self.assertTrue(verify_multi_sentence_guard())
-
     def test_benchmark_records_only_compact_passage_fields(self) -> None:
         from scripts.benchmark_passage_chunking import record_passages
 
@@ -178,34 +189,288 @@ class PassageValidationTests(unittest.TestCase):
 
 
 class PassageChunkerTests(unittest.TestCase):
-    def test_multi_sentence_over_ceiling_rejects_before_rcts(self) -> None:
+    def test_paragraph_preference_keeps_fit_paragraphs_separate(self) -> None:
+        case = PARAGRAPH_PREFERENCE_CASE
+        selected_text = str(case["selected_text"])
+        passages = self.chunk_case(case)
+
+        self.assert_exact_passages(
+            selected_text,
+            passages,
+            [tuple(span) for span in case["expected_spans"]],  # type: ignore[arg-type]
+        )
+        self.assertEqual(
+            [passage.text for passage in passages],
+            [
+                "First alpha. First beta.\n\n",
+                "Second alpha. Second beta.",
+            ],
+        )
+        self.assertEqual(
+            [passage.boundary for passage in passages],
+            case["expected_boundaries"],
+        )
+
+    def test_oversized_span_uses_full_document_sentence_context(self) -> None:
+        import trec_ragtime.passages as passages_module
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        prefix = "Context. "
+        oversized = "Alpha beta gamma. Delta epsilon zeta."
+        suffix = " Tail."
+        selected_text = prefix + oversized + suffix
+        tokenizer_inputs: list[str] = []
+
         class PairLength:
-            fingerprint = "multi-sentence-guard-v1"
+            fingerprint = "context-sensitive-oversized-sentence-v1"
             max_length = 5
             max_passage_length = 3
             passage_length_function = staticmethod(lambda text: len(text.split()))
 
             def __call__(self, text: str) -> int:
-                if text.count(".") >= 2:
-                    return 6
-                return len(text.split()) + 1
+                return len(text.split())
 
-        chunker = PassageChunker(PairLength(), overlap_tokens=0)
+        class FakeDocument:
+            def __init__(self, text: str, start_char: int) -> None:
+                self.page_content = text
+                self.metadata = {"start_index": start_char}
+
+        class FakeSentence:
+            def __init__(self, start_char: int, text_with_ws: str) -> None:
+                self.start_char = start_char
+                self.text_with_ws = text_with_ws
+
+        class FakeTokenizedDocument:
+            def __init__(self, sentences: tuple[FakeSentence, ...]) -> None:
+                self.sents = sentences
+
+        class FakeSentenceSplitter:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def _tokenizer(self, text: str) -> FakeTokenizedDocument:
+                tokenizer_inputs.append(text)
+                if text == selected_text:
+                    return FakeTokenizedDocument(
+                        (
+                            FakeSentence(0, prefix),
+                            FakeSentence(len(prefix), oversized),
+                            FakeSentence(len(prefix) + len(oversized) + 1, "Tail."),
+                        )
+                    )
+                if text == oversized:
+                    first = "Alpha beta gamma. "
+                    return FakeTokenizedDocument(
+                        (
+                            FakeSentence(0, first),
+                            FakeSentence(len(first), text[len(first) :]),
+                        )
+                    )
+                raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+            def create_documents(self, texts: list[str]) -> list[FakeDocument]:
+                return [
+                    FakeDocument(prefix, 0),
+                    FakeDocument(oversized, len(prefix)),
+                    FakeDocument(" Tail.", len(prefix) + len(oversized)),
+                ]
+
         with patch.object(
-            PassageChunker,
-            "_recursive_splitter",
-            side_effect=AssertionError("RCTS must not receive multiple sentences"),
+            passages_module,
+            "_load_splitters",
+            return_value=(FakeSentenceSplitter, RecursiveCharacterTextSplitter),
         ):
-            with self.assertRaisesRegex(
-                PassageChunkingError, "exactly one underlying sentence"
+            chunker = PassageChunker(PairLength(), overlap_tokens=0)
+            passages = chunker.chunk(
+                document_id="context-sensitive-oversized-sentence",
+                canonical_text=selected_text,
+                selected_text=selected_text,
+                representation="canonical",
+                language="eng",
+            )
+
+        self.assertEqual(tokenizer_inputs, [selected_text])
+        self.assertEqual(
+            [passage.boundary for passage in passages],
+            ["sentence", "oversized_sentence", "oversized_sentence", "sentence"],
+        )
+        self.assertEqual("".join(passage.text for passage in passages), selected_text)
+
+    def test_oversized_multi_sentence_span_emits_authoritative_units(self) -> None:
+        import trec_ragtime.passages as passages_module
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        selected_text = "Alpha beta.  Gamma delta.\nEpsilon zeta."
+        first_sentence_end = selected_text.index("Gamma")
+        second_sentence_end = selected_text.index("Epsilon")
+
+        class PairLength:
+            fingerprint = "multi-sentence-direct-units-v1"
+            max_length = 5
+            max_passage_length = 4
+            passage_length_function = staticmethod(lambda text: len(text.split()))
+
+            def __call__(self, text: str) -> int:
+                return len(text.split())
+
+        class FakeDocument:
+            def __init__(self, text: str, start_char: int) -> None:
+                self.page_content = text
+                self.metadata = {"start_index": start_char}
+
+        class FakeSentence:
+            def __init__(self, start_char: int, text_with_ws: str) -> None:
+                self.start_char = start_char
+                self.text_with_ws = text_with_ws
+
+        first_sentence = "Alpha beta.  "
+        second_sentence = "Gamma delta.\n"
+        third_sentence = "Epsilon zeta."
+
+        class FakeTokenizedDocument:
+            sents = (
+                FakeSentence(0, first_sentence),
+                FakeSentence(len(first_sentence), second_sentence),
+                FakeSentence(
+                    len(first_sentence) + len(second_sentence), third_sentence
+                ),
+            )
+
+        class FakeSentenceSplitter:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def _tokenizer(self, text: str) -> FakeTokenizedDocument:
+                if text != selected_text:
+                    raise AssertionError(f"unexpected tokenizer input: {text!r}")
+                return FakeTokenizedDocument()
+
+            def create_documents(self, texts: list[str]) -> list[FakeDocument]:
+                return [FakeDocument(texts[0], 0)]
+
+        with patch.object(
+            passages_module,
+            "_load_splitters",
+            return_value=(FakeSentenceSplitter, RecursiveCharacterTextSplitter),
+        ):
+            chunker = PassageChunker(PairLength(), overlap_tokens=0)
+            with patch.object(
+                PassageChunker,
+                "_recursive_splitter",
+                side_effect=AssertionError(
+                    "RCTS must not receive multiple authoritative sentences"
+                ),
             ):
-                chunker.chunk(
-                    document_id="doc-multi-sentence-over-ceiling",
-                    canonical_text="One. Two.",
-                    selected_text="One. Two.",
+                passages = chunker.chunk(
+                    document_id="doc-multi-sentence-direct-units",
+                    canonical_text=selected_text,
+                    selected_text=selected_text,
                     representation="canonical",
                     language="eng",
                 )
+
+        self.assert_exact_passages(
+            selected_text,
+            passages,
+            [
+                (0, first_sentence_end),
+                (first_sentence_end, second_sentence_end),
+                (second_sentence_end, len(selected_text)),
+            ],
+        )
+        self.assertEqual(
+            [passage.text for passage in passages],
+            ["Alpha beta.  ", "Gamma delta.\n", "Epsilon zeta."],
+        )
+        self.assertEqual(
+            [passage.boundary for passage in passages],
+            ["sentence", "sentence", "sentence"],
+        )
+
+    def test_oversized_sentence_retries_rcts_until_exact_pair_fits(self) -> None:
+        import trec_ragtime.passages as passages_module
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        selected_text = " " + "x " * 422 + "end"
+
+        class PairLength:
+            fingerprint = "nonlinear-oversized-sentence-v1"
+            max_length = 512
+            max_passage_length = 423
+            passage_length_function = staticmethod(lambda text: len(text.split()))
+
+            def __call__(self, text: str) -> int:
+                return 89 + len(text.split()) + int(text.endswith("end"))
+
+        class FakeDocument:
+            def __init__(self, text: str, start_char: int) -> None:
+                self.page_content = text
+                self.metadata = {"start_index": start_char}
+
+        class FakeSentence:
+            start_char = 0
+            text_with_ws = selected_text
+
+        class FakeTokenizedDocument:
+            sents = (FakeSentence(),)
+
+        class FakeSentenceSplitter:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def _tokenizer(self, text: str) -> FakeTokenizedDocument:
+                if text != selected_text:
+                    raise AssertionError("RCTS received more than one sentence")
+                return FakeTokenizedDocument()
+
+            def create_documents(self, texts: list[str]) -> list[FakeDocument]:
+                return [FakeDocument(texts[0], 0)]
+
+        rcts_chunk_sizes: list[int] = []
+        rcts_inputs: list[str] = []
+
+        class RecordingRecursiveTextSplitter(RecursiveCharacterTextSplitter):
+            def __init__(self, *, chunk_size: int, **kwargs: object) -> None:
+                rcts_chunk_sizes.append(chunk_size)
+                super().__init__(chunk_size=chunk_size, **kwargs)
+
+            def create_documents(self, texts: list[str]) -> list[FakeDocument]:
+                rcts_inputs.extend(texts)
+                return super().create_documents(texts)  # type: ignore[return-value]
+
+        pair_length = PairLength()
+        with patch.object(
+            passages_module,
+            "_load_splitters",
+            return_value=(FakeSentenceSplitter, RecordingRecursiveTextSplitter),
+        ):
+            chunker = PassageChunker(pair_length, overlap_tokens=0)
+            passages = chunker.chunk(
+                document_id="nonlinear-oversized-sentence",
+                canonical_text=selected_text,
+                selected_text=selected_text,
+                representation="canonical",
+                language="eng",
+            )
+
+        self.assertEqual(pair_length.passage_length_function(selected_text), 423)
+        self.assertEqual(pair_length(selected_text), 513)
+        self.assertEqual(rcts_chunk_sizes, [423, 422])
+        self.assertEqual(rcts_inputs, [selected_text, selected_text])
+        self.assert_exact_passages(selected_text, passages, [(0, 844), (844, 848)])
+        self.assertEqual(
+            [passage.boundary for passage in passages],
+            [
+                "oversized_sentence",
+                "oversized_sentence",
+            ],
+        )
+        self.assertTrue(
+            all(
+                pair_length(passage.text) <= pair_length.max_length
+                for passage in passages
+            )
+        )
 
     def assert_exact_passages(
         self,

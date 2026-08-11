@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import redirect_stderr, redirect_stdout
+import json
 import inspect
 from io import StringIO
 import math
 import sys
 import threading
+import types
 import unittest
 from collections import UserDict
 from collections.abc import Callable
@@ -95,6 +97,32 @@ class BatchEncodingTokenizer:
             {
                 "input_ids": [[1] * length],
                 "length": [length],
+                "overflowing_tokens": [],
+                "num_truncated_tokens": 0,
+            }
+        )
+
+
+class ChatTemplateBatchEncodingTokenizer(BatchEncodingTokenizer):
+    chat_template = "maintained nonblank template"
+
+    def __init__(self, *, template_overhead: int = 10) -> None:
+        super().__init__()
+        self.template_overhead = template_overhead
+        self.template_calls: list[tuple[list[dict[str, str]], dict[str, object]]] = []
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: object,
+    ) -> UserDict[str, object]:
+        self.template_calls.append(
+            ([dict(message) for message in messages], dict(kwargs))
+        )
+        length = self.template_overhead + len(messages[1]["content"])
+        return UserDict(
+            {
+                "input_ids": list(range(length)),
                 "overflowing_tokens": [],
                 "num_truncated_tokens": 0,
             }
@@ -202,7 +230,7 @@ class FlashWireCodecTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             decode_flash_request(
                 request.replace(
-                    b'"model_name":"BAAI/bge-reranker-v2-m3"',
+                    f'"model_name":"{config.model_name}"'.encode(),
                     b'"model_name":1',
                 )
             )
@@ -248,7 +276,7 @@ class RunpodFlashConfigTests(unittest.TestCase):
             endpoint_id="endpoint-a",
             model_config=policy,
             workers=1,
-            idle_timeout=60.0,
+            idle_timeout=60,
             request_timeout=30.0,
             concurrency=2,
         )
@@ -258,7 +286,7 @@ class RunpodFlashConfigTests(unittest.TestCase):
             worker_name="other-worker",
             gpu="AMPERE_48",
             workers=4,
-            idle_timeout=600.0,
+            idle_timeout=600,
             request_timeout=3.0,
             max_payload_bytes=12345,
             concurrency=8,
@@ -276,6 +304,26 @@ class RunpodFlashConfigTests(unittest.TestCase):
             RunpodFlashConfig(endpoint_id="endpoint", worker_name="bad\nname")
         with self.assertRaises(ValueError):
             RunpodFlashConfig(endpoint_id="endpoint", max_payload_bytes=10_000_001)
+
+    def test_idle_timeout_accepts_runpod_inclusive_integer_bounds_without_importing_runpod(
+        self,
+    ) -> None:
+        with patch.dict(sys.modules, {"runpod_flash": None}):
+            lower = RunpodFlashConfig(endpoint_id="endpoint", idle_timeout=1)
+            upper = RunpodFlashConfig(endpoint_id="endpoint", idle_timeout=3600)
+
+        self.assertEqual(lower.idle_timeout, 1)
+        self.assertEqual(upper.idle_timeout, 3600)
+
+    def test_idle_timeout_rejects_fractional_values(self) -> None:
+        for value in (1.0, 1.5, 3599.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RunpodFlashConfig(endpoint_id="endpoint", idle_timeout=value)
+
+    def test_idle_timeout_rejects_values_outside_runpod_range(self) -> None:
+        for value in (0, -1, 3601, True, "60", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RunpodFlashConfig(endpoint_id="endpoint", idle_timeout=value)  # type: ignore[arg-type]
 
 
 class RunpodFlashPassageScorerTests(unittest.TestCase):
@@ -367,6 +415,34 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             scorer.score("q", (_passage("x" * 500, document_id="too-large"),))
 
+    def test_payload_limit_measures_the_final_runpod_input_body(self) -> None:
+        text = "payload-envelope-check"
+        policy = LocalCrossEncoderConfig()
+        request = encode_flash_request(
+            "query",
+            ((sha256_bytes(text), text),),
+            model_config=_wire_model_config(policy),
+            scorer_fingerprint=policy.fingerprint,
+        )
+        runpod_body = json.dumps(
+            {"input": {"request": decode_flash_request(request)}},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertGreater(len(runpod_body), len(request))
+
+        config = RunpodFlashConfig(
+            endpoint_id="fake",
+            model_config=policy,
+            max_payload_bytes=len(runpod_body),
+        )
+        scorer = RunpodFlashPassageScorer(config, FakeAsyncRunner())
+        self.addCleanup(scorer.close)
+
+        with self.assertRaises(FlashScoringError):
+            scorer.score("query", (_passage(text),))
+
     def test_concurrency_is_bounded_and_all_batches_complete(self) -> None:
         passages = tuple(_passage(f"text-{i}", document_id=str(i)) for i in range(8))
         runner = FakeAsyncRunner(delay=0.02)
@@ -452,9 +528,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 return self
 
         class Endpoint:
-            async def run(self, request: dict[str, object]) -> Job:
-                calls.append(("run", request))
-                return Job(request)
+            async def run(self, job_input: dict[str, object]) -> Job:
+                calls.append(("run", job_input))
+                return Job(job_input["request"])
 
         request = encode_flash_request(
             "query",
@@ -469,7 +545,51 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
         self.assertEqual(decode_flash_response(response)["scores"][0]["score"], 4.0)
         self.assertEqual(calls[0][0], "run")
+        self.assertEqual(calls[0][1], {"request": decode_flash_request(request)})
         self.assertEqual(calls[1], ("wait", 3.0))
+
+    def test_endpoint_adapter_matches_flash_keyword_dispatch(self) -> None:
+        policy = LocalCrossEncoderConfig()
+        config = RunpodFlashConfig(endpoint_id="endpoint", model_config=policy)
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(FakeModel(), BatchEncodingTokenizer())
+        )
+        request = encode_flash_request(
+            "query",
+            ((sha256_bytes("text"), "text"),),
+            model_config=_wire_model_config(policy),
+            scorer_fingerprint=config.fingerprint,
+        )
+        received: list[dict[str, object]] = []
+
+        class Job:
+            def __init__(self, output: bytes) -> None:
+                self.output = output
+
+            async def wait(self, timeout: float | None = None) -> "Job":
+                return self
+
+        class Endpoint:
+            async def run(self, job_input: dict[str, object]) -> Job:
+                received.append(job_input)
+                response = worker.score(**job_input)
+                return Job(
+                    encode_flash_response(
+                        response["scores"],
+                        schema_version=response["schema_version"],
+                        scorer_fingerprint=response["scorer_fingerprint"],
+                    )
+                )
+
+        runner = FlashEndpointBatchRunner(config, endpoint=Endpoint())
+        self.addCleanup(runner.close)
+
+        response = decode_flash_response(runner.run_batch_sync(request))
+
+        self.assertEqual(
+            response["scores"], [{"hash": sha256_bytes("text").hex(), "score": 4.0}]
+        )
+        self.assertEqual(received, [{"request": decode_flash_request(request)}])
 
     def test_endpoint_run_or_wait_failure_cancels_job(self) -> None:
         config = RunpodFlashConfig(endpoint_id="endpoint", request_timeout=0.01)
@@ -503,6 +623,83 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
 
 class StaticFlashWorkerTests(unittest.TestCase):
+    def test_worker_fingerprint_matches_rotated_local_identity(self) -> None:
+        policy = LocalCrossEncoderConfig()
+
+        self.assertTrue(policy.fingerprint.startswith("local-cross-encoder-v3/"))
+        self.assertEqual(
+            FlashPassageWorker._fingerprint_for_values(_wire_model_config(policy)),
+            policy.fingerprint,
+        )
+
+    def test_static_default_loader_constructs_direct_cross_encoder(self) -> None:
+        policy = LocalCrossEncoderConfig()
+        source = inspect.getsource(FlashPassageWorker)
+        namespace = {"__name__": "flash_worker_isolated"}
+        constructor_calls: list[dict[str, object]] = []
+        dtype = object()
+
+        class FakeTokenizer:
+            def __call__(
+                self, query: str, text: str, **kwargs: object
+            ) -> dict[str, object]:
+                return {"input_ids": [1, 2, 3], "length": [3]}
+
+        class FakeModel:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                constructor_calls.append({"args": args, **kwargs})
+                self.tokenizer = FakeTokenizer()
+
+            def predict(self, pairs: object, **kwargs: object) -> list[float]:
+                return [1.0]
+
+        fake_sentence_transformers = types.ModuleType("sentence_transformers")
+        fake_sentence_transformers.CrossEncoder = FakeModel  # type: ignore[attr-defined]
+        fake_sentence_transformers_modules = types.ModuleType(
+            "sentence_transformers.sentence_transformer.modules"
+        )
+
+        class FakeTransformer:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+        fake_sentence_transformers_modules.Transformer = FakeTransformer  # type: ignore[attr-defined]
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float32 = dtype  # type: ignore[attr-defined]
+        fake_torch.float16 = object()  # type: ignore[attr-defined]
+        fake_torch.bfloat16 = object()  # type: ignore[attr-defined]
+
+        with patch.dict(
+            sys.modules,
+            {
+                "trec_ragtime": None,
+                "sentence_transformers": fake_sentence_transformers,
+                "sentence_transformers.sentence_transformer.modules": fake_sentence_transformers_modules,
+                "torch": fake_torch,
+            },
+            clear=False,
+        ):
+            exec(compile(source, "<flash-worker>", "exec"), namespace)
+            isolated_worker = namespace["FlashPassageWorker"]
+            model, tokenizer = isolated_worker._default_loader(
+                _wire_model_config(policy)
+            )
+
+        self.assertIsInstance(model, FakeModel)
+        self.assertIsInstance(tokenizer, FakeTokenizer)
+        self.assertEqual(
+            constructor_calls,
+            [
+                {
+                    "args": (policy.model_name,),
+                    "revision": policy.revision,
+                    "device": policy.effective_device,
+                    "max_length": policy.max_length,
+                    "model_kwargs": {"torch_dtype": dtype},
+                }
+            ],
+        )
+
     def test_static_worker_source_executes_without_project_imports(self) -> None:
         policy = LocalCrossEncoderConfig()
         source = inspect.getsource(FlashPassageWorker)
@@ -541,8 +738,12 @@ class StaticFlashWorkerTests(unittest.TestCase):
         self.assertEqual(len(loader.calls), 1)
 
     def test_concurrent_cold_start_binds_one_identity_before_prediction(self) -> None:
-        policy_a = LocalCrossEncoderConfig(revision="revision-a")
-        policy_b = replace(policy_a, revision="revision-b")
+        policy_a = LocalCrossEncoderConfig(
+            revision="revision-a", tokenizer_revision="revision-a"
+        )
+        policy_b = replace(
+            policy_a, revision="revision-b", tokenizer_revision="revision-b"
+        )
         validated = threading.Barrier(2)
         load_started = threading.Event()
         release_load = threading.Event()
@@ -701,6 +902,43 @@ class StaticFlashWorkerTests(unittest.TestCase):
             worker.score(_request_for_config(policy, text="overflow"))
         self.assertEqual(len(loader.calls), 1)
 
+    def test_isolated_worker_rejects_template_overflow_before_prediction(
+        self,
+    ) -> None:
+        policy = LocalCrossEncoderConfig(max_length=12)
+        source = inspect.getsource(FlashPassageWorker)
+        namespace = {"__name__": "flash_worker_isolated"}
+        model = FakeModel()
+        tokenizer = ChatTemplateBatchEncodingTokenizer(template_overhead=10)
+
+        with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
+            exec(compile(source, "<flash-worker>", "exec"), namespace)
+        isolated_worker = namespace["FlashPassageWorker"]
+        worker = isolated_worker(loader=lambda config: (model, tokenizer))
+
+        with self.assertRaisesRegex(ValueError, "overflow"):
+            worker.score(_request_for_config(policy, text="abc"))
+
+        self.assertEqual(model.predict_calls, [])
+        self.assertEqual(tokenizer.calls, [])
+        self.assertEqual(
+            tokenizer.template_calls,
+            [
+                (
+                    [
+                        {"role": "query", "content": "query"},
+                        {"role": "document", "content": "abc"},
+                    ],
+                    {
+                        "tokenize": True,
+                        "add_generation_prompt": False,
+                        "truncation": False,
+                        "return_dict": True,
+                    },
+                )
+            ],
+        )
+
     def test_worker_accepts_batch_encoding_mapping_and_returns_finite_hash_scores(
         self,
     ) -> None:
@@ -776,7 +1014,7 @@ class FlashDecorationTests(unittest.TestCase):
             worker_name="worker-name",
             gpu="GPU_GROUP",
             workers=3,
-            idle_timeout=123.0,
+            idle_timeout=123,
         )
         calls: list[object] = []
 

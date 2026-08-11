@@ -92,7 +92,6 @@ _SUPPORTED_BASELINE_PUBLIC_EXPORTS = {
     "PassageScorer",
     "PassageScoringError",
     "PipelineResult",
-    "PROJECT_CACHE_DIR_ENV",
     "RagtimeApiError",
     "RagtimeClient",
     "RagtimeConfigurationError",
@@ -114,8 +113,6 @@ _SUPPORTED_BASELINE_PUBLIC_EXPORTS = {
     "decode_flash_request",
     "decode_flash_response",
     "default_local_corpus_path",
-    "default_project_cache_dir",
-    "ensure_private_cache_dir",
     "encode_flash_request",
     "encode_flash_response",
     "max_passage_v1",
@@ -639,14 +636,14 @@ class PassageRerankingIntegrationTests(unittest.TestCase):
             all(pair_length(passage.text) <= policy.max_length for passage in passages)
         )
         self.assertIn(
-            ((_INTEGRATION_QUERY,), FakeTokenizer.SINGLE_SEQUENCE_KWARGS),
+            ((_INTEGRATION_QUERY, ""), FakeTokenizer.PAIR_LENGTH_KWARGS),
             tokenizer.calls,
         )
         self.assertIn(
             ((selected_text,), FakeTokenizer.SINGLE_SEQUENCE_KWARGS),
             tokenizer.calls,
         )
-        self.assertEqual(tokenizer.special_token_calls, [True])
+        self.assertEqual(tokenizer.special_token_calls, [])
 
 
 if __name__ == "__main__":

@@ -109,6 +109,43 @@ class PairCountingTokenizer:
         return 3 if pair else 2
 
 
+class ChatTemplateTokenizer:
+    chat_template = "maintained nonblank template"
+
+    def __init__(self, *, template_overhead: int = 10) -> None:
+        self.template_overhead = template_overhead
+        self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+        self.template_calls: list[tuple[list[dict[str, str]], dict[str, Any]]] = []
+
+    def __call__(self, *texts: str, **kwargs: Any) -> dict[str, object]:
+        self.calls.append((texts, dict(kwargs)))
+        if len(texts) == 1:
+            count = len(texts[0])
+        elif len(texts) == 2:
+            count = len(texts[0]) + len(texts[1]) + 2
+        else:
+            raise AssertionError(f"unexpected tokenizer arity: {len(texts)}")
+        return {"input_ids": list(range(count)), "length": [count]}
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> dict[str, object]:
+        self.template_calls.append(
+            ([dict(message) for message in messages], dict(kwargs))
+        )
+        count = self.template_overhead + len(messages[1]["content"])
+        return {
+            "input_ids": list(range(count)),
+            "overflowing_tokens": [],
+            "num_truncated_tokens": 0,
+        }
+
+    def num_special_tokens_to_add(self, pair: bool = False) -> int:
+        return 2 if pair else 1
+
+
 class ReviewedPinnedTokenizer:
     """Offline shape matching the reviewed pinned-tokenizer reproduction."""
 
@@ -124,7 +161,8 @@ class ReviewedPinnedTokenizer:
             query, passage = texts
             if query != self.QUERY:
                 raise AssertionError(f"unexpected pair query: {query!r}")
-            count = 8 if not passage else len(passage) + 11
+            passage_count = 0 if not passage else len(passage) + 1
+            count = 10 + passage_count
         elif len(texts) == 1:
             (text,) = texts
             if kwargs.get("add_special_tokens") is not False:
@@ -207,6 +245,11 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
 
         self.assertTrue(is_dataclass(config))
         self.assertEqual(config.__class__.__slots__, config.__slots__)
+        self.assertEqual(DEFAULT_MODEL_NAME, "mixedbread-ai/mxbai-rerank-base-v2")
+        self.assertEqual(
+            DEFAULT_MODEL_REVISION,
+            "3ea9d4dffa7d12a4f366be8e275c349de9fc9865",
+        )
         self.assertEqual(config.model_name, DEFAULT_MODEL_NAME)
         self.assertEqual(config.revision, DEFAULT_MODEL_REVISION)
         self.assertEqual(config.tokenizer_name, DEFAULT_MODEL_NAME)
@@ -222,14 +265,26 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
         self.assertEqual(rocm.effective_device, "cuda")
         self.assertEqual(rocm.fingerprint, cuda.fingerprint)
 
+    def test_corrected_preprocessing_uses_v3_fingerprint_identity(self) -> None:
+        prefix, digest = LocalCrossEncoderConfig().fingerprint.split("/", 1)
+
+        self.assertEqual(prefix, "local-cross-encoder-v3")
+        self.assertEqual(len(digest), 64)
+
     def test_fingerprint_changes_for_every_result_affecting_setting(self) -> None:
         base = LocalCrossEncoderConfig()
         variants = (
             replace(base, schema_version=2),
-            replace(base, model_name="other/model"),
-            replace(base, revision="other-revision"),
-            replace(base, tokenizer_name="other/tokenizer"),
-            replace(base, tokenizer_revision="other-tokenizer-revision"),
+            replace(
+                base,
+                model_name="other/model",
+                tokenizer_name="other/model",
+            ),
+            replace(
+                base,
+                revision="other-revision",
+                tokenizer_revision="other-revision",
+            ),
             replace(base, device="cuda"),
             replace(base, precision="float16"),
             replace(base, batch_size=16),
@@ -244,6 +299,18 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
         self.assertTrue(
             all(variant.fingerprint != base.fingerprint for variant in variants)
         )
+
+    def test_config_rejects_a_tokenizer_that_is_not_the_pinned_model_processor(
+        self,
+    ) -> None:
+        base = _runtime_versions()
+        for kwargs in (
+            {"tokenizer_name": "other/tokenizer"},
+            {"tokenizer_revision": "other-tokenizer-revision"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, "match"):
+                    LocalCrossEncoderConfig(**base, **kwargs)
 
     def test_each_runtime_version_rotates_fingerprint_when_installed_metadata_rotates(
         self,
@@ -314,7 +381,7 @@ class LocalCrossEncoderConfigTests(unittest.TestCase):
 
 
 class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
-    def test_lazy_full_pair_length_formats_query_and_counts_special_tokens(
+    def test_lazy_full_pair_length_formats_query_and_counts_exact_pair(
         self,
     ) -> None:
         config = LocalCrossEncoderConfig(max_length=16, query_format="Q: {query}")
@@ -346,16 +413,12 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
                 ("Q: exact 你", "中文", {"truncation": False, "return_length": True}),
                 (
                     "Q: exact 你",
-                    None,
-                    {
-                        "add_special_tokens": False,
-                        "truncation": False,
-                        "return_length": True,
-                    },
+                    "",
+                    {"truncation": False, "return_length": True},
                 ),
             ],
         )
-        self.assertEqual(tokenizer.special_token_calls, [True])
+        self.assertEqual(tokenizer.special_token_calls, [])
 
     def test_splitter_budget_uses_official_passage_only_tokenization(
         self,
@@ -388,16 +451,79 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
                 ),
                 (
                     "Q: exact 你",
-                    None,
+                    "",
+                    {"truncation": False, "return_length": True},
+                ),
+            ],
+        )
+        self.assertEqual(tokenizer.special_token_calls, [])
+
+    def test_template_pair_length_and_budget_use_exact_rendered_overhead(self) -> None:
+        config = LocalCrossEncoderConfig(max_length=16, query_format="Q: {query}")
+        tokenizer = ChatTemplateTokenizer(template_overhead=10)
+        length_function = CrossEncoderPairLengthFunction(
+            config,
+            "exact",
+            tokenizer_loader=lambda _: tokenizer,
+        )
+
+        self.assertEqual(length_function.max_passage_length, 6)
+        self.assertEqual(length_function("abc"), 13)
+        self.assertEqual(length_function.passage_length_function("abc"), 3)
+        self.assertEqual(
+            tokenizer.calls,
+            [
+                (
+                    ("abc",),
                     {
                         "add_special_tokens": False,
                         "truncation": False,
                         "return_length": True,
                     },
+                )
+            ],
+        )
+        self.assertEqual(
+            tokenizer.template_calls,
+            [
+                (
+                    [
+                        {"role": "query", "content": "Q: exact"},
+                        {"role": "document", "content": ""},
+                    ],
+                    {
+                        "tokenize": True,
+                        "add_generation_prompt": False,
+                        "truncation": False,
+                        "return_dict": True,
+                    },
+                ),
+                (
+                    [
+                        {"role": "query", "content": "Q: exact"},
+                        {"role": "document", "content": "abc"},
+                    ],
+                    {
+                        "tokenize": True,
+                        "add_generation_prompt": False,
+                        "truncation": False,
+                        "return_dict": True,
+                    },
                 ),
             ],
         )
-        self.assertEqual(tokenizer.special_token_calls, [True])
+
+    def test_nonblank_chat_template_requires_callable_template_api(self) -> None:
+        tokenizer = ChatTemplateTokenizer()
+        tokenizer.apply_chat_template = None  # type: ignore[method-assign,assignment]
+        length_function = CrossEncoderPairLengthFunction(
+            LocalCrossEncoderConfig(max_length=16),
+            "query",
+            tokenizer_loader=lambda _: tokenizer,
+        )
+
+        with self.assertRaisesRegex(PassageScoringError, "apply_chat_template"):
+            length_function("passage")
 
     def test_splitter_budget_matches_reviewed_pinned_tokenizer_shape(self) -> None:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -412,7 +538,7 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
         passage = "中" * 502
 
         self.assertEqual(length_function(passage), 513)
-        self.assertEqual(length_function(""), 8)
+        self.assertEqual(length_function(""), 10)
         self.assertEqual(length_function.passage_length_function("中"), 2)
         self.assertEqual(
             length_function.passage_length_function("中" * 501),
@@ -439,12 +565,8 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
         )
         self.assertIn(
             (
-                (ReviewedPinnedTokenizer.QUERY,),
-                {
-                    "add_special_tokens": False,
-                    "truncation": False,
-                    "return_length": True,
-                },
+                (ReviewedPinnedTokenizer.QUERY, ""),
+                {"truncation": False, "return_length": True},
             ),
             tokenizer.calls,
         )
@@ -459,32 +581,31 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
             ),
             tokenizer.calls,
         )
-        self.assertEqual(tokenizer.special_token_calls, [True])
+        self.assertEqual(tokenizer.special_token_calls, [])
 
-    def test_splitter_budget_rejects_invalid_special_token_api_results(self) -> None:
-        config = LocalCrossEncoderConfig(max_length=16)
-        invalid_results: tuple[object, ...] = (None, True, -1, 1.5)
+    def test_splitter_budget_rejects_malformed_empty_pair_ids(self) -> None:
+        class MalformedPairTokenizer(PairCountingTokenizer):
+            def __call__(
+                self,
+                query: str,
+                passage: str | None = None,
+                **kwargs: Any,
+            ) -> dict[str, object]:
+                if passage == "":
+                    return {"input_ids": None, "length": [0]}
+                return super().__call__(query, passage, **kwargs)
 
-        for invalid_result in invalid_results:
-            with self.subTest(invalid_result=invalid_result):
-                tokenizer = PairCountingTokenizer()
-                if invalid_result is None:
-                    tokenizer.num_special_tokens_to_add = None  # type: ignore[method-assign,assignment]
-                else:
-                    tokenizer.num_special_tokens_to_add = (  # type: ignore[method-assign]
-                        lambda pair, value=invalid_result: value
-                    )
-                length_function = CrossEncoderPairLengthFunction(
-                    config,
-                    "exact 你",
-                    tokenizer_loader=lambda _, value=tokenizer: value,
-                )
+        length_function = CrossEncoderPairLengthFunction(
+            LocalCrossEncoderConfig(max_length=16),
+            "exact 你",
+            tokenizer_loader=lambda _: MalformedPairTokenizer(),
+        )
 
-                with self.assertRaises(PassageScoringError):
-                    _ = length_function.max_passage_length
+        with self.assertRaisesRegex(PassageScoringError, "input_ids"):
+            _ = length_function.max_passage_length
 
-    def test_splitter_budget_rejects_malformed_query_token_length(self) -> None:
-        class MismatchedLengthTokenizer(PairCountingTokenizer):
+    def test_splitter_budget_rejects_reported_empty_pair_truncation(self) -> None:
+        class TruncatedPairTokenizer(PairCountingTokenizer):
             def __call__(
                 self,
                 query: str,
@@ -492,17 +613,17 @@ class CrossEncoderPairLengthFunctionTests(unittest.TestCase):
                 **kwargs: Any,
             ) -> dict[str, object]:
                 encoded = super().__call__(query, passage, **kwargs)
-                if passage is None:
-                    encoded["length"] = [999]
+                if passage == "":
+                    encoded["num_truncated_tokens"] = 1
                 return encoded
 
         length_function = CrossEncoderPairLengthFunction(
             LocalCrossEncoderConfig(max_length=16),
             "exact 你",
-            tokenizer_loader=lambda _: MismatchedLengthTokenizer(),
+            tokenizer_loader=lambda _: TruncatedPairTokenizer(),
         )
 
-        with self.assertRaisesRegex(PassageScoringError, "length"):
+        with self.assertRaisesRegex(PassageScoringError, "truncation"):
             _ = length_function.max_passage_length
 
     def test_splitter_budget_rejects_a_query_with_no_positive_passage_budget(
@@ -686,12 +807,9 @@ assert 'torch' not in sys.modules
         self.assertEqual(scorer.fingerprint, original_config.fingerprint)
         self.assertEqual(model.predict_calls[0][1]["batch_size"], 1)
 
-    def test_default_loader_and_predict_path_uses_pinned_runtime_seam(self) -> None:
+    def test_default_loader_constructs_the_direct_cross_encoder_path(self) -> None:
         passage = _passage("passage")
-        constructor_calls: list[tuple[str, dict[str, Any]]] = []
-        transformer_constructor_calls: list[tuple[str, dict[str, Any]]] = []
-        tokenizer_loader_calls: list[tuple[str, dict[str, Any]]] = []
-        loaded_tokenizers: list[Any] = []
+        constructor_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         tokenizer_calls: list[tuple[str, str, dict[str, Any]]] = []
         predict_calls: list[tuple[list[tuple[str, str]], dict[str, Any]]] = []
         models: list[Any] = []
@@ -710,44 +828,15 @@ assert 'torch' not in sys.modules
         class FakeIdentity:
             pass
 
-        class GetterOnlyTransformer:
-            def __init__(self, tokenizer: Any) -> None:
-                self.processor = tokenizer
-
-            @property
-            def tokenizer(self) -> Any:
-                return self.processor
-
-        class FakeTransformer(GetterOnlyTransformer):
-            def __init__(self, model_name_or_path: str, **kwargs: Any) -> None:
-                transformer_constructor_calls.append((model_name_or_path, kwargs))
-                tokenizer = FakeAutoTokenizer.from_pretrained(
-                    kwargs["tokenizer_name_or_path"],
-                    **kwargs["processor_kwargs"],
-                )
-                super().__init__(tokenizer)
-
         class FakeCrossEncoder:
-            def __init__(
-                self,
-                model_name: str | None = None,
-                *,
-                modules: list[GetterOnlyTransformer] | None = None,
-                **kwargs: Any,
-            ) -> None:
-                constructor_calls.append((model_name, {"modules": modules, **kwargs}))
-                self._first_module = (
-                    modules[0] if modules else GetterOnlyTransformer(object())
-                )
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                constructor_calls.append((args, kwargs))
+                self._tokenizer = FakeTokenizer()
                 models.append(self)
 
             @property
             def tokenizer(self) -> Any:
-                return self._first_module.tokenizer
-
-            @tokenizer.setter
-            def tokenizer(self, value: Any) -> None:
-                self._first_module.tokenizer = value
+                return self._tokenizer
 
             def predict(
                 self, inputs: list[tuple[str, str]], **kwargs: Any
@@ -755,22 +844,17 @@ assert 'torch' not in sys.modules
                 predict_calls.append((list(inputs), kwargs))
                 return [4.75]
 
-        class FakeAutoTokenizer:
-            @classmethod
-            def from_pretrained(cls, model_name: str, **kwargs: Any) -> FakeTokenizer:
-                tokenizer_loader_calls.append((model_name, kwargs))
-                tokenizer = FakeTokenizer()
-                loaded_tokenizers.append(tokenizer)
-                return tokenizer
-
         fake_sentence_transformers = types.ModuleType("sentence_transformers")
         fake_sentence_transformers.CrossEncoder = FakeCrossEncoder  # type: ignore[attr-defined]
         fake_sentence_transformers_modules = types.ModuleType(
             "sentence_transformers.sentence_transformer.modules"
         )
+
+        class FakeTransformer:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
         fake_sentence_transformers_modules.Transformer = FakeTransformer  # type: ignore[attr-defined]
-        fake_transformers = types.ModuleType("transformers")
-        fake_transformers.AutoTokenizer = FakeAutoTokenizer  # type: ignore[attr-defined]
         fake_torch = types.ModuleType("torch")
         fake_torch.float32 = dtype  # type: ignore[attr-defined]
         fake_torch.float16 = object()  # type: ignore[attr-defined]
@@ -783,15 +867,12 @@ assert 'torch' not in sys.modules
             batch_size=4,
             max_length=17,
             query_format="Q: {query}",
-            tokenizer_name="explicit/tokenizer",
-            tokenizer_revision="tokenizer-revision",
         )
         with patch.dict(
             sys.modules,
             {
                 "sentence_transformers": fake_sentence_transformers,
                 "sentence_transformers.sentence_transformer.modules": fake_sentence_transformers_modules,
-                "transformers": fake_transformers,
                 "torch": fake_torch,
             },
         ):
@@ -800,46 +881,18 @@ assert 'torch' not in sys.modules
 
         self.assertEqual(scores, {passage.content_hash: 4.75})
         self.assertEqual(len(constructor_calls), 1)
-        model_name, constructor_kwargs = constructor_calls[0]
-        self.assertIsNone(model_name)
-        self.assertEqual(constructor_kwargs["device"], "cuda")
-        self.assertEqual(len(constructor_kwargs["modules"]), 1)
+        model_args, constructor_kwargs = constructor_calls[0]
+        self.assertEqual(model_args, (DEFAULT_MODEL_NAME,))
         self.assertEqual(
-            transformer_constructor_calls,
-            [
-                (
-                    DEFAULT_MODEL_NAME,
-                    {
-                        "transformer_task": "sequence-classification",
-                        "model_kwargs": {
-                            "revision": DEFAULT_MODEL_REVISION,
-                            "torch_dtype": dtype,
-                        },
-                        "processor_kwargs": {
-                            "revision": "tokenizer-revision",
-                            "model_max_length": 17,
-                        },
-                        "config_kwargs": {"revision": DEFAULT_MODEL_REVISION},
-                        "max_seq_length": 17,
-                        "tokenizer_name_or_path": "explicit/tokenizer",
-                    },
-                )
-            ],
-        )
-        self.assertEqual(
-            tokenizer_loader_calls,
-            [
-                (
-                    "explicit/tokenizer",
-                    {
-                        "revision": "tokenizer-revision",
-                        "model_max_length": 17,
-                    },
-                )
-            ],
+            constructor_kwargs,
+            {
+                "revision": DEFAULT_MODEL_REVISION,
+                "device": "cuda",
+                "max_length": 17,
+                "model_kwargs": {"torch_dtype": dtype},
+            },
         )
         self.assertEqual(len(tokenizer_calls), 1)
-        self.assertIs(models[0].tokenizer, loaded_tokenizers[0])
         self.assertEqual(tokenizer_calls[0][0:2], ("Q: query", "passage"))
         self.assertIs(tokenizer_calls[0][2]["truncation"], False)
         self.assertEqual(tokenizer_calls[0][2]["max_length"], 17)
@@ -967,6 +1020,38 @@ assert 'torch' not in sys.modules
 
         self.assertEqual(len(tokenizer.calls), 2)
         self.assertEqual(model.predict_calls, [])
+
+    def test_template_rendered_overflow_is_rejected_before_prediction(self) -> None:
+        passage = _passage("abc")
+        model = RecordingModel({"abc": 1.0})
+        tokenizer = ChatTemplateTokenizer(template_overhead=10)
+        scorer = LocalCrossEncoderScorer(
+            LocalCrossEncoderConfig(max_length=12),
+            loader=lambda config: (model, tokenizer),
+        )
+
+        with self.assertRaisesRegex(PassageScoringError, "overflow"):
+            scorer.score("query", (passage,))
+
+        self.assertEqual(model.predict_calls, [])
+        self.assertEqual(tokenizer.calls, [])
+        self.assertEqual(
+            tokenizer.template_calls,
+            [
+                (
+                    [
+                        {"role": "query", "content": "query"},
+                        {"role": "document", "content": "abc"},
+                    ],
+                    {
+                        "tokenize": True,
+                        "add_generation_prompt": False,
+                        "truncation": False,
+                        "return_dict": True,
+                    },
+                )
+            ],
+        )
 
     def test_query_only_overflow_is_rejected_before_model_prediction(self) -> None:
         passage = _passage("p")

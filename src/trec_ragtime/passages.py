@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import re
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence, cast
 
@@ -23,6 +25,7 @@ _PIPELINES_BY_LANGUAGE: Mapping[str, str] = {
 _PINNED_PIPELINE_MAPPING = ";".join(
     f"{language}={pipeline}" for language, pipeline in _PIPELINES_BY_LANGUAGE.items()
 )
+_BLANK_LINE_RE = re.compile(r"(?:\r?\n)[ \t]*(?:\r?\n)")
 
 
 def _load_splitters() -> tuple[type[Any], type[Any]]:
@@ -34,6 +37,29 @@ def _load_splitters() -> tuple[type[Any], type[Any]]:
             "langchain-text-splitters and spaCy are required for passage chunking"
         ) from error
     return SpacyTextSplitter, RecursiveCharacterTextSplitter
+
+
+def _paragraph_aware_spacy_splitter(spacy_splitter: type[Any]) -> type[Any]:
+    """Keep LangChain sentence merging inside blank-line-separated paragraphs."""
+
+    class ParagraphAwareSpacyTextSplitter(spacy_splitter):
+        def _merge_splits(
+            self,
+            splits: Iterable[str],
+            separator: str,
+        ) -> list[str]:
+            chunks: list[str] = []
+            paragraph: list[str] = []
+            for split in splits:
+                paragraph.append(split)
+                if _BLANK_LINE_RE.search(split):
+                    chunks.extend(super()._merge_splits(paragraph, separator))
+                    paragraph = []
+            if paragraph:
+                chunks.extend(super()._merge_splits(paragraph, separator))
+            return chunks
+
+    return ParagraphAwareSpacyTextSplitter
 
 
 class PassageChunkingError(ValueError):
@@ -222,7 +248,7 @@ class PassageChunker:
         )
         fingerprint_material = "|".join(
             (
-                "passage-chunker-v1",
+                "passage-chunker-v2",
                 f"pair-length={pair_fingerprint}",
                 f"max-length={max_length}",
                 f"max-passage-length={max_passage_length}",
@@ -235,7 +261,7 @@ class PassageChunker:
         self._pair_length = pair_length
         self._overlap_tokens = overlap_tokens
         self._fingerprint = (
-            "langchain-spacy-v1/" + sha256_bytes(fingerprint_material).hex()
+            "langchain-spacy-v2/" + sha256_bytes(fingerprint_material).hex()
         )
         self._sentence_splitters: dict[str, object] = {}
 
@@ -257,9 +283,10 @@ class PassageChunker:
             return splitter
         spacy_splitter, _ = _load_splitters()
         try:
+            paragraph_aware_splitter = _paragraph_aware_spacy_splitter(spacy_splitter)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"\[W108\].*")
-                splitter = spacy_splitter(
+                splitter = paragraph_aware_splitter(
                     separator="",
                     pipeline=pipeline,
                     chunk_size=self._pair_length.max_passage_length,
@@ -277,12 +304,16 @@ class PassageChunker:
         self._sentence_splitters[pipeline] = splitter
         return splitter
 
-    def _recursive_splitter(self) -> object:
+    def _recursive_splitter(self, *, chunk_size: int | None = None) -> object:
         _, recursive_splitter = _load_splitters()
         try:
             return recursive_splitter(
                 separators=[" ", ""],
-                chunk_size=self._pair_length.max_passage_length,
+                chunk_size=(
+                    self._pair_length.max_passage_length
+                    if chunk_size is None
+                    else chunk_size
+                ),
                 chunk_overlap=0,
                 length_function=self._pair_length.passage_length_function,
                 strip_whitespace=False,
@@ -353,13 +384,13 @@ class PassageChunker:
         *,
         parent_name: str,
         splitter: object,
+        sentence_units: Sequence[_Span] | None = None,
     ) -> tuple[_Span, ...]:
         if not documents:
             raise PassageChunkingError(f"{parent_name} splitter returned no documents")
         raw_spans: list[_Span] = []
         previous_start = -1
         previous_end = -1
-        sentence_units: tuple[_Span, ...] | None = None
         for document in documents:
             content = getattr(document, "page_content", None)
             metadata = getattr(document, "metadata", None)
@@ -449,6 +480,7 @@ class PassageChunker:
         parent_text: str,
         *,
         parent_name: str,
+        sentence_units: Sequence[_Span] | None = None,
     ) -> tuple[_Span, ...]:
         try:
             with warnings.catch_warnings():
@@ -463,6 +495,7 @@ class PassageChunker:
             documents,
             parent_name=parent_name,
             splitter=splitter,
+            sentence_units=sentence_units,
         )
 
     def chunk(
@@ -496,50 +529,136 @@ class PassageChunker:
 
         pipeline = self._pipeline_for_language(language)
         sentence_splitter = self._sentence_splitter(pipeline)
+        source_sentence_units = self._spacy_sentence_units(
+            sentence_splitter,
+            selected_text,
+        )
         sentence_spans = self._split_exact(
             sentence_splitter,
             selected_text,
             parent_name="sentence",
+            sentence_units=source_sentence_units,
         )
         final_spans: list[tuple[_Span, Boundary]] = []
         for sentence_span in sentence_spans:
+            underlying_sentences = tuple(
+                sentence
+                for sentence in source_sentence_units
+                if sentence.start_char >= sentence_span.start_char
+                and sentence.end_char <= sentence_span.end_char
+            )
             if self._pair_length(sentence_span.text) <= self._pair_length.max_length:
                 final_spans.append((sentence_span, "sentence"))
                 continue
+            if len(underlying_sentences) > 1:
+                first_sentence = underlying_sentences[0]
+                last_sentence = underlying_sentences[-1]
+                if (
+                    first_sentence.start_char > sentence_span.start_char
+                    and not selected_text[
+                        sentence_span.start_char : first_sentence.start_char
+                    ].isspace()
+                ) or (
+                    last_sentence.end_char < sentence_span.end_char
+                    and not selected_text[
+                        last_sentence.end_char : sentence_span.end_char
+                    ].isspace()
+                ):
+                    raise PassageChunkingError(
+                        "RCTS sentence span does not cover the complete unit"
+                    )
+                sentence_spans_to_process_list: list[_Span] = []
+                for index, sentence in enumerate(underlying_sentences):
+                    start = (
+                        sentence_span.start_char if index == 0 else sentence.start_char
+                    )
+                    end = (
+                        sentence_span.end_char
+                        if index == len(underlying_sentences) - 1
+                        else underlying_sentences[index + 1].start_char
+                    )
+                    sentence_spans_to_process_list.append(
+                        _Span(selected_text[start:end], start, end)
+                    )
+                sentence_spans_to_process = tuple(sentence_spans_to_process_list)
+            else:
+                sentence_spans_to_process = (sentence_span,)
 
-            underlying_sentences = self._spacy_sentence_units(
-                sentence_splitter,
-                sentence_span.text,
-            )
-            if len(underlying_sentences) != 1:
-                raise PassageChunkingError(
-                    "RCTS requires exactly one underlying sentence"
+            for sentence_span in sentence_spans_to_process:
+                if (
+                    self._pair_length(sentence_span.text)
+                    <= self._pair_length.max_length
+                ):
+                    final_spans.append((sentence_span, "sentence"))
+                    continue
+
+                underlying_sentences = tuple(
+                    sentence
+                    for sentence in source_sentence_units
+                    if sentence.start_char >= sentence_span.start_char
+                    and sentence.end_char <= sentence_span.end_char
                 )
-            underlying_sentence = underlying_sentences[0]
-            if (
-                underlying_sentence.start_char > 0
-                and not sentence_span.text[: underlying_sentence.start_char].isspace()
-            ) or (
-                underlying_sentence.end_char < len(sentence_span.text)
-                and not sentence_span.text[underlying_sentence.end_char :].isspace()
-            ):
-                raise PassageChunkingError(
-                    "RCTS sentence span does not cover the complete unit"
-                )
-            recursive_spans = self._split_exact(
-                self._recursive_splitter(),
-                sentence_span.text,
-                parent_name="recursive sentence",
-            )
-            for recursive_span in recursive_spans:
-                start = sentence_span.start_char + recursive_span.start_char
-                end = sentence_span.start_char + recursive_span.end_char
-                mapped = _Span(selected_text[start:end], start, end)
-                if self._pair_length(mapped.text) > self._pair_length.max_length:
+                if len(underlying_sentences) != 1:
+                    raise PassageChunkingError(
+                        "RCTS requires exactly one underlying sentence"
+                    )
+                underlying_sentence = underlying_sentences[0]
+                if (
+                    underlying_sentence.start_char > sentence_span.start_char
+                    and not selected_text[
+                        sentence_span.start_char : underlying_sentence.start_char
+                    ].isspace()
+                ) or (
+                    underlying_sentence.end_char < sentence_span.end_char
+                    and not selected_text[
+                        underlying_sentence.end_char : sentence_span.end_char
+                    ].isspace()
+                ):
+                    raise PassageChunkingError(
+                        "RCTS sentence span does not cover the complete unit"
+                    )
+                mapped_spans: tuple[_Span, ...] | None = None
+                chunk_size = self._pair_length.max_passage_length
+                while True:
+                    recursive_spans = self._split_exact(
+                        self._recursive_splitter(chunk_size=chunk_size),
+                        sentence_span.text,
+                        parent_name="recursive sentence",
+                    )
+                    candidate_spans = tuple(
+                        _Span(
+                            selected_text[
+                                sentence_span.start_char
+                                + recursive_span.start_char : sentence_span.start_char
+                                + recursive_span.end_char
+                            ],
+                            sentence_span.start_char + recursive_span.start_char,
+                            sentence_span.start_char + recursive_span.end_char,
+                        )
+                        for recursive_span in recursive_spans
+                    )
+                    overflows = [
+                        self._pair_length(span.text) - self._pair_length.max_length
+                        for span in candidate_spans
+                    ]
+                    max_overflow = max(overflows, default=0)
+                    if max_overflow <= 0:
+                        mapped_spans = candidate_spans
+                        break
+                    if chunk_size == 1:
+                        break
+                    next_chunk_size = max(1, chunk_size - max(1, max_overflow))
+                    if next_chunk_size >= chunk_size:
+                        raise PassageChunkingError(
+                            "recursive sentence fallback did not reduce chunk size"
+                        )
+                    chunk_size = next_chunk_size
+                if mapped_spans is None:
                     raise PassageChunkingError(
                         "recursive sentence fallback exceeded the full-pair ceiling"
                     )
-                final_spans.append((mapped, "oversized_sentence"))
+                for mapped in mapped_spans:
+                    final_spans.append((mapped, "oversized_sentence"))
 
         if not final_spans:
             raise PassageChunkingError("no passages were produced")

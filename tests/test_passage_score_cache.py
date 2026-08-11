@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import math
+import multiprocessing
 import subprocess
 import sys
 import threading
@@ -9,7 +11,10 @@ from collections.abc import Callable, Mapping, Sequence
 
 import msgspec
 
-from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.artifact_store import (
+    ArtifactStoreRemoteError,
+    ArtifactValidationError,
+)
 from trec_ragtime.passage_score_cache import (
     CachedPassageScorer,
     PassageScoreArtifactValidationError,
@@ -19,6 +24,7 @@ from trec_ragtime.passage_score_cache import (
     query_hash,
     score_object_key,
 )
+from trec_ragtime.passage_scoring import LocalCrossEncoderConfig
 from trec_ragtime.passages import Passage, sha256_bytes
 
 
@@ -79,6 +85,12 @@ class FailingArtifactStore(FakeArtifactStore):
         return super().write(key, payload)
 
 
+class UnsuccessfulWriteArtifactStore(FakeArtifactStore):
+    def write(self, key: str, payload: bytes) -> bool:
+        self.write_calls.append((key, payload))
+        return False
+
+
 class RecordingScorer:
     def __init__(
         self,
@@ -120,6 +132,79 @@ class BarrierScorer(RecordingScorer):
         except threading.BrokenBarrierError:
             pass
         return response
+
+
+class BlockingScorer(RecordingScorer):
+    def __init__(self, blocked_queries: Sequence[str]) -> None:
+        super().__init__()
+        self.entered = {query: threading.Event() for query in blocked_queries}
+        self.release = {query: threading.Event() for query in blocked_queries}
+        self.second_call_entered = threading.Event()
+        self._call_count_lock = threading.Lock()
+        self._call_counts: dict[str, int] = {}
+
+    def score(self, query: str, passages: Sequence[Passage]) -> Mapping[bytes, object]:
+        response = super().score(query, passages)
+        with self._call_count_lock:
+            call_count = self._call_counts.get(query, 0) + 1
+            self._call_counts[query] = call_count
+            if call_count == 2:
+                self.second_call_entered.set()
+        self.entered[query].set()
+        if not self.release[query].wait(timeout=5.0):
+            raise AssertionError(f"scoring was not released for {query!r}")
+        return response
+
+
+class ProcessBarrierScorer(RecordingScorer):
+    def __init__(self, barrier: object) -> None:
+        super().__init__()
+        self._barrier = barrier
+
+    def score(self, query: str, passages: Sequence[Passage]) -> Mapping[bytes, object]:
+        response = super().score(query, passages)
+        getattr(self._barrier, "wait")(timeout=5.0)
+        return response
+
+
+class ConcurrentFakeArtifactStore(FakeArtifactStore):
+    def __init__(
+        self,
+        objects: object,
+        update_lock: object,
+        write_barrier: object,
+    ) -> None:
+        super().__init__()
+        self.objects = objects  # type: ignore[assignment]
+        self._update_lock = update_lock
+        self._write_barrier = write_barrier
+
+    def write(self, key: str, payload: bytes) -> bool:
+        getattr(self._write_barrier, "wait")(timeout=5.0)
+        return super().write(key, payload)
+
+    def atomic_update(
+        self,
+        key: str,
+        update: Callable[[bytes | None], bytes],
+    ) -> bytes:
+        with self._update_lock:  # type: ignore[operator]
+            current = self.objects.get(key)
+            payload = update(current)
+            if not isinstance(payload, bytes):
+                raise TypeError("atomic update must return bytes")
+            self.objects[key] = payload
+            return payload
+
+
+def _score_in_process(
+    store: ConcurrentFakeArtifactStore,
+    scorer_barrier: object,
+    passage: Passage,
+) -> None:
+    _cache(store, ProcessBarrierScorer(scorer_barrier)).score(
+        "shared query", (passage,)
+    )
 
 
 def _passage(
@@ -168,6 +253,30 @@ def _cache(
     )
 
 
+def _legacy_v2_fingerprint(config: LocalCrossEncoderConfig) -> str:
+    material = msgspec.msgpack.encode(
+        (
+            "local-cross-encoder-fingerprint-v1",
+            config.schema_version,
+            config.model_name,
+            config.revision,
+            config.tokenizer_name,
+            config.tokenizer_revision,
+            config.sentence_transformers_version,
+            config.transformers_version,
+            config.tokenizers_version,
+            config.torch_version,
+            config.effective_device,
+            config.effective_precision,
+            config.batch_size,
+            config.max_length,
+            config.query_format,
+            config.query_policy,
+        )
+    )
+    return "local-cross-encoder-v2/" + hashlib.sha256(material).hexdigest()
+
+
 class PassageScoreCacheTests(unittest.TestCase):
     def test_key_and_map_bytes_are_stable_across_subprocesses(self) -> None:
         code = """
@@ -198,6 +307,26 @@ print(encode_score_map(scores).hex())
             score_object_key("q", "model-v1", "chunker-v1", "report_text"),
         }
         self.assertEqual(len(keys), 4)
+
+    def test_corrected_mixedbread_policy_rotates_durable_object_identity(self) -> None:
+        policy = LocalCrossEncoderConfig(
+            model_name="mixedbread-ai/mxbai-rerank-base-v2",
+            revision="3ea9d4dffa7d12a4f366be8e275c349de9fc9865",
+            tokenizer_name="mixedbread-ai/mxbai-rerank-base-v2",
+            tokenizer_revision="3ea9d4dffa7d12a4f366be8e275c349de9fc9865",
+        )
+        corrected = _cache(
+            FakeArtifactStore(),
+            RecordingScorer(fingerprint=policy.fingerprint),
+        ).object_key("exact query")
+        legacy = score_object_key(
+            "exact query",
+            _legacy_v2_fingerprint(policy),
+            "chunker-v1",
+            "canonical",
+        )
+
+        self.assertNotEqual(corrected, legacy)
 
     def test_map_codec_normalizes_scores_and_orders_binary_keys(self) -> None:
         first = b"a" * 32
@@ -293,6 +422,136 @@ print(encode_score_map(scores).hex())
                 third.content_hash: 1.0,
             },
         )
+
+    def test_different_query_keys_can_score_concurrently(self) -> None:
+        store = FakeArtifactStore()
+        first = _passage("first", document_id="first")
+        second = _passage("second", document_id="second")
+        scorer = BlockingScorer(("query-a", "query-b"))
+        cache_a = _cache(store, scorer)
+        cache_b = _cache(store, scorer)
+        results: dict[str, dict[bytes, float]] = {}
+        errors: list[BaseException] = []
+
+        def score(
+            name: str,
+            cache: PassageScoreCache,
+            query: str,
+            passage: Passage,
+        ) -> None:
+            try:
+                results[name] = cache.score(query, (passage,))
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=score, args=("a", cache_a, "query-a", first)),
+            threading.Thread(target=score, args=("b", cache_b, "query-b", second)),
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(scorer.entered["query-a"].wait(timeout=2.0))
+            self.assertTrue(scorer.entered["query-b"].wait(timeout=2.0))
+        finally:
+            for release in scorer.release.values():
+                release.set()
+            for thread in threads:
+                thread.join(timeout=3.0)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            results,
+            {"a": {first.content_hash: 1.0}, "b": {second.content_hash: 1.0}},
+        )
+
+    def test_same_query_key_serializes_and_preserves_the_union(self) -> None:
+        store = FakeArtifactStore()
+        first = _passage("first", document_id="first")
+        second = _passage("second", document_id="second")
+        scorer = BlockingScorer(("same query",))
+        cache_a = _cache(store, scorer)
+        cache_b = _cache(store, scorer)
+        results: dict[str, dict[bytes, float]] = {}
+        errors: list[BaseException] = []
+
+        def score(
+            name: str,
+            cache: PassageScoreCache,
+            passage: Passage,
+        ) -> None:
+            try:
+                results[name] = cache.score("same query", (passage,))
+            except BaseException as error:
+                errors.append(error)
+
+        first_thread = threading.Thread(target=score, args=("first", cache_a, first))
+        second_thread = threading.Thread(target=score, args=("second", cache_b, second))
+        first_thread.start()
+        self.assertTrue(scorer.entered["same query"].wait(timeout=2.0))
+        second_thread.start()
+        try:
+            self.assertFalse(scorer.second_call_entered.wait(timeout=0.5))
+        finally:
+            scorer.release["same query"].set()
+            first_thread.join(timeout=3.0)
+            second_thread.join(timeout=3.0)
+
+        self.assertTrue(
+            all(not thread.is_alive() for thread in (first_thread, second_thread))
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            results,
+            {
+                "first": {first.content_hash: 1.0},
+                "second": {second.content_hash: 1.0},
+            },
+        )
+        self.assertEqual(
+            decode_score_map(store.objects[cache_a.object_key("same query")]),
+            {first.content_hash: 1.0, second.content_hash: 1.0},
+        )
+
+    def test_atomic_store_merge_preserves_disjoint_updates_across_processes(
+        self,
+    ) -> None:
+        context = multiprocessing.get_context("spawn")
+        with context.Manager() as manager:
+            store = ConcurrentFakeArtifactStore(
+                manager.dict(),
+                context.Lock(),
+                context.Barrier(2),
+            )
+            first = _passage("first", document_id="first")
+            second = _passage("second", document_id="second")
+            scorer_barrier = context.Barrier(2)
+            processes = [
+                context.Process(
+                    target=_score_in_process,
+                    args=(store, scorer_barrier, first),
+                ),
+                context.Process(
+                    target=_score_in_process,
+                    args=(store, scorer_barrier, second),
+                ),
+            ]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=10.0)
+
+            self.assertTrue(all(not process.is_alive() for process in processes))
+            self.assertEqual(
+                [process.exitcode for process in processes],
+                [0, 0],
+            )
+            key = _cache(store, RecordingScorer()).object_key("shared query")
+            self.assertEqual(
+                decode_score_map(store.objects[key]),
+                {first.content_hash: 1.0, second.content_hash: 1.0},
+            )
 
     def test_concurrent_extensions_keep_complete_union_and_warm_reads_do_not_rescore(
         self,
@@ -431,6 +690,18 @@ print(encode_score_map(scores).hex())
         with self.assertRaisesRegex(RuntimeError, "write failed"):
             _cache(write_store, RecordingScorer()).score("query", (passage,))
         self.assertEqual(write_store.write_calls, [])
+
+    def test_unsuccessful_write_does_not_return_scores_as_cached(self) -> None:
+        passage = _passage("first")
+        store = UnsuccessfulWriteArtifactStore()
+        scorer = RecordingScorer()
+
+        with self.assertRaises(ArtifactStoreRemoteError):
+            _cache(store, scorer).score("query", (passage,))
+
+        self.assertEqual(scorer.calls, [("query", (passage.content_hash,))])
+        self.assertEqual(len(store.write_calls), 1)
+        self.assertEqual(store.objects, {})
 
     def test_scorer_failure_or_partial_coverage_never_writes(self) -> None:
         first = _passage("first")

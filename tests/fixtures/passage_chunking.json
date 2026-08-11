@@ -195,6 +195,46 @@
       ]
     },
     {
+      "name": "heading_and_list",
+      "document_id": "doc-heading-list-001",
+      "canonical_text": "# Findings\n- Alpha item.\n- Beta item.\nConclusion follows.",
+      "selected_text": "# Findings\n- Alpha item.\n- Beta item.\nConclusion follows.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 8,
+      "max_passage_length": 5,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 25],
+        [25, 57]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "abbreviation_and_punctuation",
+      "document_id": "doc-abbreviation-punctuation-001",
+      "canonical_text": "Dr. Smith reviewed the U.S. report, e.g. the Jan. 5 release. Did it pass? It did!",
+      "selected_text": "Dr. Smith reviewed the U.S. report, e.g. the Jan. 5 release. Did it pass? It did!",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 13,
+      "max_passage_length": 11,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 61],
+        [61, 81]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
       "name": "normal_sentence_packing",
       "document_id": "doc-packed-001",
       "canonical_text": "One. Two. Three.",

@@ -17,8 +17,8 @@ import msgspec
 from .passages import Passage, sha256_bytes
 
 
-DEFAULT_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-DEFAULT_MODEL_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+DEFAULT_MODEL_NAME = "mixedbread-ai/mxbai-rerank-base-v2"
+DEFAULT_MODEL_REVISION = "3ea9d4dffa7d12a4f366be8e275c349de9fc9865"
 DEFAULT_TOKENIZER_NAME = DEFAULT_MODEL_NAME
 DEFAULT_TOKENIZER_REVISION = DEFAULT_MODEL_REVISION
 DEFAULT_SCHEMA_VERSION = 1
@@ -27,7 +27,7 @@ DEFAULT_BATCH_SIZE = 32
 DEFAULT_QUERY_FORMAT = "{query}"
 DEFAULT_QUERY_POLICY = "literal-v1"
 _HASH_LENGTH = 32
-_FINGERPRINT_PREFIX = "local-cross-encoder-v2/"
+_FINGERPRINT_PREFIX = "local-cross-encoder-v3/"
 _PAIR_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-pair-length-v1/"
 _PASSAGE_LENGTH_FINGERPRINT_PREFIX = "cross-encoder-passage-length-v2/"
 _RUNTIME_DISTRIBUTIONS = (
@@ -137,7 +137,7 @@ def _validate_runtime_versions(config: "LocalCrossEncoderConfig") -> None:
 def _fingerprint_for_config(config: "LocalCrossEncoderConfig") -> str:
     material = msgspec.msgpack.encode(
         (
-            "local-cross-encoder-fingerprint-v1",
+            "local-cross-encoder-fingerprint-v2",
             config.schema_version,
             config.model_name,
             config.revision,
@@ -195,6 +195,10 @@ class LocalCrossEncoderConfig:
         _non_blank_string(self.revision, "revision")
         _non_blank_string(self.tokenizer_name, "tokenizer_name")
         _non_blank_string(self.tokenizer_revision, "tokenizer_revision")
+        if self.tokenizer_name != self.model_name:
+            raise ValueError("tokenizer_name must match model_name")
+        if self.tokenizer_revision != self.revision:
+            raise ValueError("tokenizer_revision must match revision")
         _non_blank_string(
             self.sentence_transformers_version,
             "sentence_transformers_version",
@@ -364,10 +368,9 @@ def _default_tokenizer_loader(config: LocalCrossEncoderConfig) -> Any:
 
 
 def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
-    """Load a pinned local model with its explicitly pinned tokenizer module."""
+    """Load a pinned local model and its owned tokenizer."""
 
     from sentence_transformers import CrossEncoder
-    from sentence_transformers.sentence_transformer.modules import Transformer
     import torch
 
     dtype = {
@@ -375,24 +378,14 @@ def _default_loader(config: LocalCrossEncoderConfig) -> tuple[Any, Any]:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[config.effective_precision]
-    transformer = Transformer(
+    model = CrossEncoder(
         config.model_name,
-        transformer_task="sequence-classification",
+        revision=config.revision,
+        device=config.effective_device,
+        max_length=config.max_length,
         model_kwargs={
-            "revision": config.revision,
             "torch_dtype": dtype,
         },
-        processor_kwargs={
-            "revision": config.tokenizer_revision,
-            "model_max_length": config.max_length,
-        },
-        config_kwargs={"revision": config.revision},
-        max_seq_length=config.max_length,
-        tokenizer_name_or_path=config.tokenizer_name,
-    )
-    model = CrossEncoder(
-        modules=[transformer],
-        device=config.effective_device,
     )
     tokenizer = getattr(model, "tokenizer", None)
     if tokenizer is None or not callable(tokenizer):
@@ -487,6 +480,40 @@ def _reported_token_length(encoded: object) -> int:
             "tokenizer length does not match the returned input_ids"
         )
     return length
+
+
+def _tokenize_pair(
+    tokenizer: Any,
+    query: str,
+    passage: str,
+    *,
+    max_length: int | None = None,
+) -> object:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if isinstance(chat_template, str) and chat_template.strip():
+        apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+        if not callable(apply_chat_template):
+            raise PassageScoringError(
+                "tokenizer with a chat_template must expose apply_chat_template"
+            )
+        return apply_chat_template(
+            [
+                {"role": "query", "content": query},
+                {"role": "document", "content": passage},
+            ],
+            tokenize=True,
+            add_generation_prompt=False,
+            truncation=False,
+            return_dict=True,
+        )
+
+    kwargs: dict[str, object] = {
+        "truncation": False,
+        "return_length": True,
+    }
+    if max_length is not None:
+        kwargs["max_length"] = max_length
+    return tokenizer(query, passage, **kwargs)
 
 
 class _PassageLengthFunction:
@@ -649,33 +676,7 @@ class CrossEncoderPairLengthFunction:
         if self._pair_token_overhead_value is not None:
             return self._pair_token_overhead_value
 
-        query_length = self._single_sequence_length(self._formatted_query)
-        if query_length <= 0:
-            raise PassageScoringError(
-                "formatted query must have a positive no-special token length"
-            )
-        tokenizer = self._ensure_tokenizer()
-        special_token_counter = getattr(tokenizer, "num_special_tokens_to_add", None)
-        if not callable(special_token_counter):
-            raise PassageScoringError(
-                "tokenizer must expose num_special_tokens_to_add(pair=True)"
-            )
-        try:
-            special_tokens = special_token_counter(pair=True)
-        except Exception as error:
-            raise PassageScoringError(
-                "tokenizer failed while counting pair special tokens"
-            ) from error
-        if (
-            isinstance(special_tokens, bool)
-            or not isinstance(special_tokens, int)
-            or special_tokens < 0
-        ):
-            raise PassageScoringError(
-                "tokenizer returned an invalid pair special-token count"
-            )
-
-        overhead = query_length + special_tokens
+        overhead = self("")
         if overhead <= 0:
             raise PassageScoringError("formatted query pair overhead must be positive")
         self._pair_token_overhead_value = overhead
@@ -711,11 +712,10 @@ class CrossEncoderPairLengthFunction:
             raise PassageScoringError("passage must be a string")
         tokenizer = self._ensure_tokenizer()
         try:
-            encoded = tokenizer(
+            encoded = _tokenize_pair(
+                tokenizer,
                 self._formatted_query,
                 passage,
-                truncation=False,
-                return_length=True,
             )
         except PassageScoringError:
             raise
@@ -802,12 +802,11 @@ class LocalCrossEncoderScorer:
     def _tokenize_pairs(self, tokenizer: Any, pairs: Sequence[tuple[str, str]]) -> None:
         for query, passage in pairs:
             try:
-                encoded = tokenizer(
+                encoded = _tokenize_pair(
+                    tokenizer,
                     query,
                     passage,
-                    truncation=False,
                     max_length=self._config.max_length,
-                    return_length=True,
                 )
             except PassageScoringError:
                 raise

@@ -14,9 +14,12 @@ from unittest.mock import patch
 from trec_ragtime.passages import (
     Passage,
     PassageChunker,
-    PassageChunkingError,
     sha256_bytes,
     validate_passages,
+)
+from trec_ragtime.passage_scoring import (
+    CrossEncoderPairLengthFunction,
+    LocalCrossEncoderConfig,
 )
 
 
@@ -50,16 +53,37 @@ class FixturePairLength:
         return self.passage_length_function(text) + 2
 
 
-class PairAwareCjkLength:
-    """Fake exact pair budget used without loading a model or tokenizer."""
+class _OfflinePinnedTokenizer:
+    """Deterministic pinned-tokenizer shape used without model weights."""
 
-    fingerprint = "benchmark-fake-cross-encoder-pair-v1"
-    passage_length_function = len
-    max_passage_length = 501
-    max_length = 512
+    QUERY = "shared evidence and practical outcomes"
 
-    def __call__(self, text: str) -> int:
-        return len(text) + 11
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def __call__(self, *texts: str, **kwargs: Any) -> dict[str, object]:
+        self.calls.append((texts, dict(kwargs)))
+        if len(texts) == 2:
+            query, passage = texts
+            if query != self.QUERY:
+                raise AssertionError(f"unexpected pair query: {query!r}")
+            passage_count = 0 if not passage else len(passage) + 1
+            count = 10 + passage_count
+        elif len(texts) == 1:
+            (text,) = texts
+            if kwargs.get("add_special_tokens") is not False:
+                raise AssertionError("single-sequence counting must disable specials")
+            if text == self.QUERY:
+                count = 6
+            elif not text:
+                count = 0
+            elif set(text) == {"中"}:
+                count = len(text) + 1
+            else:
+                raise AssertionError(f"unexpected single sequence: {text!r}")
+        else:
+            raise AssertionError(f"unexpected tokenizer arity: {len(texts)}")
+        return {"input_ids": list(range(count)), "length": [count]}
 
 
 class MultiSentencePairLength:
@@ -229,7 +253,7 @@ def run_once(cases: list[dict[str, Any]]) -> tuple[list[bytes], int, float]:
     return records, passage_count, time.perf_counter() - started
 
 
-def verify_multi_sentence_guard() -> bool:
+def verify_multi_sentence_units() -> tuple[tuple[int, int, str], ...]:
     text = "One. Two."
     pair_length = MultiSentencePairLength()
     individual_sentences = ("One.", "Two.")
@@ -249,21 +273,30 @@ def verify_multi_sentence_guard() -> bool:
             "RCTS must not receive a multi-sentence over-ceiling span"
         ),
     ):
-        try:
-            chunker.chunk(
-                document_id="benchmark-multi-sentence-guard",
-                canonical_text=text,
-                selected_text=text,
-                representation="canonical",
-                language="eng",
-            )
-        except PassageChunkingError as error:
-            if str(error) != "RCTS requires exactly one underlying sentence":
-                raise AssertionError(
-                    "multi-sentence guard raised an unexpected error"
-                ) from error
-            return True
-    raise AssertionError("multi-sentence over-ceiling span was not rejected")
+        passages = chunker.chunk(
+            document_id="benchmark-multi-sentence-units",
+            canonical_text=text,
+            selected_text=text,
+            representation="canonical",
+            language="eng",
+        )
+
+    assert_benchmark_invariants(text, passages, pair_length, pair_length.max_length)
+    actual = tuple(
+        (passage.start_char, passage.end_char, passage.text) for passage in passages
+    )
+    expected = ((0, 5, "One. "), (5, 9, "Two."))
+    if actual != expected:
+        raise AssertionError(
+            f"multi-sentence repacking changed source spans: {actual!r}"
+        )
+    if any(passage.boundary != "sentence" for passage in passages):
+        raise AssertionError(
+            "multi-sentence repacking must preserve sentence boundaries"
+        )
+    if "".join(passage.text for passage in passages) != text:
+        raise AssertionError("multi-sentence repacking left source text uncovered")
+    return actual
 
 
 class _FakeDocument:
@@ -313,7 +346,21 @@ def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
     import trec_ragtime.passages as passages_module
 
     text = "中" * 502
-    pair_length = PairAwareCjkLength()
+    tokenizer = _OfflinePinnedTokenizer()
+    tokenizer_loader_calls = 0
+
+    def tokenizer_loader(config: LocalCrossEncoderConfig) -> _OfflinePinnedTokenizer:
+        nonlocal tokenizer_loader_calls
+        if config.max_length != 512:
+            raise AssertionError("pair-aware fixture changed its pinned max length")
+        tokenizer_loader_calls += 1
+        return tokenizer
+
+    pair_length = CrossEncoderPairLengthFunction(
+        LocalCrossEncoderConfig(max_length=512),
+        _OfflinePinnedTokenizer.QUERY,
+        tokenizer_loader=tokenizer_loader,
+    )
     if (
         len(text) > pair_length.max_length
         or pair_length(text) <= pair_length.max_length
@@ -353,8 +400,9 @@ def verify_pair_aware_case() -> tuple[tuple[int, int, str], ...]:
         )
 
     assert _PinnedTokenizerSplitter.pipelines == ["zh_core_web_sm"]
-    assert splitter_loader_calls == 2
+    assert splitter_loader_calls == 3
     assert model_loader_calls == []
+    assert tokenizer_loader_calls == 1
     assert_benchmark_invariants(text, passages, pair_length, pair_length.max_length)
     assert all(passage.boundary == "oversized_sentence" for passage in passages)
     records = tuple(
@@ -380,30 +428,45 @@ def main() -> int:
         raise AssertionError(
             "pair-aware benchmark runs produced different passage records"
         )
-    oversized_sentence_rcts_only = verify_multi_sentence_guard()
+    first_multi_sentence_record = verify_multi_sentence_units()
+    second_multi_sentence_record = verify_multi_sentence_units()
+    if first_multi_sentence_record != second_multi_sentence_record:
+        raise AssertionError("multi-sentence units produced different passage records")
 
     oversized_cases = [case for case in cases if case["name"] == "oversized_sentence"]
     if len(oversized_cases) != 1:
         raise AssertionError("fixture must contain one oversized_sentence case")
 
-    print("package_versions=" + json.dumps(package_versions(), sort_keys=True))
+    packages = package_versions()
+    print("benchmark_scope=exact_fixture_chunking_plus_offline_pair_ceiling")
+    print(
+        "selected_library_versions="
+        + json.dumps(
+            {name: packages[name] for name in ("langchain-text-splitters", "spacy")},
+            sort_keys=True,
+        )
+    )
+    print("pair_length_seam=CrossEncoderPairLengthFunction")
+    print("pair_length_tokenizer=offline_pinned_tokenizer_shape")
+    print("package_versions=" + json.dumps(packages, sort_keys=True))
     print("spacy_model_versions=" + json.dumps(models, sort_keys=True))
     print(f"fixture_cases={len(cases)}")
     print(f"passes={len(cases) * 2}")
     print("failures=0")
     print("full_source_coverage=true")
     print("sentence_only_overlap=true")
-    print("oversized_sentence_rcts_only=" + str(oversized_sentence_rcts_only).lower())
+    print("multi_sentence_units_without_rcts=true")
     print("pair_ceiling=true")
     print("deterministic_records=true")
     print("pair_aware_model_loader_calls=0")
+    print("pair_aware_tokenizer_loader_calls=1")
     print(f"startup_seconds={startup_seconds:.6f}")
     print(f"run1_seconds={first_seconds:.6f}")
     print(f"run2_seconds={second_seconds:.6f}")
     print(f"documents_per_second={len(cases) / first_seconds:.3f}")
     print(f"passages={first_passages}")
     print(f"passages_per_second={first_passages / first_seconds:.3f}")
-    print("pair_aware_fake_ceiling=true")
+    print("pair_aware_pinned_tokenizer_ceiling=true")
     print(f"pair_aware_passages={len(first_pair_record)}")
     return 0
 

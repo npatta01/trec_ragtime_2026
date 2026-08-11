@@ -27,7 +27,7 @@ FLASH_PAYLOAD_LIMIT_BYTES = 10_000_000
 DEFAULT_FLASH_BATCH_SIZE = 32
 DEFAULT_FLASH_CONCURRENCY = 4
 DEFAULT_FLASH_REQUEST_TIMEOUT = 60.0
-DEFAULT_FLASH_IDLE_TIMEOUT = 300.0
+DEFAULT_FLASH_IDLE_TIMEOUT = 300
 DEFAULT_FLASH_WORKER_NAME = "trec-ragtime-passage-scorer"
 DEFAULT_FLASH_GPU = "AMPERE_24"
 _BRIDGE_CLEANUP_GRACE_SECONDS = 0.5
@@ -418,7 +418,7 @@ class RunpodFlashConfig:
     concurrency: int = DEFAULT_FLASH_CONCURRENCY
     request_timeout: float = DEFAULT_FLASH_REQUEST_TIMEOUT
     workers: int = 1
-    idle_timeout: float = DEFAULT_FLASH_IDLE_TIMEOUT
+    idle_timeout: int = DEFAULT_FLASH_IDLE_TIMEOUT
     worker_name: str = DEFAULT_FLASH_WORKER_NAME
     gpu: str = DEFAULT_FLASH_GPU
     model_name: str | None = None
@@ -453,12 +453,17 @@ class RunpodFlashConfig:
                 raise ValueError(f"{field_name} must be a positive integer")
         if self.max_payload_bytes > FLASH_PAYLOAD_LIMIT_BYTES:
             raise ValueError("max_payload_bytes cannot exceed the Flash 10 MB limit")
-        for field_name in ("request_timeout", "idle_timeout"):
-            value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, numbers.Real):
-                raise ValueError(f"{field_name} must be a positive number")
-            if not math.isfinite(float(value)) or float(value) <= 0:
-                raise ValueError(f"{field_name} must be a positive finite number")
+        value = self.request_timeout
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise ValueError("request_timeout must be a positive number")
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError("request_timeout must be a positive finite number")
+        if (
+            isinstance(self.idle_timeout, bool)
+            or not isinstance(self.idle_timeout, int)
+            or not 1 <= self.idle_timeout <= 3600
+        ):
+            raise ValueError("idle_timeout must be an integer between 1 and 3600")
         for field_name in (
             "worker_name",
             "gpu",
@@ -690,6 +695,18 @@ def _runner_awaitable(runner: object, payload: bytes) -> Awaitable[object]:
     return cast(Awaitable[object], result)
 
 
+def _runpod_request_body(payload: bytes) -> bytes:
+    """Encode the body produced by the Runpod endpoint ``/run`` call."""
+
+    request = decode_flash_request(payload)
+    return json.dumps(
+        {"input": {"request": request}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 class RunpodFlashPassageScorer:
     """Synchronous exact scorer backed by bounded asynchronous Flash batches."""
 
@@ -727,9 +744,10 @@ class RunpodFlashPassageScorer:
         current: list[tuple[bytes, str]] = []
 
         def fits(payload: bytes) -> bool:
+            request_body = _runpod_request_body(payload)
             return (
-                len(payload) < config.max_payload_bytes
-                and len(payload) < FLASH_PAYLOAD_LIMIT_BYTES
+                len(request_body) < config.max_payload_bytes
+                and len(request_body) < FLASH_PAYLOAD_LIMIT_BYTES
             )
 
         def flush() -> None:
@@ -978,7 +996,7 @@ class FlashEndpointBatchRunner:
             run = getattr(endpoint, "run", None)
             if not callable(run):
                 raise FlashScoringError("Flash endpoint does not expose async run")
-            job_result = run(request)
+            job_result = run({"request": request})
             if not hasattr(job_result, "__await__"):
                 raise FlashScoringError("Flash endpoint run must be awaitable")
             job = await cast(Awaitable[object], job_result)

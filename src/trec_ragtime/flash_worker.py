@@ -9,7 +9,7 @@ class FlashPassageWorker:
     """Self-contained Flash worker; only this class body is sent remotely."""
 
     _WIRE_SCHEMA_VERSION = 1
-    _FINGERPRINT_PREFIX = "local-cross-encoder-v2/"
+    _FINGERPRINT_PREFIX = "local-cross-encoder-v3/"
     _ERROR = ValueError
     _CONFIG_FIELDS = (
         "schema_version",
@@ -150,6 +150,10 @@ class FlashPassageWorker:
             "query_policy",
         ):
             cls._non_blank(values[field_name], field_name)
+        if values["tokenizer_name"] != values["model_name"]:
+            raise cls._error("tokenizer_name must match model_name")
+        if values["tokenizer_revision"] != values["revision"]:
+            raise cls._error("tokenizer_revision must match revision")
         for field_name in ("schema_version", "batch_size", "max_length"):
             field_value = values[field_name]
             if (
@@ -174,7 +178,7 @@ class FlashPassageWorker:
 
         material = msgspec.msgpack.encode(
             (
-                "local-cross-encoder-fingerprint-v1",
+                "local-cross-encoder-fingerprint-v2",
                 values["schema_version"],
                 values["model_name"],
                 values["revision"],
@@ -226,29 +230,21 @@ class FlashPassageWorker:
     def _default_loader(config: dict[str, object]) -> tuple[object, object]:
         import torch
         from sentence_transformers import CrossEncoder
-        from sentence_transformers.sentence_transformer.modules import Transformer
 
         dtype = {
             "float32": torch.float32,
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
         }[config["precision"]]
-        transformer = Transformer(
+        model = CrossEncoder(
             config["model_name"],
-            transformer_task="sequence-classification",
+            revision=config["revision"],
+            device=config["device"],
+            max_length=config["max_length"],
             model_kwargs={
-                "revision": config["revision"],
                 "torch_dtype": dtype,
             },
-            processor_kwargs={
-                "revision": config["tokenizer_revision"],
-                "model_max_length": config["max_length"],
-            },
-            config_kwargs={"revision": config["revision"]},
-            max_seq_length=config["max_length"],
-            tokenizer_name_or_path=config["tokenizer_name"],
         )
-        model = CrossEncoder(modules=[transformer], device=config["device"])
         tokenizer = getattr(model, "tokenizer", None)
         if tokenizer is None or not callable(tokenizer):
             raise ValueError("loaded model did not expose a callable tokenizer")
@@ -298,26 +294,27 @@ class FlashPassageWorker:
         else:
             length = len(items)
 
-        reported = cls._as_sequence(encoded.get("length"))
-        if isinstance(reported, bool):
-            raise cls._error("tokenizer returned malformed length")
-        if isinstance(reported, int):
-            reported_length = reported
-        elif isinstance(reported, Sequence) and not isinstance(
-            reported, (str, bytes, bytearray)
-        ):
-            values = list(reported)
-            if (
-                len(values) != 1
-                or isinstance(values[0], bool)
-                or not isinstance(values[0], int)
-            ):
+        if "length" in encoded:
+            reported = cls._as_sequence(encoded.get("length"))
+            if isinstance(reported, bool):
                 raise cls._error("tokenizer returned malformed length")
-            reported_length = values[0]
-        else:
-            raise cls._error("tokenizer did not return a valid length")
-        if reported_length < 0 or reported_length != length:
-            raise cls._error("tokenizer length does not match input_ids")
+            if isinstance(reported, int):
+                reported_length = reported
+            elif isinstance(reported, Sequence) and not isinstance(
+                reported, (str, bytes, bytearray)
+            ):
+                values = list(reported)
+                if (
+                    len(values) != 1
+                    or isinstance(values[0], bool)
+                    or not isinstance(values[0], int)
+                ):
+                    raise cls._error("tokenizer returned malformed length")
+                reported_length = values[0]
+            else:
+                raise cls._error("tokenizer did not return a valid length")
+            if reported_length < 0 or reported_length != length:
+                raise cls._error("tokenizer length does not match input_ids")
 
         overflow = cls._as_sequence(encoded.get("overflowing_tokens"))
         if overflow not in (None, [], (), False):
@@ -326,6 +323,40 @@ class FlashPassageWorker:
         if truncated not in (None, 0, [], (), False, [0], (0,)):
             raise cls._error("tokenizer reported truncation")
         return length
+
+    @classmethod
+    def _tokenize_pair(
+        cls,
+        tokenizer: object,
+        query: str,
+        passage: str,
+        *,
+        max_length: int,
+    ) -> object:
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if isinstance(chat_template, str) and chat_template.strip():
+            apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+            if not callable(apply_chat_template):
+                raise cls._error(
+                    "tokenizer with a chat_template must expose apply_chat_template"
+                )
+            return apply_chat_template(
+                [
+                    {"role": "query", "content": query},
+                    {"role": "document", "content": passage},
+                ],
+                tokenize=True,
+                add_generation_prompt=False,
+                truncation=False,
+                return_dict=True,
+            )
+        return tokenizer(
+            query,
+            passage,
+            truncation=False,
+            max_length=max_length,
+            return_length=True,
+        )
 
     @classmethod
     def _format_query(cls, config: dict[str, object], query: object) -> str:
@@ -430,12 +461,11 @@ class FlashPassageWorker:
         pairs = [(formatted_query, text) for _, text in rows]
         for pair_query, passage in pairs:
             try:
-                encoded = tokenizer(
+                encoded = cls._tokenize_pair(
+                    tokenizer,
                     pair_query,
                     passage,
-                    truncation=False,
                     max_length=config["max_length"],
-                    return_length=True,
                 )
                 length = cls._token_length(encoded)
             except Exception as error:

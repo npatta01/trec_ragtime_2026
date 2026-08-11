@@ -6,19 +6,48 @@ import hashlib
 import math
 import numbers
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import cast
 
 import msgspec
 
-from .artifact_store import ArtifactStoreLike, ArtifactValidationError
+from .artifact_store import (
+    ArtifactStoreLike,
+    ArtifactStoreRemoteError,
+    ArtifactValidationError,
+)
 from .passage_scoring import PassageScorer, validate_passage_scores
 from .passages import Passage, sha256_bytes
 
 CACHE_SCHEMA_VERSION = 1
 OBJECT_ROOT = "passage-scores/v1"
 _HASH_LENGTH = 32
-_SCORE_TRANSACTION_LOCK = threading.Lock()
+_SCORE_TRANSACTION_LOCKS_GUARD = threading.Lock()
+_SCORE_TRANSACTION_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
+
+
+@contextmanager
+def _score_transaction(key: str) -> Iterator[None]:
+    with _SCORE_TRANSACTION_LOCKS_GUARD:
+        entry = _SCORE_TRANSACTION_LOCKS.get(key)
+        if entry is None:
+            lock = threading.Lock()
+            _SCORE_TRANSACTION_LOCKS[key] = (lock, 1)
+        else:
+            lock, references = entry
+            _SCORE_TRANSACTION_LOCKS[key] = (lock, references + 1)
+
+    try:
+        with lock:
+            yield
+    finally:
+        with _SCORE_TRANSACTION_LOCKS_GUARD:
+            current_lock, references = _SCORE_TRANSACTION_LOCKS[key]
+            if references == 1:
+                del _SCORE_TRANSACTION_LOCKS[key]
+            else:
+                _SCORE_TRANSACTION_LOCKS[key] = (current_lock, references - 1)
 
 
 class PassageScoreArtifactValidationError(ValueError):
@@ -176,9 +205,14 @@ def _unique_requested(
 class PassageScoreCache:
     """Cache-aside adapter for complete per-query passage score maps.
 
-    All cache instances share a process-local lock around the complete
-    read/score/merge/write transaction. A future cross-process
-    ``ArtifactStoreLike`` must provide its own atomic update operation.
+    Cache instances serialize the complete read/score/merge/write transaction
+    for the same object key when the injected store exposes only the basic
+    ``ArtifactStoreLike`` seam. A store that supports shared writers may also
+    expose ``atomic_update(key, transform) -> bytes``; the transform receives
+    the latest raw payload and must be applied and published atomically by the
+    store. This optional capability prevents cross-process and cross-machine
+    disjoint score updates from being lost without expanding this adapter's
+    public interface.
     """
 
     __slots__ = (
@@ -263,7 +297,38 @@ class PassageScoreCache:
             return {}
 
         key = self.object_key(query)
-        with _SCORE_TRANSACTION_LOCK:
+        atomic_update = getattr(self._store, "atomic_update", None)
+        if callable(atomic_update):
+            stored = self._store.read_validated(key, self._decoder)
+            prior_scores = {} if stored is None else _normalize_score_map(stored)
+            missing = tuple(
+                passage
+                for content_hash, passage in requested
+                if content_hash not in prior_scores
+            )
+
+            if missing:
+                response = self._scorer.score(query, missing)
+                new_scores = validate_passage_scores(missing, response)
+
+                def merge_latest(payload: bytes | None) -> bytes:
+                    latest = {} if payload is None else self._decoder(payload)
+                    merged = dict(_normalize_score_map(latest, allow_empty=True))
+                    for content_hash, score in new_scores.items():
+                        merged.setdefault(content_hash, score)
+                    return encode_score_map(merged)
+
+                payload = atomic_update(key, merge_latest)
+                if not isinstance(payload, bytes):
+                    raise TypeError("atomic score-map update must return bytes")
+                prior_scores = decode_score_map(payload)
+
+            return {
+                content_hash: prior_scores[content_hash]
+                for content_hash, _ in requested
+            }
+
+        with _score_transaction(key):
             stored = self._store.read_validated(key, self._decoder)
             prior_scores = {} if stored is None else _normalize_score_map(stored)
             missing = tuple(
@@ -278,7 +343,11 @@ class PassageScoreCache:
                 merged = dict(prior_scores)
                 merged.update(new_scores)
                 payload = encode_score_map(merged)
-                self._store.write(key, payload)
+                stored = self._store.write(key, payload)
+                if stored is not True:
+                    raise ArtifactStoreRemoteError(
+                        "passage-score artifact write did not succeed"
+                    )
                 prior_scores = decode_score_map(payload)
 
             return {
