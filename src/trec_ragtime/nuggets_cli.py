@@ -26,8 +26,9 @@ from typing import Any
 
 from .artifact_store import ArtifactStore
 from .nugget_cache import NuggetArtifactCache, NuggetInput
-from .nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig, provider_settings
+from .nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig
 from .nuggets import DEFAULT_EVIDENCE_BUDGET, DEFAULT_MAX_NUGGETS, NuggetClusterer
+from .providers import provider_settings
 from .nuggets_runner import (
     DEFAULT_CONCURRENCY,
     TopicOutcome,

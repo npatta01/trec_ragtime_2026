@@ -118,6 +118,12 @@ from .passages import (
     sha256_bytes,
     validate_passages,
 )
+from .providers import (
+    OPENAI_BASE_URL,
+    OPENROUTER_BASE_URL,
+    ProviderConfigurationError,
+    provider_settings,
+)
 from .reranking import (
     PassageEvidence,
     RerankedDocument,
@@ -201,6 +207,8 @@ __all__ = [
     "NuggetizerBackend",
     "NuggetizerConfig",
     "NuggetizerError",
+    "OPENAI_BASE_URL",
+    "OPENROUTER_BASE_URL",
     "Passage",
     "PassageChunker",
     "PassageChunkingError",
@@ -209,6 +217,7 @@ __all__ = [
     "PassageScorer",
     "PassageScoringError",
     "PipelineResult",
+    "ProviderConfigurationError",
     "RagtimeApiError",
     "RagtimeClient",
     "RagtimeConfigurationError",
@@ -234,6 +243,7 @@ __all__ = [
     "encode_flash_request",
     "encode_flash_response",
     "max_passage_v1",
+    "provider_settings",
     "rerank_retrieval",
     "run_topic_nuggets",
     "sha256_bytes",

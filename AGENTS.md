@@ -25,6 +25,18 @@
   outputs. The API endpoint is public configuration; the token is secret.
 - The committed ciphertext is `config/secrets.sops.env`. Its GCP KMS creation
   rule is in `.sops.yaml` and uses the `np-public-training` project key.
+- The encrypted file carries `RAGTIME_BASE_URL`, `RAGTIME_BEARER_TOKEN`,
+  `RAGTIME_HF_BUCKET_ID`, `RAGTIME_ARTIFACT_PREFIX`,
+  `RAGTIME_ARTIFACT_CACHE_DIR`, `RAGTIME_CACHE_NAMESPACE`, `HF_TOKEN`,
+  `RUNPOD_API_KEY`, and `OPENROUTER_API_KEY`.
+- The LLM provider credential is not a special case: `OPENROUTER_API_KEY` comes
+  from the decrypted `.env` like the rest, and implies the
+  `https://openrouter.ai/api/v1` base URL. `OPENAI_API_KEY` with an optional
+  `OPENAI_BASE_URL` is the fallback for a direct OpenAI account or a LiteLLM
+  proxy. `trec_ragtime.provider_settings()` is the one place that resolves the
+  `(base_url, api_key)` pair; do not re-derive provider routing in notebooks,
+  scripts, or stage adapters. It returns the key for the SDK to use only: keep
+  it out of logs, stored payloads, cache keys, and fingerprints.
 - To update credentials, edit the ciphertext through SOPS and then refresh the
   local `.env` before running code:
 

@@ -3,11 +3,10 @@
 Nuggetization is delegated to ``nuggetizer``; this module owns nothing but the
 call shape, so a package change cannot leak into the pipeline.
 
-Provider routing follows this repository's convention, which upstream does not
-share: the README documents ``OPENROUTER_API_KEY`` with an OpenRouter base URL,
-while pinned 0.0.5 only ever reads ``OPEN_AI_API_KEY`` or ``OPENAI_API_KEY`` and
-always points at OpenAI. ``provider_settings`` bridges the two, so the setup the
-README already describes works here.
+Provider routing comes from :func:`trec_ragtime.providers.provider_settings`,
+which resolves the credential the decrypted ``.env`` carries. Pinned 0.0.5 reads
+only ``OPEN_AI_API_KEY`` or ``OPENAI_API_KEY`` and always points at OpenAI, so
+the resolved base URL and key are handed to it explicitly.
 
 ``BoundedHandler`` exists because upstream's ``LLMHandler.run`` retries forever:
 it catches every exception, rotates the key, sleeps, and loops with no exit
@@ -22,7 +21,6 @@ than from the provider.
 from __future__ import annotations
 
 import importlib.metadata
-import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -31,10 +29,10 @@ from nuggetizer.core.types import Document, Query, Request, ScoredNugget
 from nuggetizer.models.nuggetizer import Nuggetizer
 from openai import OpenAI
 
+from .providers import provider_settings
+
 
 PACKAGE_NAME = "nuggetizer"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENAI_BASE_URL = "https://api.openai.com/v1"
 MAX_COMPLETION_TOKENS = 2048
 REQUEST_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_CALLS = 64
@@ -54,28 +52,6 @@ class NuggetizerConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     creator_window_size: int = 10
     scorer_window_size: int = 20
     max_calls: int = DEFAULT_MAX_CALLS
-
-
-def provider_settings(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
-    """Return ``(base_url, api_key)`` using this repository's documented setup.
-
-    ``OPENROUTER_API_KEY`` wins because that is what the README tells people to
-    export; ``OPENAI_API_KEY`` with an optional ``OPENAI_BASE_URL`` is the
-    fallback. The key is returned for the SDK to use and is never logged, stored,
-    or placed in a fingerprint.
-    """
-
-    values = os.environ if environ is None else environ
-    router_key = values.get("OPENROUTER_API_KEY")
-    if router_key:
-        return values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL), router_key
-    openai_key = values.get("OPENAI_API_KEY") or values.get("OPEN_AI_API_KEY")
-    if openai_key:
-        return values.get("OPENAI_BASE_URL", OPENAI_BASE_URL), openai_key
-    raise NuggetizerError(
-        "no provider credential: export OPENROUTER_API_KEY, or OPENAI_API_KEY "
-        "with an optional OPENAI_BASE_URL"
-    )
 
 
 class BoundedHandler:
@@ -234,12 +210,10 @@ def _label(value: Any, allowed: frozenset[str], field: str) -> str:
 __all__ = [
     "DEFAULT_MAX_CALLS",
     "MAX_COMPLETION_TOKENS",
-    "OPENROUTER_BASE_URL",
     "BoundedHandler",
     "NuggetizerBackend",
     "NuggetizerConfig",
     "NuggetizerError",
     "build",
     "package_identity",
-    "provider_settings",
 ]

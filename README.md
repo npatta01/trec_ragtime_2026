@@ -472,9 +472,10 @@ The shared setup is:
 ```python
 from openai import OpenAI
 
-from trec_ragtime import CachedChatCompletions
+from trec_ragtime import CachedChatCompletions, provider_settings
 from trec_ragtime.artifact_store import ArtifactStore
 
+provider_url, provider_key = provider_settings()
 client = OpenAI(api_key=provider_key, base_url=provider_url, max_retries=0)
 cached = CachedChatCompletions(client, ArtifactStore.from_env())
 response = cached.create(model=model, messages=messages)
@@ -484,28 +485,33 @@ When `namespace` is omitted, the wrapper inherits a store's validated
 `namespace` metadata; stores without namespace metadata use the default
 `ragtime2-2026-v1`. Pass `namespace=` explicitly to override the store.
 
-For OpenRouter, use `provider_url = "https://openrouter.ai/api/v1"` and keep
-the provider key in the environment or another private configuration source.
-For a LiteLLM deployment, set `provider_url` to that deployment's configured
-OpenAI-compatible `/v1` proxy URL; the proxy address is deployment-specific and
-the wrapper does not assume one.
+The LLM provider credential is not a special case: `OPENROUTER_API_KEY` lives
+in the committed `config/secrets.sops.env` ciphertext and reaches the process
+through the same decrypt-first workflow as every other secret. Decrypt into the
+ignored root `.env`, and the notebooks and entry points that load `.env` pick it
+up from there. The variable is listed with an empty value in the tracked
+`.env.example` for an unshared local configuration. OpenRouter's base URL is
+`https://openrouter.ai/api/v1`.
 
-The decrypt-first workflow replaces the project `.env`, so provider-specific
-values are intentionally not listed in `.env.example`. Export them in the shell
-after decrypting `.env`, or inject them through another private runtime secret
-source.
-
-```python
-import os
-
-# OpenRouter
-provider_url = "https://openrouter.ai/api/v1"
-provider_key = os.environ["OPENROUTER_API_KEY"]
-
-# LiteLLM proxy (the configured value must be its OpenAI-compatible /v1 URL)
-provider_url = os.environ["LITELLM_PROXY_BASE_URL"]
-provider_key = os.environ["LITELLM_PROXY_API_KEY"]
+```bash
+sops decrypt --output .env config/secrets.sops.env
 ```
+
+For a direct OpenAI account or a LiteLLM deployment, use `OPENAI_API_KEY`
+instead and set `OPENAI_BASE_URL` to that deployment's OpenAI-compatible `/v1`
+URL. The proxy address is deployment-specific, so nothing here assumes one;
+omitting `OPENAI_BASE_URL` reaches OpenAI itself at `https://api.openai.com/v1`.
+
+`trec_ragtime.provider_settings()` owns that resolution so callers do not
+re-derive it from the environment: `OPENROUTER_API_KEY` wins and implies the
+OpenRouter base URL, `OPENAI_API_KEY` (or the `OPEN_AI_API_KEY` spelling some
+upstream packages read) with an optional `OPENAI_BASE_URL` is the fallback,
+and an explicit `OPENAI_BASE_URL` overrides the default in either case. A
+blank value is an unfilled `.env` placeholder rather than a credential, and no
+credential at all raises `ProviderConfigurationError` instead of reaching a
+provider anonymously. Pass an explicit mapping to resolve without reading the
+process environment. The returned key is for the SDK to use: it is never
+logged, stored, or part of a cache key or fingerprint.
 
 The cache identity includes the base URL, operation, namespace, and the exact
 JSON request. Mapping key order is canonicalized recursively, while list order
@@ -678,10 +684,12 @@ setuptools `include` list, so a Git-pinned build installs and then fails on
 release; the installed version and revision are part of every artifact
 fingerprint, so a change retires the previous objects.
 
-Provider routing is environment driven. Upstream constructs its own OpenAI
-client with no explicit base URL, so `OPENAI_API_KEY` plus `OPENAI_BASE_URL`
-reaches OpenRouter, a LiteLLM proxy, or OpenAI itself. Upstream exposes no
-seed, so identical inputs may still produce different claims on a cold run:
+The provider credential is resolved by `trec_ragtime.providers.provider_settings`
+from the decrypted `.env`, so `OPENROUTER_API_KEY` is picked up automatically and
+implies the OpenRouter base URL. Pinned 0.0.5 reads only `OPEN_AI_API_KEY` or
+`OPENAI_API_KEY` and always points at OpenAI, so the resolved base URL and key
+are handed to it explicitly rather than left to its own lookup. Upstream exposes
+no seed, so identical inputs may still produce different claims on a cold run:
 determinism comes from the artifact cache, not from the provider. Upstream also
 retries a failed provider call forever, so this stage caps each topic's provider
 calls and turns exhaustion into a failed topic rather than a hung batch.

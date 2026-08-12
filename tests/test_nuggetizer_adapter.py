@@ -10,15 +10,14 @@ from typing import Any
 from nuggetizer.core.types import AssignedScoredNugget, ScoredNugget
 
 from trec_ragtime.nuggetizer_adapter import (
-    OPENROUTER_BASE_URL,
     BoundedHandler,
     NuggetizerBackend,
     NuggetizerConfig,
     NuggetizerError,
     build,
     package_identity,
-    provider_settings,
 )
+from trec_ragtime.providers import OPENROUTER_BASE_URL, ProviderConfigurationError
 
 
 PASSAGES = (
@@ -106,6 +105,32 @@ class PackageIdentityTestCase(unittest.TestCase):
         self.assertTrue(identity["version"])
         # A published release carries no VCS metadata; a Git pin would.
         self.assertEqual(set(identity) - {"commit"}, {"name", "version"})
+
+
+class ProviderResolutionTestCase(ProviderKeyTestCase):
+    """Resolution itself lives in trec_ragtime.providers; this checks the wiring."""
+
+    def test_builds_its_client_from_the_shared_resolver(self) -> None:
+        previous = os.environ.pop("OPENAI_API_KEY", None)
+        os.environ["OPENROUTER_API_KEY"] = "router-key"
+        try:
+            handler = build(NuggetizerConfig(model="test-model")).creator_llm
+            self.assertEqual(str(handler.client.base_url).rstrip("/"), OPENROUTER_BASE_URL)
+        finally:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            if previous is not None:
+                os.environ["OPENAI_API_KEY"] = previous
+
+    def test_an_unconfigured_provider_fails_before_any_call(self) -> None:
+        saved = {name: os.environ.pop(name, None)
+                 for name in ("OPENAI_API_KEY", "OPEN_AI_API_KEY", "OPENROUTER_API_KEY")}
+        try:
+            with self.assertRaises(ProviderConfigurationError):
+                build(NuggetizerConfig(model="test-model"))
+        finally:
+            for name, value in saved.items():
+                if value is not None:
+                    os.environ[name] = value
 
 
 class BuildTestCase(ProviderKeyTestCase):
@@ -274,31 +299,6 @@ class BoundedHandlerTestCase(ProviderKeyTestCase):
                         "test-model", max_calls=max_calls,
                         base_url="https://provider/v1", api_key="k",
                     )
-
-
-class ProviderSettingsTestCase(unittest.TestCase):
-    """This repository documents OpenRouter; pinned 0.0.5 has never heard of it."""
-
-    def test_prefers_the_documented_openrouter_variable(self) -> None:
-        base_url, key = provider_settings({"OPENROUTER_API_KEY": "router"})
-        self.assertEqual(base_url, OPENROUTER_BASE_URL)
-        self.assertEqual(key, "router")
-
-    def test_falls_back_to_openai_with_its_own_base_url(self) -> None:
-        base_url, key = provider_settings(
-            {"OPENAI_API_KEY": "direct", "OPENAI_BASE_URL": "https://proxy/v1"}
-        )
-        self.assertEqual((base_url, key), ("https://proxy/v1", "direct"))
-
-    def test_an_explicit_base_url_overrides_the_openrouter_default(self) -> None:
-        base_url, _ = provider_settings(
-            {"OPENROUTER_API_KEY": "router", "OPENAI_BASE_URL": "https://proxy/v1"}
-        )
-        self.assertEqual(base_url, "https://proxy/v1")
-
-    def test_names_both_variables_when_neither_is_set(self) -> None:
-        with self.assertRaisesRegex(NuggetizerError, "OPENROUTER_API_KEY"):
-            provider_settings({})
 
 
 if __name__ == "__main__":

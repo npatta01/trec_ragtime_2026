@@ -386,8 +386,6 @@ class FingerprintCoverageTestCase(unittest.TestCase):
             "MAX_COMPLETION_TOKENS": "reported by NuggetizerBackend.fingerprint",
             "DEFAULT_MAX_CALLS": "a default for the fingerprinted nuggetizer_config",
             "REQUEST_TIMEOUT_SECONDS": "a timeout aborts a call, it never alters a result",
-            "OPENROUTER_BASE_URL": "a default for the fingerprinted provider_base_url_digest",
-            "OPENAI_BASE_URL": "a default for the fingerprinted provider_base_url_digest",
         },
     }
 
