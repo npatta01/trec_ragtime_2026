@@ -477,6 +477,10 @@ class RunpodFlashConfigTests(unittest.TestCase):
                     endpoint_id="endpoint", max_concurrency=value
                 )
 
+    def test_worker_range_must_scale_to_zero(self) -> None:
+        with self.assertRaisesRegex(ValueError, "minimum must be zero"):
+            RunpodFlashConfig(endpoint_id="endpoint", workers=(1, 2))
+
     def test_transport_settings_do_not_change_model_fingerprint(self) -> None:
         policy = LocalCrossEncoderConfig(batch_size=2)
         base = RunpodFlashConfig(

@@ -297,7 +297,7 @@ Run `rerank_retrieval()` twice through `RunpodFlashPassageScorer` and an in-proc
 
 - [ ] **Step 2: Update README**
 
-Keep caller usage as ordinary `rerank_retrieval(..., scorer=flash_scorer)`. Explain endpoint-owned exact-request caching/internal batches, `workers=(1, 1)` for one warm pod, and increasing max workers without caller changes. Remove client-wave claims.
+Keep caller usage as ordinary `rerank_retrieval(..., scorer=flash_scorer)`. Explain endpoint-owned exact-request caching/internal batches, a zero minimum worker count to avoid idle billing, and increasing max workers without caller changes. Remove client-wave claims.
 
 - [ ] **Step 3: Run focused offline verification**
 

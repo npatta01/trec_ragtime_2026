@@ -108,13 +108,13 @@ The initial production shape is one class worker with:
 
 - one model/tokenizer loaded and retained per worker;
 - `max_concurrency=1` for GPU inference;
-- `workers=(1, 1)` when a continuously warm single pod is desired;
+- a zero minimum worker count so idle endpoints do not bill;
 - a persistent NetworkVolume-backed `HF_HUB_CACHE` for cold-worker model reuse;
 - a private worker-local artifact L1 and shared Hugging Face Bucket L2;
 - an empirically selected model batch size, starting with 32 and probing 64 and
   128 under `flash dev` without changing any other result-affecting setting.
 
-Scaling changes only the Flash worker range, for example `(1, 4)`. Each worker
+Scaling changes only the Flash worker range, for example `(0, 4)`. Each worker
 is interchangeable and uses the same scorer fingerprint and shared durable
 cache. No query or topic is pinned to a worker.
 

@@ -546,6 +546,8 @@ class RunpodFlashConfig:
                 or maximum < 1
             ):
                 raise ValueError("workers must be a valid (minimum, maximum) range")
+            if minimum != 0:
+                raise ValueError("workers minimum must be zero to avoid idle billing")
         else:
             raise ValueError("workers must be a positive integer or a valid range")
         if self.max_payload_bytes > FLASH_PAYLOAD_LIMIT_BYTES:
