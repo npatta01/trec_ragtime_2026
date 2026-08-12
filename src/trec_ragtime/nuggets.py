@@ -39,7 +39,10 @@ from typing import Annotated, Literal, Protocol
 import msgspec
 
 
-SCHEMA_VERSION = 1
+# 2: NuggetSupport carries variant_index, so a link inherited from a
+# clustered paraphrase is distinguishable from one judged against the
+# published claim. Bundles written under 1 keep their own keys.
+SCHEMA_VERSION = 2
 BEHAVIOR_VERSION = "nuggets-v1"
 DEFAULT_EVIDENCE_BUDGET = 24
 DEFAULT_MAX_NUGGETS = 20
@@ -90,10 +93,18 @@ class NuggetSupport(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     ``partial_support`` is retained, so a nugget may be attested only partially.
     That is model-indicated partial support, not entailment: a consumer that
     needs full support must filter on this label rather than assume it.
+
+    ``variant_index`` names the entry of the nugget's ``variants`` this passage
+    was actually judged against. Clustering folds paraphrases under one leader
+    claim, so without it a link inherited from a variant is indistinguishable
+    from one judged against the wording the bundle publishes. A consumer that
+    needs a citation judged against the exact claim keeps the links whose
+    ``variants[variant_index]`` matches the normalized claim.
     """
 
     alias: _Alias
     assignment: Literal["support", "partial_support"]
+    variant_index: Annotated[int, msgspec.Meta(ge=0)]
 
 
 class Nugget(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -524,6 +535,8 @@ def check_bundle(bundle: NuggetBundle) -> None:
             raise NuggetError("cluster id does not match its merged claims")
         if normalize_claim(nugget.claim) not in nugget.variants:
             raise NuggetError("nugget claim is missing from its own cluster")
+        if any(link.variant_index >= len(nugget.variants) for link in nugget.support):
+            raise NuggetError("nugget support names a variant the cluster does not have")
 
     ordered = sorted(bundle.nuggets, key=lambda nugget: _order_key(nugget, scores))
     if list(bundle.nuggets) != ordered:
@@ -535,21 +548,34 @@ def _merge_cluster(
 ) -> Nugget:
     """Fold paraphrases into one nugget, keeping every attesting passage."""
 
-    links: dict[str, str] = {}
-    for _, _, member_links in members:
-        for alias, assignment in member_links.items():
-            # A full support judgement outranks a partial one for the same alias.
-            if links.get(alias) != "support":
-                links[alias] = assignment
     claim = members[0][0]
-    importance = "vital" if any(m[1] == "vital" for m in members) else "okay"
     variants = tuple(sorted({normalize_claim(m[0]) for m in members}))
+    position = {variant: index for index, variant in enumerate(variants)}
+
+    # Each member was judged against its own wording, so carry that through.
+    # Attributing a variant's evidence to the leader without saying so is how a
+    # passage supporting one paraphrase ends up looking like a citation for a
+    # claim it was never shown.
+    links: dict[str, tuple[str, int]] = {}
+    for member_claim, _, member_links in members:
+        variant_index = position[normalize_claim(member_claim)]
+        for alias, assignment in member_links.items():
+            current = links.get(alias)
+            # A full support judgement outranks a partial one for the same
+            # alias, and takes its own variant with it.
+            if current is None or (current[0] != "support" and assignment == "support"):
+                links[alias] = (assignment, variant_index)
+    importance = "vital" if any(m[1] == "vital" for m in members) else "okay"
     return Nugget(
         nugget_id=_nugget_id(topic_id, claim, links),
         claim=claim,
         importance=importance,  # type: ignore[arg-type]
         support=tuple(
-            NuggetSupport(alias=alias, assignment=links[alias])  # type: ignore[arg-type]
+            NuggetSupport(
+                alias=alias,
+                assignment=links[alias][0],  # type: ignore[arg-type]
+                variant_index=links[alias][1],
+            )
             for alias in sorted(links)
         ),
         cluster_id=_cluster_id(topic_id, variants),

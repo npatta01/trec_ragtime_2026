@@ -257,6 +257,46 @@ class StageTestCase(unittest.TestCase):
             embed=fixed_embedder({normalize_claim(k): v for k, v in vectors.items()})
         )
 
+    def test_a_merged_paraphrase_says_which_wording_each_passage_backed(self) -> None:
+        """Clustering must not silently relabel a variant's evidence.
+
+        Two paraphrases merge under one leader claim. The passage that backed
+        only the follower still appears in the leader's support, which is
+        intended, but it has to stay traceable to the wording it was judged
+        against; otherwise it reads as a citation for a claim it never saw.
+        """
+
+        leader, follower = "grain exports fell", "grain shipments declined"
+        backend = ScriptedBackend(
+            claims=((leader, "vital"), (follower, "okay")),
+            supported={leader: ("grain passage",), follower: ("port passage",)},
+        )
+        bundle = run_topic_nuggets(
+            topic_id="2000", query="grain", representation="report_text",
+            facets=self.facets, backend=backend,
+            clusterer=NuggetClusterer(
+                embed=fixed_embedder({
+                    normalize_claim(leader): [1.0, 0.0],
+                    normalize_claim(follower): [0.97, 0.24],
+                }),
+                threshold=0.92,
+            ),
+        )
+        (nugget,) = bundle.nuggets
+        self.assertEqual(nugget.claim, leader)
+        self.assertEqual(len(nugget.variants), 2)
+
+        judged = {
+            link.alias: nugget.variants[link.variant_index] for link in nugget.support
+        }
+        # Resolve by document rather than by position: the table round-robins
+        # facets, so facet 0's two passages are not adjacent in the alias order.
+        alias_of = {row.document_id: row.alias for row in bundle.evidence}
+        grain, port = alias_of["doc-0-0"], alias_of["doc-0-1"]
+        self.assertEqual(judged[grain], normalize_claim(leader))
+        # The inherited link points at the follower, not the published claim.
+        self.assertEqual(judged[port], normalize_claim(follower))
+
     def test_links_each_claim_to_the_passages_that_support_it(self) -> None:
         backend = ScriptedBackend(
             claims=(("grain exports fell", "vital"), ("ports closed", "okay")),
@@ -623,7 +663,7 @@ class CheckBundleTestCase(unittest.TestCase):
             bundle,
             nuggets=(
                 msgspec.structs.replace(
-                    nugget, support=(NuggetSupport(alias="e999", assignment="support"),)
+                    nugget, support=(NuggetSupport(alias="e999", assignment="support", variant_index=0),)
                 ),
             ),
         )

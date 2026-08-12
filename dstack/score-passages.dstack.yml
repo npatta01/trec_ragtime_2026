@@ -23,6 +23,7 @@ files:
   # Derived worklist of unscored queries, shipped directly so workers never
   # scan the bucket for completed work (that scan exhausted the API rate limit).
   - ../remaining_plan.json:remaining_plan.json
+  - ../plan_2066.json:plan_2066.json
 
 env:
   - HF_TOKEN
