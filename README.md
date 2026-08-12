@@ -171,6 +171,11 @@ The adapter accepts the same complete score map, and the static worker accepts
 mapping-compatible Transformers `BatchEncoding` values. An existing endpoint
 caller and a later worker definition use the same pinned model policy:
 
+> **Flash scaling rule:** always configure workers as `(0, N)`: `0` is the
+> minimum and `N` is the desired maximum. The integer shorthand `workers=N`
+> also means `(0, N)`. Never use `(1, N)`, because it keeps a worker running
+> and billing while idle.
+
 ```python
 from trec_ragtime import (
     CrossEncoderPairLengthFunction,
@@ -190,7 +195,7 @@ flash_policy = RunpodFlashConfig(
     max_payload_bytes=9_000_000,
     concurrency=4,
     request_timeout=60.0,
-    workers=1,
+    workers=1,  # Flash shorthand for (0, 1): scale to zero when idle.
     idle_timeout=300,
 )
 

@@ -7,3 +7,4 @@ __pycache__/
 !.env.example
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
+.flash/

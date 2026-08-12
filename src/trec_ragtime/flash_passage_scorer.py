@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import numbers
+import re
 import string
 import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -30,6 +31,8 @@ DEFAULT_FLASH_REQUEST_TIMEOUT = 60.0
 DEFAULT_FLASH_IDLE_TIMEOUT = 300
 DEFAULT_FLASH_WORKER_NAME = "trec-ragtime-passage-scorer"
 DEFAULT_FLASH_GPU = "AMPERE_24"
+_FLASH_CACHE_STATUSES = frozenset({"hit", "miss_written", "miss_raced"})
+_FLASH_CACHE_KEY_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _BRIDGE_CLEANUP_GRACE_SECONDS = 0.5
 _BRIDGE_STARTUP_CLEANUP_GRACE_SECONDS = 0.5
 _MODEL_CONFIG_FIELDS = (
@@ -294,6 +297,61 @@ def _response_rows(rows: object) -> list[dict[str, object]]:
     return normalized
 
 
+def _validate_cache_object_key(value: object) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise FlashScoringError("cache object_key is invalid")
+    if (
+        value.startswith("/")
+        or "\\" in value
+        or "?" in value
+        or "#" in value
+        or _FLASH_CACHE_KEY_CONTROL_RE.search(value)
+    ):
+        raise FlashScoringError("cache object_key is invalid")
+    parts = value.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise FlashScoringError("cache object_key is invalid")
+    return value
+
+
+def _validate_cache_telemetry(
+    value: object,
+    *,
+    expected_row_count: int | None = None,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "status",
+        "object_key",
+        "row_count",
+        "batch_count",
+    }:
+        raise FlashScoringError("response cache telemetry is invalid")
+    status = value["status"]
+    if not isinstance(status, str) or status not in _FLASH_CACHE_STATUSES:
+        raise FlashScoringError("response cache status is invalid")
+    object_key = _validate_cache_object_key(value["object_key"])
+    row_count = value["row_count"]
+    if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count <= 0:
+        raise FlashScoringError("response cache row_count is invalid")
+    batch_count = value["batch_count"]
+    if (
+        isinstance(batch_count, bool)
+        or not isinstance(batch_count, int)
+        or batch_count < 0
+    ):
+        raise FlashScoringError("response cache batch_count is invalid")
+    if expected_row_count is not None and row_count != expected_row_count:
+        raise FlashScoringError("response cache row_count does not match scores")
+    if status == "hit" and batch_count != 0:
+        raise FlashScoringError("cache hits must report batch_count zero")
+    return {
+        "status": status,
+        "object_key": object_key,
+        "row_count": row_count,
+        "batch_count": batch_count,
+    }
+
+
 def encode_flash_request(
     query: str,
     rows: Iterable[Mapping[str, object] | Sequence[object]],
@@ -351,14 +409,23 @@ def encode_flash_response(
     *,
     schema_version: int = WIRE_SCHEMA_VERSION,
     scorer_fingerprint: str,
+    cache: Mapping[str, object] | None = None,
 ) -> bytes:
     """Encode a strict score response."""
 
     _validate_schema_version(schema_version)
     _validate_fingerprint(scorer_fingerprint)
+    normalized_rows = _response_rows(rows)
+    if cache is None:
+        raise FlashScoringError("response cache telemetry is required")
+    normalized_cache = _validate_cache_telemetry(
+        cache,
+        expected_row_count=len(normalized_rows),
+    )
     return _json_bytes(
         {
-            "scores": _response_rows(rows),
+            "cache": normalized_cache,
+            "scores": normalized_rows,
             "schema_version": schema_version,
             "scorer_fingerprint": scorer_fingerprint,
         }
@@ -371,12 +438,21 @@ def decode_flash_response(
     """Decode and validate a strict score response."""
 
     value = _json_object(payload)
-    if set(value) != {"scores", "schema_version", "scorer_fingerprint"}:
+    if set(value) != {
+        "cache",
+        "scores",
+        "schema_version",
+        "scorer_fingerprint",
+    }:
         raise FlashScoringError("response fields are invalid")
+    scores = _response_rows(value["scores"])
     return {
         "schema_version": _validate_schema_version(value["schema_version"]),
         "scorer_fingerprint": _validate_fingerprint(value["scorer_fingerprint"]),
-        "scores": _response_rows(value["scores"]),
+        "scores": scores,
+        "cache": _validate_cache_telemetry(
+            value["cache"], expected_row_count=len(scores)
+        ),
     }
 
 
@@ -417,7 +493,8 @@ class RunpodFlashConfig:
     max_payload_bytes: int = FLASH_PAYLOAD_LIMIT_BYTES
     concurrency: int = DEFAULT_FLASH_CONCURRENCY
     request_timeout: float = DEFAULT_FLASH_REQUEST_TIMEOUT
-    workers: int = 1
+    workers: int | tuple[int, int] = 1
+    max_concurrency: int = 1
     idle_timeout: int = DEFAULT_FLASH_IDLE_TIMEOUT
     worker_name: str = DEFAULT_FLASH_WORKER_NAME
     gpu: str = DEFAULT_FLASH_GPU
@@ -447,10 +524,32 @@ class RunpodFlashConfig:
             or self.batch_size <= 0
         ):
             raise ValueError("batch_size must be a positive integer when provided")
-        for field_name in ("max_payload_bytes", "concurrency", "workers"):
+        for field_name in ("max_payload_bytes", "concurrency", "max_concurrency"):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{field_name} must be a positive integer")
+        workers = self.workers
+        if isinstance(workers, bool):
+            raise ValueError("workers must be a positive integer or a valid range")
+        if isinstance(workers, int):
+            if workers <= 0:
+                raise ValueError("workers must be a positive integer")
+        elif isinstance(workers, tuple) and len(workers) == 2:
+            minimum, maximum = workers
+            if (
+                isinstance(minimum, bool)
+                or isinstance(maximum, bool)
+                or not isinstance(minimum, int)
+                or not isinstance(maximum, int)
+                or minimum < 0
+                or minimum > maximum
+                or maximum < 1
+            ):
+                raise ValueError("workers must be a valid (minimum, maximum) range")
+            if minimum != 0:
+                raise ValueError("workers minimum must be zero to avoid idle billing")
+        else:
+            raise ValueError("workers must be a positive integer or a valid range")
         if self.max_payload_bytes > FLASH_PAYLOAD_LIMIT_BYTES:
             raise ValueError("max_payload_bytes cannot exceed the Flash 10 MB limit")
         value = self.request_timeout
@@ -516,7 +615,7 @@ class RunpodFlashConfig:
         return self.idle_timeout
 
     @property
-    def worker_count(self) -> int:
+    def worker_count(self) -> int | tuple[int, int]:
         return self.workers
 
     @property
@@ -707,40 +806,8 @@ def _runpod_request_body(payload: bytes) -> bytes:
     ).encode("utf-8")
 
 
-class _RunpodRequestBodySizer:
-    """Measure wrapped request bodies from already validated request parts."""
-
-    __slots__ = ("_prefix", "_suffix")
-
-    def __init__(
-        self,
-        query: str,
-        model_config: Mapping[str, object],
-        scorer_fingerprint: str,
-    ) -> None:
-        self._prefix = (
-            b'{"input":{"request":{"schema_version":'
-            + _json_bytes(WIRE_SCHEMA_VERSION)
-            + b',"scorer_fingerprint":'
-            + _json_bytes(scorer_fingerprint)
-            + b',"model_config":'
-            + _json_bytes(model_config)
-            + b',"query":'
-            + _json_bytes(query)
-            + b',"rows":['
-        )
-        self._suffix = b"]}}}"
-
-    @staticmethod
-    def row_size(content_hash: bytes, text: str) -> int:
-        return len(_json_bytes({"hash": content_hash.hex(), "text": text}))
-
-    def body_size(self, serialized_row_bytes: int) -> int:
-        return len(self._prefix) + len(self._suffix) + serialized_row_bytes
-
-
 class RunpodFlashPassageScorer:
-    """Synchronous exact scorer backed by bounded asynchronous Flash batches."""
+    """Synchronous exact scorer backed by one asynchronous Flash request."""
 
     __slots__ = ("_config", "_runner", "_owned_runner", "_bridge")
 
@@ -767,82 +834,28 @@ class RunpodFlashPassageScorer:
         return self._config.fingerprint
 
     @staticmethod
-    def _build_batches(
+    def _build_request(
         query: str,
         unique: Mapping[bytes, str],
         config: RunpodFlashConfig,
-    ) -> tuple[tuple[bytes, frozenset[bytes]], ...]:
-        batches: list[tuple[bytes, frozenset[bytes]]] = []
-        current: list[tuple[bytes, str]] = []
+    ) -> bytes:
         model_config = _model_config_mapping(config.effective_model_config)
-        body_sizer = _RunpodRequestBodySizer(query, model_config, config.fingerprint)
-        row_sizes = {
-            content_hash: body_sizer.row_size(content_hash, text)
-            for content_hash, text in unique.items()
-        }
-        current_serialized_row_bytes = 0
-        current_row_count = 0
         limit = min(config.max_payload_bytes, FLASH_PAYLOAD_LIMIT_BYTES)
-        batch_size = config.effective_batch_size
-
-        def fits(serialized_row_bytes: int) -> bool:
-            return body_sizer.body_size(serialized_row_bytes) < limit
-
-        def flush() -> None:
-            nonlocal current_serialized_row_bytes, current_row_count
-            if not current:
-                return
-            payload = encode_flash_request(
-                query,
-                current,
-                model_config=model_config,
-                scorer_fingerprint=config.fingerprint,
+        payload = encode_flash_request(
+            query,
+            unique.items(),
+            model_config=model_config,
+            scorer_fingerprint=config.fingerprint,
+        )
+        request_body = _runpod_request_body(payload)
+        if len(request_body) >= limit:
+            raise FlashScoringError(
+                "Flash payload must be strictly below its byte limit"
             )
-            request_body = _runpod_request_body(payload)
-            if (
-                len(request_body) != body_sizer.body_size(current_serialized_row_bytes)
-                or len(request_body) >= limit
-            ):
-                raise FlashScoringError(
-                    "Flash payload must be strictly below its byte limit"
-                )
-            batches.append(
-                (payload, frozenset(content_hash for content_hash, _ in current))
-            )
-            current.clear()
-            current_serialized_row_bytes = 0
-            current_row_count = 0
-
-        for content_hash, text in unique.items():
-            if current_row_count >= batch_size:
-                flush()
-            candidate_row_size = row_sizes[content_hash]
-            candidate_serialized_row_bytes = (
-                current_serialized_row_bytes
-                + candidate_row_size
-                + (1 if current_row_count else 0)
-            )
-            if fits(candidate_serialized_row_bytes):
-                current.append((content_hash, text))
-                current_serialized_row_bytes = candidate_serialized_row_bytes
-                current_row_count += 1
-                continue
-            if current:
-                flush()
-                if not fits(candidate_row_size):
-                    raise FlashScoringError(
-                        "one passage exceeds the Flash JSON payload limit"
-                    )
-                current.append((content_hash, text))
-                current_serialized_row_bytes = candidate_row_size
-                current_row_count = 1
-                continue
-            raise FlashScoringError("one passage exceeds the Flash JSON payload limit")
-        flush()
-        return tuple(batches)
+        return payload
 
     async def _run_one(
-        self, payload: bytes, expected_batch: frozenset[bytes]
+        self, payload: bytes, expected_request: frozenset[bytes]
     ) -> dict[bytes, float]:
         try:
             raw = await asyncio.wait_for(
@@ -865,64 +878,17 @@ class RunpodFlashPassageScorer:
             bytes.fromhex(cast(str, row["hash"])): cast(float, row["score"])
             for row in rows
         }
-        if set(scores) != set(expected_batch):
-            raise FlashScoringError("Flash response coverage does not match its batch")
+        if set(scores) != set(expected_request):
+            raise FlashScoringError("Flash response coverage does not match request")
         return scores
-
-    @staticmethod
-    async def _cancel_and_await(tasks: Sequence[asyncio.Task[Any]]) -> None:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _score_async(
         self,
         passages: Sequence[Passage],
-        batches: Sequence[tuple[bytes, frozenset[bytes]]],
+        payload: bytes,
+        expected_request: frozenset[bytes],
     ) -> dict[bytes, float]:
-        batch_results: list[dict[bytes, float]] = []
-        for start in range(0, len(batches), self._config.concurrency):
-            wave = batches[start : start + self._config.concurrency]
-            tasks = [
-                asyncio.create_task(self._run_one(payload, expected_batch))
-                for payload, expected_batch in wave
-            ]
-            try:
-                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-                failed = next(
-                    (
-                        task
-                        for task in done
-                        if not task.cancelled() and task.exception() is not None
-                    ),
-                    None,
-                )
-                if failed is not None:
-                    await self._cancel_and_await(tasks)
-                    failed.result()
-                batch_results.extend(task.result() for task in tasks)
-            except BaseException:
-                try:
-                    await self._cancel_and_await(tasks)
-                except BaseException:
-                    pass
-                raise
-
-        merged: dict[bytes, float] = {}
-        for result in batch_results:
-            if set(result) & set(merged):
-                raise FlashScoringError("Flash batches returned duplicate score hashes")
-            merged.update(result)
-        expected_global = {
-            content_hash
-            for _, expected_batch in batches
-            for content_hash in expected_batch
-        }
-        if set(merged) != expected_global:
-            raise FlashScoringError(
-                "Flash response coverage does not match the global request"
-            )
+        merged = await self._run_one(payload, expected_request)
         try:
             return validate_passage_scores(passages, merged)
         except PassageScoringError as error:
@@ -943,12 +909,12 @@ class RunpodFlashPassageScorer:
             ) from error
         if not unique:
             return {}
-        batches = self._build_batches(query, unique, self._config)
+        payload = self._build_request(query, unique, self._config)
+        expected_request = frozenset(unique)
         try:
             return self._bridge.run(
-                lambda: self._score_async(passages, batches),
-                timeout=float(self._config.request_timeout) * max(1, len(batches))
-                + 1.0,
+                lambda: self._score_async(passages, payload, expected_request),
+                timeout=float(self._config.request_timeout) + 1.0,
             )
         except FlashScoringError:
             raise
