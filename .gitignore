@@ -10,3 +10,4 @@ notebooks/.ipynb_checkpoints/
 .flash/
 scoring-plan.json
 remaining_plan.json
+done_topics.txt
