@@ -34,6 +34,7 @@ from .nuggets_runner import (
     DEFAULT_CONCURRENCY,
     TopicOutcome,
     TopicWork,
+    _sanitize,
     build_fingerprint,
     evidence_from_reranking,
     run_topics,
@@ -364,18 +365,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         scorer_config, scorer = _open_scorer(arguments, stack)
         retriever = stack.enter_context(RagtimeRetriever.from_env())
         for plan in plans:
-            prepared = prepare_topic(
-                plan,
-                narrative=narratives[plan.topic_id],
-                plan_sha256=arguments.plan_sha256,
-                retriever=retriever,
-                store=store,
-                scorer=scorer,
-                scorer_config=scorer_config,
-                representation=arguments.representation,
-                top_k=arguments.top_k,
-                rerank_documents=arguments.rerank_documents,
-            )
+            # Preparation reads retrieval and scores, so it can fail for one
+            # topic without saying anything about the others. Leaving it
+            # unguarded meant a single throttled bucket call aborted the whole
+            # run and discarded every topic still queued behind it.
+            try:
+                prepared = prepare_topic(
+                    plan,
+                    narrative=narratives[plan.topic_id],
+                    plan_sha256=arguments.plan_sha256,
+                    retriever=retriever,
+                    store=store,
+                    scorer=scorer,
+                    scorer_config=scorer_config,
+                    representation=arguments.representation,
+                    top_k=arguments.top_k,
+                    rerank_documents=arguments.rerank_documents,
+                )
+            except Exception as error:  # noqa: BLE001 - one topic must not stop a run
+                outcomes.append(
+                    TopicOutcome(plan.topic_id, "failed", reason=_sanitize(error))
+                )
+                continue
             if prepared is None:
                 outcomes.append(
                     TopicOutcome(

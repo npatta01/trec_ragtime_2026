@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar, cast
@@ -319,12 +321,25 @@ class ArtifactStore:
     def _verify_private_bucket(self) -> None:
         if self._private_verified:
             return
-        try:
-            info = self._get_api().bucket_info(self.bucket_id)
-        except Exception:
-            raise ArtifactStoreRemoteError(
-                "failed to inspect the configured Hugging Face bucket"
-            ) from None
+        # Every process calls this before its first read, and the hub does not
+        # retry bucket_info, so starting a wave of workers together reliably
+        # rate-limits some of them. A throttle here says nothing about whether
+        # the bucket is private, so ride it out rather than fail the caller.
+        info = None
+        for attempt in range(4):
+            try:
+                info = self._get_api().bucket_info(self.bucket_id)
+                break
+            except Exception:
+                if _http_status(sys.exc_info()[1] or Exception()) == 404:
+                    raise ArtifactStoreRemoteError(
+                        "configured Hugging Face bucket does not exist"
+                    ) from None
+                if attempt == 3:
+                    raise ArtifactStoreRemoteError(
+                        "failed to inspect the configured Hugging Face bucket"
+                    ) from None
+                time.sleep(2.0 * 2**attempt)
         if getattr(info, "private", None) is not True:
             raise ArtifactStoreRemoteError(
                 "configured Hugging Face bucket is not private"
