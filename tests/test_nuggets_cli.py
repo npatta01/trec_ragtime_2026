@@ -284,6 +284,48 @@ class ScorerTransportTestCase(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "flash-endpoint-id"):
                 _open_scorer(arguments, stack)
 
+    def test_flash_scales_to_a_range_starting_at_zero(self) -> None:
+        """workers is the throughput bound; the minimum must stay 0 to stop billing."""
+
+        from unittest.mock import patch
+
+        from trec_ragtime.nuggets_cli import _open_scorer
+        from contextlib import ExitStack
+
+        arguments = build_parser().parse_args(
+            ["--model", "m", "--scorer", "flash", "--flash-endpoint-id", "ep-1",
+             "--flash-workers", "8"]
+        )
+        seen = {}
+
+        class _Config:
+            def __init__(self, **kwargs: Any) -> None:
+                seen.update(kwargs)
+                self.effective_model_config = object()
+
+        with (
+            patch("trec_ragtime.flash_passage_scorer.RunpodFlashConfig", _Config),
+            patch("trec_ragtime.flash_passage_scorer.FlashEndpointBatchRunner"),
+            patch("trec_ragtime.flash_passage_scorer.RunpodFlashPassageScorer"),
+            ExitStack() as stack,
+        ):
+            _open_scorer(arguments, stack)
+        self.assertEqual(seen["workers"], (0, 8))
+        self.assertEqual(seen["concurrency"], 8)
+
+    def test_flash_rejects_a_worker_count_below_one(self) -> None:
+        from contextlib import ExitStack
+
+        from trec_ragtime.nuggets_cli import _open_scorer
+
+        arguments = build_parser().parse_args(
+            ["--model", "m", "--scorer", "flash", "--flash-endpoint-id", "ep-1",
+             "--flash-workers", "0"]
+        )
+        with ExitStack() as stack:
+            with self.assertRaisesRegex(ValueError, "flash-workers"):
+                _open_scorer(arguments, stack)
+
     def test_flash_exits_two_rather_than_traceback(self) -> None:
         from trec_ragtime.nuggets_cli import main
 

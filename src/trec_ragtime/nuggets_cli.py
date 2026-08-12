@@ -223,9 +223,14 @@ def _open_scorer(arguments: argparse.Namespace, stack: ExitStack) -> tuple[Any, 
         RunpodFlashPassageScorer,
     )
 
+    if arguments.flash_workers < 1:
+        raise ValueError("--flash-workers must be at least 1")
     flash = RunpodFlashConfig(
         endpoint_id=arguments.flash_endpoint_id,
         model_config=LocalCrossEncoderConfig(device="cuda"),
+        # (0, N): scale to zero when idle, up to N workers under load.
+        workers=(0, arguments.flash_workers),
+        concurrency=arguments.flash_concurrency or arguments.flash_workers,
     )
     runner = stack.enter_context(FlashEndpointBatchRunner(flash))
     scorer = stack.enter_context(RunpodFlashPassageScorer(flash, runner))
@@ -263,6 +268,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--flash-endpoint-id", default=None,
         help="an existing Runpod endpoint running the passage-scoring worker",
+    )
+    parser.add_argument(
+        "--flash-workers", type=int, default=4,
+        help="maximum Runpod workers, as the range (0, N). This is the knob that "
+             "actually bounds throughput: with N=1 every scoring request queues "
+             "behind one GPU. The minimum stays 0 so idle workers stop billing.",
+    )
+    parser.add_argument(
+        "--flash-concurrency", type=int, default=None,
+        help="client-side parallel scoring requests; defaults to --flash-workers "
+             "so the workers stay fed",
     )
     parser.add_argument(
         "--device", default="cpu",
