@@ -191,6 +191,14 @@ class FakeAsyncRunner:
                 rows,
                 schema_version=request["schema_version"],
                 scorer_fingerprint=request["scorer_fingerprint"],
+                cache={
+                    "status": "miss_written",
+                    "object_key": "passage-score-requests/v1/fake/00/"
+                    + "0" * 64
+                    + ".mpk",
+                    "row_count": len(rows),
+                    "batch_count": 1,
+                },
             )
         finally:
             self.active -= 1
@@ -246,6 +254,49 @@ class FlashWireCodecTests(unittest.TestCase):
                 b'{"schema_version":1,"scorer_fingerprint":"p","scores":'
                 b'[{"hash":"' + sha256_bytes("text").hex().encode() + b'","score":NaN}]'
             )
+
+    def test_response_requires_strict_cache_telemetry(self) -> None:
+        row = {"hash": sha256_bytes("text").hex(), "score": 1.0}
+        cache = {
+            "status": "hit",
+            "object_key": "passage-score-requests/v1/fake/00/" + "0" * 64 + ".mpk",
+            "row_count": 1,
+            "batch_count": 0,
+        }
+        payload = encode_flash_response(
+            [row], scorer_fingerprint="fingerprint", cache=cache
+        )
+        self.assertEqual(
+            decode_flash_response(payload),
+            {
+                "schema_version": 1,
+                "scorer_fingerprint": "fingerprint",
+                "scores": [row],
+                "cache": cache,
+            },
+        )
+        decoded = json.loads(payload)
+        for invalid_cache in (
+            {**cache, "extra": 1},
+            {**cache, "status": "unknown"},
+            {**cache, "object_key": "../unsafe"},
+            {**cache, "row_count": 2},
+            {**cache, "batch_count": 1},
+            {**cache, "row_count": 1.0},
+            {**cache, "batch_count": -1},
+            {**cache, "row_count": 1, "status": "hit\nunsafe"},
+        ):
+            with self.subTest(invalid_cache=invalid_cache):
+                candidate = dict(decoded)
+                candidate["cache"] = invalid_cache
+                with self.assertRaises(FlashScoringError):
+                    decode_flash_response(candidate)
+
+        for extra_field in ("extra",):
+            candidate = dict(decoded)
+            candidate[extra_field] = 1
+            with self.assertRaises(FlashScoringError):
+                decode_flash_response(candidate)
 
     def test_model_config_schema_version_is_distinct_from_wire_schema(self) -> None:
         config = LocalCrossEncoderConfig(schema_version=2)
@@ -330,54 +381,54 @@ class RunpodFlashConfigTests(unittest.TestCase):
 
 
 class RunpodFlashPassageScorerTests(unittest.TestCase):
-    def test_batch_sizing_uses_scalar_totals_and_builds_body_only_on_flush(
+    def test_one_logical_request_handles_65_passages_without_model_batch_waves(
         self,
     ) -> None:
+        passages = tuple(
+            _passage(f"text-{index}", document_id=str(index)) for index in range(65)
+        )
+        config = RunpodFlashConfig(endpoint_id="fake", batch_size=32)
+        runner = FakeAsyncRunner()
+        scorer = RunpodFlashPassageScorer(config, runner)
+        self.addCleanup(scorer.close)
+
+        scores = scorer.score("query", passages)
+
+        self.assertEqual(len(scores), 65)
+        self.assertEqual(len(runner.payloads), 1)
+        self.assertEqual(len(decode_flash_request(runner.payloads[0])["rows"]), 65)
+
+    def test_wrapped_request_at_10_mb_fails_without_splitting(self) -> None:
+        text = "x" * (FLASH_PAYLOAD_LIMIT_BYTES + 100)
+        config = RunpodFlashConfig(endpoint_id="fake", batch_size=32)
+        runner = FakeAsyncRunner()
+        scorer = RunpodFlashPassageScorer(config, runner)
+        self.addCleanup(scorer.close)
+
+        with self.assertRaises(FlashScoringError):
+            scorer.score("query", (_passage(text),))
+        self.assertEqual(runner.payloads, [])
+
+    def test_build_request_encodes_and_measures_one_wrapped_body(self) -> None:
         config = RunpodFlashConfig(endpoint_id="fake", batch_size=7)
         unique = {sha256_bytes(f"text-{index}"): f"text-{index}" for index in range(7)}
-        original_body_size = flash_passage_scorer._RunpodRequestBodySizer.body_size
         original_request_body = flash_passage_scorer._runpod_request_body
-        body_size_calls: list[int] = []
         request_body_calls = 0
-
-        def record_body_size(sizer: object, serialized_row_bytes: int) -> int:
-            if not isinstance(serialized_row_bytes, int):
-                raise AssertionError("batch sizing must pass a scalar row-byte total")
-            body_size_calls.append(serialized_row_bytes)
-            return original_body_size(sizer, serialized_row_bytes)
 
         def count_request_body_builds(payload: bytes) -> bytes:
             nonlocal request_body_calls
             request_body_calls += 1
             return original_request_body(payload)
 
-        def reject_sequence_sum(_: object) -> int:
-            raise AssertionError("batch sizing must not sum candidate row sequences")
-
-        with (
-            patch.object(
-                flash_passage_scorer._RunpodRequestBodySizer,
-                "body_size",
-                record_body_size,
-            ),
-            patch.object(
-                flash_passage_scorer,
-                "_runpod_request_body",
-                count_request_body_builds,
-            ),
-            patch.object(
-                RunpodFlashConfig,
-                "effective_batch_size",
-                new_callable=PropertyMock,
-                return_value=7,
-            ) as effective_batch_size,
-            patch.object(flash_passage_scorer, "sum", reject_sequence_sum, create=True),
+        with patch.object(
+            flash_passage_scorer,
+            "_runpod_request_body",
+            count_request_body_builds,
         ):
-            batches = RunpodFlashPassageScorer._build_batches("query", unique, config)
+            payload = RunpodFlashPassageScorer._build_request("query", unique, config)
 
-        self.assertEqual(len(body_size_calls), len(unique) + len(batches))
-        self.assertEqual(request_body_calls, len(batches))
-        self.assertEqual(effective_batch_size.call_count, 1)
+        self.assertEqual(request_body_calls, 1)
+        self.assertEqual(len(decode_flash_request(payload)["rows"]), len(unique))
 
     def test_adapter_and_worker_failures_do_not_emit_sensitive_literals(self) -> None:
         query = "query-sensitive-7f"
@@ -414,7 +465,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         for sensitive in (query, text, content_hash, credential):
             self.assertNotIn(sensitive, output)
 
-    def test_batches_by_count_and_returns_exact_unique_hash_coverage(self) -> None:
+    def test_one_request_returns_exact_unique_hash_coverage(self) -> None:
         passages = (
             _passage("first", document_id="first"),
             _passage("first", document_id="duplicate"),
@@ -436,7 +487,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 passages[3].content_hash: 5.0,
             },
         )
-        self.assertEqual(len(runner.payloads), 2)
+        self.assertEqual(len(runner.payloads), 1)
         for payload in runner.payloads:
             self.assertEqual(
                 decode_flash_request(payload)["scorer_fingerprint"], config.fingerprint
@@ -446,7 +497,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 _wire_model_config(config.effective_model_config),
             )
 
-    def test_payloads_are_below_both_limits_and_oversized_rows_fail(self) -> None:
+    def test_one_request_obeys_payload_limit_without_splitting(self) -> None:
         passages = tuple(
             _passage("漢字-é" * count, document_id=str(count)) for count in range(1, 8)
         )
@@ -457,13 +508,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         scorer = RunpodFlashPassageScorer(config, runner)
         self.addCleanup(scorer.close)
 
-        scorer.score("query-é", passages)
-
-        self.assertGreater(len(runner.payloads), 1)
-        self.assertTrue(all(len(payload) < 1200 for payload in runner.payloads))
-        self.assertTrue(
-            all(len(payload) < FLASH_PAYLOAD_LIMIT_BYTES for payload in runner.payloads)
-        )
+        with self.assertRaises(FlashScoringError):
+            scorer.score("query-é", passages)
+        self.assertEqual(runner.payloads, [])
         with self.assertRaises(FlashScoringError):
             scorer.score("q", (_passage("x" * 500, document_id="too-large"),))
 
@@ -504,9 +551,10 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         self.addCleanup(scorer.close)
 
         self.assertEqual(len(scorer.score("query", passages)), 8)
-        self.assertLessEqual(runner.maximum_active, 2)
+        self.assertEqual(runner.maximum_active, 1)
+        self.assertEqual(len(runner.payloads), 1)
 
-    def test_failed_batch_cancels_and_awaits_siblings(self) -> None:
+    def test_failed_request_is_cancelled_and_awaited(self) -> None:
         class QuiescingFailureRunner:
             def __init__(self) -> None:
                 self.dispatches = 0
@@ -517,27 +565,29 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 self.dispatches += 1
                 self.active += 1
                 try:
-                    if self.dispatches == 1:
-                        raise RuntimeError("transport failure")
-                    try:
-                        await asyncio.sleep(60.0)
-                    except asyncio.CancelledError:
-                        self.cancelled += 1
-                        raise
-                    raise AssertionError("sibling was not cancelled")
+                    await asyncio.sleep(60.0)
+                except asyncio.CancelledError:
+                    self.cancelled += 1
+                    raise
                 finally:
                     self.active -= 1
 
         runner = QuiescingFailureRunner()
         passages = tuple(_passage(f"text-{i}", document_id=str(i)) for i in range(4))
         scorer = RunpodFlashPassageScorer(
-            RunpodFlashConfig(endpoint_id="fake", batch_size=1, concurrency=2), runner
+            RunpodFlashConfig(
+                endpoint_id="fake",
+                batch_size=1,
+                concurrency=2,
+                request_timeout=0.01,
+            ),
+            runner,
         )
         self.addCleanup(scorer.close)
 
         with self.assertRaises(FlashScoringError):
             scorer.score("query", passages)
-        self.assertLessEqual(runner.dispatches, 2)
+        self.assertEqual(runner.dispatches, 1)
         self.assertGreaterEqual(runner.cancelled, 1)
         self.assertEqual(runner.active, 0)
 
@@ -550,15 +600,8 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
             async def run_batch(self, payload: bytes) -> bytes:
                 self.dispatches += 1
-                if self.dispatches == 1:
-                    raise asyncio.CancelledError
-                try:
-                    await asyncio.sleep(60.0)
-                except asyncio.CancelledError:
-                    self.cancelled += 1
-                    raise
-                self.completed += 1
-                raise AssertionError("sibling was not cancelled")
+                self.cancelled += 1
+                raise asyncio.CancelledError
 
         runner = QuiescingCancellationRunner()
         passages = tuple(_passage(f"text-{index}") for index in range(2))
@@ -575,7 +618,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(FlashScoringError, "Flash batch cancelled"):
             scorer.score("query", passages)
-        self.assertGreaterEqual(runner.dispatches, 2)
+        self.assertEqual(runner.dispatches, 1)
         self.assertEqual(runner.cancelled, 1)
         self.assertEqual(runner.completed, 0)
 
@@ -710,6 +753,42 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             runner.run_batch_sync(request)
         self.assertEqual(cancelled, [True])
+
+
+class FlashEndpointBatchRunnerTests(unittest.TestCase):
+    def test_endpoint_runner_submits_one_job_and_waits_for_output(self) -> None:
+        config = RunpodFlashConfig(endpoint_id="endpoint", request_timeout=1.0)
+        request = encode_flash_request(
+            "query",
+            ((sha256_bytes("text"), "text"),),
+            model_config=_wire_model_config(config.effective_model_config),
+            scorer_fingerprint=config.fingerprint,
+        )
+        calls: list[tuple[str, object]] = []
+
+        class Job:
+            output = encode_flash_response(
+                ({"hash": sha256_bytes("text"), "score": 4.0},),
+                scorer_fingerprint=config.fingerprint,
+            )
+
+            async def wait(self, timeout: float | None = None) -> "Job":
+                calls.append(("wait", timeout))
+                return self
+
+        class Endpoint:
+            async def run(self, job_input: dict[str, object]) -> Job:
+                calls.append(("run", job_input))
+                return Job()
+
+        runner = FlashEndpointBatchRunner(config, endpoint=Endpoint())
+        self.addCleanup(runner.close)
+
+        response = decode_flash_response(runner.run_batch_sync(request))
+
+        self.assertEqual(response["scores"][0]["score"], 4.0)
+        self.assertEqual(calls[0], ("run", {"request": decode_flash_request(request)}))
+        self.assertEqual(calls[1], ("wait", 1.0))
 
 
 class WorkerCacheIdentityTests(unittest.TestCase):
