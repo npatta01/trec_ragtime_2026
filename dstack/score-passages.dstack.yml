@@ -27,6 +27,8 @@ env:
   - RAGTIME_ARTIFACT_PREFIX
   - RAGTIME_CACHE_NAMESPACE
   - SCORING_PLAN_KEY
+  # i/n: several sharded runs split the plan across GPUs.
+  - SCORING_SHARD=1/1
 
 commands:
   - |
@@ -43,7 +45,7 @@ commands:
       python scripts/score_remote.py --plan-key $SCORING_PLAN_KEY --preflight
 
     uv run --no-managed-python --no-python-downloads --python "$py" \
-      python scripts/score_remote.py --plan-key $SCORING_PLAN_KEY --device cuda
+      python scripts/score_remote.py --plan-key $SCORING_PLAN_KEY --device cuda --shard $SCORING_SHARD
 
 # A pool of interchangeable small-to-mid GPUs: the reranker is a 0.5B
 # cross-encoder, so VRAM is not the constraint and pinning one model would

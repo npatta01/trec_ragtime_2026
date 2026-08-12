@@ -55,6 +55,12 @@ def main() -> int:
                         help="object key holding the plan, for remote runs")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--shard", default="1/1",
+        help="process only this shard of the plan, as i/n. Several single-process "
+             "runs split the work; threads cannot, because the artifact store's "
+             "fsspec cache is not thread-safe (see the loop below).",
+    )
     parser.add_argument("--preflight", action="store_true",
                         help="validate wiring and exit without scoring")
     arguments = parser.parse_args()
@@ -87,6 +93,7 @@ def main() -> int:
 
     config = LocalCrossEncoderConfig(device=arguments.device, batch_size=arguments.batch_size)
     scorer = LocalCrossEncoderScorer(config)
+
     print(f"device={config.effective_device} model={config.model_name}", flush=True)
 
     if arguments.preflight:
@@ -101,39 +108,50 @@ def main() -> int:
 
     from trec_ragtime.retrieval_cache import _from_wire
 
-    done = failed = 0
-    # Whether the GPU is starved by the CPU chunker or genuinely busy is not
-    # answerable from wall clock alone, and reading utilisation needs a live
-    # session on a billable box. Timing the two phases separately answers it for
-    # free on the next run.
+    try:
+        shard_index, shard_count = (int(p) for p in arguments.shard.split("/"))
+    except ValueError:
+        raise SystemExit("--shard must look like i/n") from None
+    if not 1 <= shard_index <= shard_count:
+        raise SystemExit("--shard must satisfy 1 <= i <= n")
+
+    done = failed = skipped = 0
     chunk_seconds = score_seconds = 0.0
     started = time.perf_counter()
-    for index, row in enumerate(queries, start=1):
+
+    def run_one(index: int, row: dict) -> None:
+        nonlocal done, failed, skipped, chunk_seconds, score_seconds
         try:
-            payload = store.read(row["object_key"])
-            if payload is None:
-                failed += 1
-                print(f"[{index}/{len(queries)}] MISSING {row['object_key']}", flush=True)
-                continue
-            envelope = msgspec.msgpack.decode(payload, type=RetrievalEnvelope)
-            retrieval = _from_wire(envelope.result)
-            chunker = PassageChunker(CrossEncoderPairLengthFunction(config, row["query"]))
+            chunker = PassageChunker(
+                CrossEncoderPairLengthFunction(config, row["query"])
+            )
             cache = PassageScoreCache(
                 store, scorer,
                 chunker_fingerprint=chunker.fingerprint,
                 representation=representation,
             )
+            # A resumed run would otherwise re-download and re-chunk every finished
+            # query just to discover its scores are cached. The score map is written
+            # once, complete, after the query succeeds, so its presence means done.
+            # A key that fails to match simply declines to skip and redoes the work.
+            if store.read(cache.object_key(row["query"])) is not None:
+                skipped += 1
+                return
+            payload = store.read(row["object_key"])
+            if payload is None:
+                failed += 1
+                print(f"[{index}/{len(queries)}] MISSING {row['object_key']}", flush=True)
+                return
+            envelope = msgspec.msgpack.decode(payload, type=RetrievalEnvelope)
+            retrieval = _from_wire(envelope.result)
             timed = _PhaseTimer(chunker, CachedPassageScorer(cache))
             rerank_retrieval(
-                retrieval,
-                chunker=timed,
-                scorer=timed,
-                representation=representation,
+                retrieval, chunker=timed, scorer=timed, representation=representation
             )
+            done += 1
             chunk_seconds += timed.chunk_seconds
             score_seconds += timed.score_seconds
-            done += 1
-            rate = (time.perf_counter() - started) / index
+            rate = (time.perf_counter() - started) / max(done, 1)
             print(f"[{index}/{len(queries)}] scored topic {row['topic_id']} "
                   f"facet {row['facet_index']} ({rate:.1f}s/query avg)", flush=True)
         except Exception as error:  # noqa: BLE001 - one query must not stop the run
@@ -142,8 +160,18 @@ def main() -> int:
                   f"{row['facet_index']}: {type(error).__name__}: "
                   f"{' '.join(str(error).split())[:160]}", flush=True)
 
+    # Deliberately sequential. Running queries in threads shares one ArtifactStore,
+    # whose fsspec cache raised spurious FileNotFoundError under load; read() maps
+    # that to a quiet miss, which is indistinguishable from a genuinely absent
+    # artifact, so ~13% of queries were silently reported MISSING and never scored.
+    # Parallelism therefore comes from several sharded processes, not threads.
+    for index, row in enumerate(queries, start=1):
+        if (index - 1) % shard_count == shard_index - 1:
+            run_one(index, row)
+
     elapsed = time.perf_counter() - started
-    print(f"scored={done} failed={failed} elapsed={elapsed/60:.1f}min", flush=True)
+    print(f"scored={done} skipped={skipped} failed={failed} "
+          f"elapsed={elapsed/60:.1f}min", flush=True)
     if done:
         other = elapsed - chunk_seconds - score_seconds
         print(
