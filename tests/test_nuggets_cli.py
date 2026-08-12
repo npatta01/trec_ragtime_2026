@@ -203,6 +203,55 @@ class PrepareTopicTestCase(unittest.TestCase):
         self.assertEqual([c["query_index"] for c in retriever.contexts], [1, 1, 2])
 
 
+class RerankDocumentCapTestCase(unittest.TestCase):
+    """A smoke-test escape hatch. Real runs rerank everything retrieved, because
+    truncating by organizer rank removes the documents reranking exists to
+    promote."""
+
+    def _retrieval(self, count: int) -> Any:
+        from trec_ragtime.models import (
+            PipelineResult, RetrievalResult, RetrievedDocument, SearchHit)
+        documents = tuple(
+            RetrievedDocument(
+                rank=i, document_id=f"doc-{i}", score=1.0 - i / 100,
+                text=f"text {i}", url=None, date=None, language="eng",
+                content_source="fixture", content_local_cache_hit=True,
+                english_text=f"text {i}",
+            )
+            for i in range(1, count + 1)
+        )
+        return RetrievalResult(
+            search_result=PipelineResult(
+                query="q", pipeline="ragtime2",
+                hits=tuple(SearchHit(d.rank, d.document_id, d.score) for d in documents),
+                processed=True, local_cache_hit=True, remote_cached=True,
+                server_timestamp=None, cache_stored_at=None,
+            ),
+            documents=documents,
+        )
+
+    def test_keeps_the_highest_ranked_documents(self) -> None:
+        from trec_ragtime.nuggets_cli import _head
+
+        capped = _head(self._retrieval(100), 20)
+        self.assertEqual(len(capped.documents), 20)
+        self.assertEqual([d.rank for d in capped.documents], list(range(1, 21)))
+
+    def test_hits_stay_consistent_with_the_kept_documents(self) -> None:
+        from trec_ragtime.nuggets_cli import _head
+
+        capped = _head(self._retrieval(100), 20)
+        self.assertEqual(
+            {h.document_id for h in capped.search_result.hits},
+            {d.document_id for d in capped.documents},
+        )
+
+    def test_a_cap_above_the_result_size_changes_nothing(self) -> None:
+        from trec_ragtime.nuggets_cli import _head
+
+        self.assertEqual(len(_head(self._retrieval(5), 20).documents), 5)
+
+
 class ParserTestCase(unittest.TestCase):
     def test_requires_a_model(self) -> None:
         with self.assertRaises(SystemExit):
@@ -212,6 +261,8 @@ class ParserTestCase(unittest.TestCase):
         arguments = build_parser().parse_args(["--model", "m"])
         self.assertEqual(arguments.representation, "report_text")
         self.assertIsNone(arguments.topic_ids)
+        # Uncapped by default: the cap is an explicit cost decision.
+        self.assertIsNone(arguments.rerank_documents)
 
 
 if __name__ == "__main__":

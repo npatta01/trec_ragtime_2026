@@ -92,6 +92,7 @@ def prepare_topic(
     scorer_config: Any,
     representation: str,
     top_k: int,
+    rerank_documents: int | None = None,
 ) -> TopicWork | None:
     """Rerank each planned facet that has a cached retrieval, keeping its index.
 
@@ -128,6 +129,12 @@ def prepare_topic(
         )
         if retrieval is None:
             continue
+        # Truncating here discards exactly the documents reranking exists to
+        # rescue: the cross-encoder can only reorder what survives, so anything
+        # the organizer underrated stays lost. Real runs rerank everything
+        # retrieved; this is for bounded smoke tests only.
+        if rerank_documents is not None:
+            retrieval = _head(retrieval, rerank_documents)
         # The pair-length function is query-specific, so the chunker is too.
         chunker = PassageChunker(CrossEncoderPairLengthFunction(scorer_config, query))
         score_cache = PassageScoreCache(
@@ -176,6 +183,24 @@ def prepare_topic(
     )
 
 
+def _head(retrieval: Any, documents: int) -> Any:
+    """Keep the highest-ranked documents, preserving the result's own order."""
+
+    import dataclasses
+
+    kept = tuple(sorted(retrieval.documents, key=lambda d: d.rank)[:documents])
+    keep_ids = {document.document_id for document in kept}
+    search = retrieval.search_result
+    return dataclasses.replace(
+        retrieval,
+        documents=kept,
+        search_result=dataclasses.replace(
+            search,
+            hits=tuple(hit for hit in search.hits if hit.document_id in keep_ids),
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ragtime-nuggets",
@@ -203,6 +228,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--device", default="cpu",
         help="cross-encoder device: cpu, cuda, cuda:N, or rocm. "
              "The scorer fingerprint includes it, so changing it re-scores.",
+    )
+    parser.add_argument(
+        "--rerank-documents", type=int, default=None,
+        help="smoke-test escape hatch: rerank only this many top documents per "
+             "facet. This truncates by ORGANIZER rank, so the cross-encoder can "
+             "no longer promote a document the retriever underrated -- which is "
+             "what reranking is for. Leave unset for real runs.",
     )
     parser.add_argument("--evidence-budget", type=int, default=DEFAULT_EVIDENCE_BUDGET)
     parser.add_argument("--max-nuggets", type=int, default=DEFAULT_MAX_NUGGETS)
@@ -283,6 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scorer_config=scorer_config,
                 representation=arguments.representation,
                 top_k=arguments.top_k,
+                rerank_documents=arguments.rerank_documents,
             )
             if prepared is None:
                 outcomes.append(
