@@ -254,7 +254,7 @@ Assert the endpoint factory receives:
 
 ~~~python
 {
-    "workers": (1, 1),
+    "workers": (0, 1),
     "max_concurrency": 1,
     "idle_timeout": 300,
     "volume": volume,
@@ -266,7 +266,7 @@ Require pinned sentence-transformers, transformers, tokenizers, torch, msgspec, 
 
 - [ ] **Step 4: Extend Flash configuration**
 
-Support `workers: int | tuple[int, int]` with Flash's integer shorthand `(0, N)` and tuple validation `0 <= minimum <= maximum`, `maximum >= 1`. Add `max_concurrency=1` and explicit `volume`/`env` passthrough to `build_flash_worker`. The smoke definition passes a concrete `GpuType`, not a heterogeneous GPU group, and sets `HF_HUB_CACHE=/runpod-volume/models` on the attached NetworkVolume. Transport settings and secrets never affect scorer identity.
+Support `workers: int | tuple[int, int]` with Flash's integer shorthand `(0, N)`. Require every explicit tuple to be `(0, N)`, with `N >= 1`, so idle endpoints always scale to zero and stop billing. Add `max_concurrency=1` and explicit `volume`/`env` passthrough to `build_flash_worker`. The smoke definition passes a concrete `GpuType`, not a heterogeneous GPU group, and sets `HF_HUB_CACHE=/runpod-volume/models` on the attached NetworkVolume. Transport settings and secrets never affect scorer identity.
 
 - [ ] **Step 5: Verify without external effects**
 
@@ -365,7 +365,7 @@ For batch sizes 32, 64, and 128, submit the same synthetic request twice. Requir
 
 - [ ] **Step 5: Run bounded two-worker duplicate check**
 
-Use an isolated prefix and temporary `workers=(2, 2)`. Submit one uncached request twice concurrently. Require complete equal coverage, statuses from `{miss_written, miss_raced, hit}`, then a third `hit`. Cap at two workers and one request pair.
+Use an isolated prefix and temporary `workers=(0, 2)`. Submit one uncached request twice concurrently. Require complete equal coverage, statuses from `{miss_written, miss_raced, hit}`, then a third `hit`. Cap at two workers and one request pair.
 
 - [ ] **Step 6: Prove restart persistence**
 

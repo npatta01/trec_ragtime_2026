@@ -18,8 +18,8 @@ scores = scorer.score(query, passages)
 For the remote path, that method makes one logical HTTP request. The Runpod
 Flash endpoint owns request validation, cache lookup, GPU micro-batching,
 complete response validation, durable cache publication, and cache telemetry.
-The same endpoint must scale from one warm worker to several interchangeable
-workers without requiring topic affinity or a coordinator.
+The same endpoint must scale from zero idle workers to several interchangeable
+workers under load without requiring topic affinity or a coordinator.
 
 Occasional duplicate GPU computation for simultaneous identical cold requests
 is acceptable. Incorrect, partial, or cross-request cache reuse is not.
