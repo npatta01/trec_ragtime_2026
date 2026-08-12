@@ -95,6 +95,12 @@ from .passages import (
     sha256_bytes,
     validate_passages,
 )
+from .providers import (
+    OPENAI_BASE_URL,
+    OPENROUTER_BASE_URL,
+    ProviderConfigurationError,
+    provider_settings,
+)
 from .reranking import (
     PassageEvidence,
     RerankedDocument,
@@ -177,6 +183,10 @@ __all__ = [
     "RagtimeRetriever",
     "RetrievalResult",
     "RetrievedDocument",
+    "OPENAI_BASE_URL",
+    "OPENROUTER_BASE_URL",
+    "ProviderConfigurationError",
+    "provider_settings",
     "PassageEvidence",
     "RerankedDocument",
     "RerankingError",
