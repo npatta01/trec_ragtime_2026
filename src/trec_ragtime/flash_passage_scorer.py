@@ -303,6 +303,8 @@ def _validate_cache_object_key(value: object) -> str:
     if (
         value.startswith("/")
         or "\\" in value
+        or "?" in value
+        or "#" in value
         or _FLASH_CACHE_KEY_CONTROL_RE.search(value)
     ):
         raise FlashScoringError("cache object_key is invalid")
@@ -415,16 +417,7 @@ def encode_flash_response(
     _validate_fingerprint(scorer_fingerprint)
     normalized_rows = _response_rows(rows)
     if cache is None:
-        # Keep the wire helper source-compatible with pre-telemetry test
-        # runners. Real workers always provide their private cache record.
-        cache = {
-            "status": "miss_written",
-            "object_key": "passage-score-requests/v1/compat/00/"
-            + "0" * 64
-            + ".mpk",
-            "row_count": len(normalized_rows),
-            "batch_count": 0,
-        }
+        raise FlashScoringError("response cache telemetry is required")
     normalized_cache = _validate_cache_telemetry(
         cache,
         expected_row_count=len(normalized_rows),

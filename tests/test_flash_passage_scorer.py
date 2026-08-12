@@ -86,6 +86,20 @@ def _request_for_config(
     }
 
 
+def _cache_telemetry(
+    row_count: int,
+    *,
+    status: str = "miss_written",
+    batch_count: int = 1,
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "object_key": "passage-score-requests/v1/fake/00/" + "0" * 64 + ".mpk",
+        "row_count": row_count,
+        "batch_count": batch_count,
+    }
+
+
 class BatchEncodingTokenizer:
     def __init__(self, *, overflow_text: str = "overflow") -> None:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
@@ -176,9 +190,10 @@ class FakeAsyncRunner:
                 rows = rows + [{"hash": "00" * 32, "score": 0.0}]
             elif self.mode == "fingerprint":
                 return encode_flash_response(
-                    [],
+                    [{"hash": request["rows"][0]["hash"], "score": 0.0}],
                     schema_version=WIRE_SCHEMA_VERSION,
                     scorer_fingerprint="drifted-fingerprint",
+                    cache=_cache_telemetry(1),
                 )
             elif self.mode == "nonfinite":
                 rows = [{"hash": row["hash"], "score": math.nan} for row in rows]
@@ -191,14 +206,7 @@ class FakeAsyncRunner:
                 rows,
                 schema_version=request["schema_version"],
                 scorer_fingerprint=request["scorer_fingerprint"],
-                cache={
-                    "status": "miss_written",
-                    "object_key": "passage-score-requests/v1/fake/00/"
-                    + "0" * 64
-                    + ".mpk",
-                    "row_count": len(rows),
-                    "batch_count": 1,
-                },
+                cache=_cache_telemetry(len(rows)),
             )
         finally:
             self.active -= 1
@@ -280,6 +288,8 @@ class FlashWireCodecTests(unittest.TestCase):
             {**cache, "extra": 1},
             {**cache, "status": "unknown"},
             {**cache, "object_key": "../unsafe"},
+            {**cache, "object_key": "safe?query"},
+            {**cache, "object_key": "safe#fragment"},
             {**cache, "row_count": 2},
             {**cache, "batch_count": 1},
             {**cache, "row_count": 1.0},
@@ -291,6 +301,9 @@ class FlashWireCodecTests(unittest.TestCase):
                 candidate["cache"] = invalid_cache
                 with self.assertRaises(FlashScoringError):
                     decode_flash_response(candidate)
+
+        with self.assertRaises(FlashScoringError):
+            encode_flash_response([row], scorer_fingerprint="fingerprint")
 
         for extra_field in ("extra",):
             candidate = dict(decoded)
@@ -654,6 +667,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                     ({"hash": sha256_bytes("text"), "score": 4.0},),
                     schema_version=request["schema_version"],
                     scorer_fingerprint=request["scorer_fingerprint"],
+                    cache=_cache_telemetry(1),
                 )
 
             async def wait(self, timeout: float | None = None) -> "Job":
@@ -711,6 +725,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                         response["scores"],
                         schema_version=response["schema_version"],
                         scorer_fingerprint=response["scorer_fingerprint"],
+                        cache=_cache_telemetry(len(response["scores"])),
                     )
                 )
 
@@ -770,6 +785,7 @@ class FlashEndpointBatchRunnerTests(unittest.TestCase):
             output = encode_flash_response(
                 ({"hash": sha256_bytes("text"), "score": 4.0},),
                 scorer_fingerprint=config.fingerprint,
+                cache=_cache_telemetry(1),
             )
 
             async def wait(self, timeout: float | None = None) -> "Job":
@@ -1499,6 +1515,7 @@ class _WorkerWireRunner:
             response["scores"],
             schema_version=response["schema_version"],
             scorer_fingerprint=response["scorer_fingerprint"],
+            cache=_cache_telemetry(len(response["scores"])),
         )
 
 
