@@ -40,6 +40,11 @@ def write_manifest_snapshot(
     wrong_hash_path: str | None = None,
 ) -> list[ParquetShard]:
     manifest = []
+    # A real snapshot directory is created by ensure_private_cache_dir at 0700.
+    # mkdir(parents=True) would instead leave it at 0777 & ~umask, so the caller
+    # rejects it as world-readable under a permissive umask and not under 0077.
+    snapshot.mkdir(parents=True, exist_ok=True)
+    snapshot.chmod(0o700)
     for config, splits in CONFIG_SPLITS.items():
         for split in splits:
             relative_path = f"{config}/{split}/0000.parquet"
