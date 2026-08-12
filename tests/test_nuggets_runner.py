@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from typing import Any
 
 from trec_ragtime.nugget_cache import NuggetArtifactCache, NuggetInput
-from trec_ragtime.nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig
 from trec_ragtime.nuggets import (
     FacetEvidence,
     NuggetClusterer,
@@ -34,9 +33,12 @@ from tests.test_nuggets import ScriptedBackend, candidate, fixed_embedder
 
 
 CLAIM = "grain exports fell"
+# Fingerprinted from the same kind of backend the factory below returns. Using a
+# NuggetizerBackend here while executing a ScriptedBackend keyed every fixture
+# bundle under a configuration the test never ran — the exact divergence
+# run_topic now rejects.
 FINGERPRINT = build_fingerprint(
-    NuggetizerBackend(NuggetizerConfig(model="test-model", max_nuggets=20),
-                      nuggetizer=object()),
+    ScriptedBackend(claims=((CLAIM, "vital"),), supported={}),
     NuggetClusterer(embed=fixed_embedder({})),
     provider_base_url="https://provider/v1",
 )
@@ -139,6 +141,26 @@ class RunTopicTestCase(unittest.TestCase):
         outcome = self._run(backend_factory=refuse)
         self.assertEqual(outcome.status, "cached")
         self.assertEqual(outcome.nugget_count, 1)
+
+    def test_a_backend_the_fingerprint_does_not_describe_is_refused(self) -> None:
+        """The key must never name a configuration that did not run.
+
+        build_fingerprint takes a backend instance while run_topic builds its
+        own from the factory, so the two can differ. That would publish a bundle
+        under another backend's identity and let a later run read it as a hit.
+        """
+
+        def other() -> Any:
+            return ScriptedBackend(
+                claims=((CLAIM, "vital"),),
+                supported={CLAIM: ("grain passage",)},
+                identity="a-different-backend",
+            )
+
+        outcome = self._run(backend_factory=other)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("backend identity", outcome.reason or "")
+        self.assertEqual(self.store.objects, {})
 
     def test_an_unsupported_topic_fails_and_stores_nothing(self) -> None:
         outcome = self._run(backend_factory=backend_factory(supported=()))

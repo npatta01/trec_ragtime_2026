@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import unittest
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import msgspec
@@ -53,10 +55,22 @@ def facet(index: int, *texts: str, **kwargs: Any) -> FacetEvidence:
 class ScriptedBackend:
     """A nuggetizer stand-in with a fixed claim set and support matrix."""
 
-    def __init__(self, claims: Sequence[tuple[str, str]], supported: dict[str, Sequence[str]]):
+    def __init__(self, claims: Sequence[tuple[str, str]], supported: dict[str, Sequence[str]],
+                 identity: str = "scripted-backend-v1"):
         self._claims = tuple(claims)
         self._supported = supported
+        self._identity = identity
         self.assign_calls: list[str] = []
+
+    @property
+    def fingerprint(self) -> dict[str, object]:
+        """NuggetBackend requires this, and run_topic now checks it.
+
+        A stand-in that omits it would let a bundle be keyed under a
+        configuration that never ran, which is the failure run_topic guards.
+        """
+
+        return {"backend": self._identity}
 
     def create(self, *, topic_id: str, query: str, passages: Sequence[tuple[str, str]]):
         self.passages = tuple(passages)
@@ -108,6 +122,47 @@ class EvidenceTableTestCase(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].evidence.facet_index, 0)
 
+    def test_rejects_offsets_that_run_past_the_source(self) -> None:
+        """Slicing is forgiving; a sealed citation must not be.
+
+        Python returns a short string for an over-long end offset, so without
+        this the bundle would record a span the document never had, and the
+        bundle stores no text for anyone downstream to catch it with.
+        """
+
+        row = candidate("grain passage")
+        overrun = EvidenceCandidate(
+            document_id=row.document_id,
+            representation=row.representation,
+            language=row.language,
+            start_char=0,
+            end_char=len(row.source_text) + 25,
+            content_hash=row.content_hash,
+            passage_score=row.passage_score,
+            document_rank=row.document_rank,
+            source_text=row.source_text,
+        )
+        facets = [FacetEvidence(facet_index=0, query="q", candidates=(overrun,))]
+        with self.assertRaisesRegex(NuggetError, "fall outside"):
+            build_evidence_table(facets, budget=4)
+
+    def test_rejects_a_content_hash_that_does_not_match_the_text(self) -> None:
+        row = candidate("grain passage")
+        tampered = EvidenceCandidate(
+            document_id=row.document_id,
+            representation=row.representation,
+            language=row.language,
+            start_char=row.start_char,
+            end_char=row.end_char,
+            content_hash=hashlib.sha256(b"a different passage").digest(),
+            passage_score=row.passage_score,
+            document_rank=row.document_rank,
+            source_text=row.source_text,
+        )
+        facets = [FacetEvidence(facet_index=0, query="q", candidates=(tampered,))]
+        with self.assertRaisesRegex(NuggetError, "content hash does not match"):
+            build_evidence_table(facets, budget=4)
+
     def test_rejects_an_unusable_budget(self) -> None:
         for budget in (0, -1, True):
             with self.subTest(budget=budget):
@@ -116,6 +171,37 @@ class EvidenceTableTestCase(unittest.TestCase):
 
 
 class ClustererTestCase(unittest.TestCase):
+    def test_one_clusterer_never_embeds_concurrently(self) -> None:
+        """run_topics shares a clusterer across topic threads.
+
+        Overlapping encode() calls on one model would make which claims merge
+        depend on thread scheduling, so the lock has to span inference, not
+        just the lazy construction.
+        """
+
+        import threading
+
+        live = 0
+        overlapped = False
+        guard = threading.Lock()
+
+        def embed(keys):
+            nonlocal live, overlapped
+            with guard:
+                live += 1
+                overlapped |= live > 1
+            time.sleep(0.02)
+            with guard:
+                live -= 1
+            return [[1.0, 0.0] for _ in keys]
+
+        clusterer = NuggetClusterer(embed=embed)
+        claims = ["alpha rose sharply", "beta fell sharply", "gamma held steady"]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: clusterer.cluster(claims), range(8)))
+
+        self.assertFalse(overlapped, "encode() ran concurrently on a shared clusterer")
+
     def test_merges_exact_duplicates_without_embedding(self) -> None:
         clusterer = NuggetClusterer(embed=fixed_embedder({}))
         self.assertEqual(clusterer.cluster(["Grain fell", "grain   FELL"]), ((0, 1),))
@@ -454,6 +540,80 @@ class CheckBundleTestCase(unittest.TestCase):
             bundle, evidence=(bundle.evidence[0], bundle.evidence[0])
         )
         with self.assertRaisesRegex(NuggetError, "reuses an alias"):
+            check_bundle(broken)
+
+    def test_rejects_evidence_in_another_representation(self) -> None:
+        """Offsets only mean something against the representation named here."""
+
+        bundle = self._bundle()
+        broken = msgspec.structs.replace(
+            bundle,
+            evidence=(
+                msgspec.structs.replace(bundle.evidence[0], representation="canonical"),
+            )
+            + bundle.evidence[1:],
+        )
+        with self.assertRaisesRegex(NuggetError, "bundle representation"):
+            check_bundle(broken)
+
+    def test_rejects_a_non_finite_passage_score(self) -> None:
+        """Infinity survives a msgpack round trip; NaN does not.
+
+        NaN is already refused a step earlier, because NaN != NaN makes the
+        decoded bundle compare unequal to the original. Infinity compares equal
+        to itself, so it reaches the ordering comparison and would sort against
+        every other score.
+        """
+
+        bundle = self._bundle()
+        broken = msgspec.structs.replace(
+            bundle,
+            evidence=(
+                msgspec.structs.replace(bundle.evidence[0], passage_score=float("inf")),
+            )
+            + bundle.evidence[1:],
+        )
+        with self.assertRaisesRegex(NuggetError, "non-finite passage score"):
+            check_bundle(broken)
+
+        nan = msgspec.structs.replace(
+            bundle,
+            evidence=(
+                msgspec.structs.replace(bundle.evidence[0], passage_score=float("nan")),
+            )
+            + bundle.evidence[1:],
+        )
+        with self.assertRaises(NuggetError):
+            check_bundle(nan)
+
+    def test_rejects_an_alias_table_that_is_not_in_canonical_order(self) -> None:
+        """Aliases are positional, so the table must read e001, e002, ...
+
+        Swapping the rows themselves is a different failure: that changes
+        evidence_digest, so it cannot collide with the original artifact's key.
+        What this catches is the table keeping its order while the names on it
+        do not, which would repoint every citation without moving a row.
+        """
+
+        bundle = self._bundle()
+        first, second = bundle.evidence[0], bundle.evidence[1]
+        broken = msgspec.structs.replace(
+            bundle,
+            evidence=(
+                msgspec.structs.replace(first, alias=second.alias),
+                msgspec.structs.replace(second, alias=first.alias),
+            )
+            + bundle.evidence[2:],
+        )
+        with self.assertRaisesRegex(NuggetError, "canonical or in order"):
+            check_bundle(broken)
+
+    def test_rejects_a_repeated_facet_record(self) -> None:
+        bundle = self._bundle()
+        broken = msgspec.structs.replace(
+            bundle, facets=(bundle.facets[0], bundle.facets[0])
+        )
+        with self.assertRaisesRegex(NuggetError, "repeats a facet record"):
             check_bundle(broken)
 
     def test_rejects_support_outside_the_alias_table(self) -> None:

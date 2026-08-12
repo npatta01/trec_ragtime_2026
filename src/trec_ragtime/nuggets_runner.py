@@ -43,6 +43,7 @@ from .nuggets import (
     FacetEvidence,
     NuggetBackend,
     NuggetBundle,
+    NuggetError,
     NuggetClusterer,
     build_evidence_table,
     run_topic_nuggets,
@@ -205,12 +206,24 @@ def run_topic(
     # the bundle against the request, and a rejection there is this topic's
     # failure, not grounds for aborting every other worker in the pool.
     try:
+        backend = backend_factory()
+        # The fingerprint was built from one backend and execution gets another
+        # from the factory, so nothing structurally stops a caller from keying a
+        # bundle under a configuration it did not run. Comparing the identity the
+        # backend reports against the one already in the key turns that into a
+        # failed topic instead of a silently mislabelled artifact.
+        if dict(backend.fingerprint) != fingerprint.backend:
+            raise NuggetError(
+                "backend identity differs from the fingerprint the bundle is "
+                "keyed under; the cached artifact would describe a "
+                "configuration that never ran"
+            )
         bundle = run_topic_nuggets(
             topic_id=work.topic_id,
             query=work.query,
             representation=work.representation,
             facets=work.facets,
-            backend=backend_factory(),
+            backend=backend,
             clusterer=clusterer,
             evidence_budget=fingerprint.evidence_budget,
             max_nuggets=fingerprint.max_nuggets,

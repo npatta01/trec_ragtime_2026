@@ -28,6 +28,7 @@ corpus.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 from collections import Counter
@@ -199,6 +200,18 @@ class NuggetBackend(Protocol):
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 
 
+def _alias_for(index: int) -> str:
+    """Name the evidence row at ``index``.
+
+    Both the table builder and ``check_bundle`` go through here so the format
+    cannot drift. The width is a minimum, not a cap: a budget above 999 yields
+    ``e1000``, which ``_Alias`` accepts and a hardcoded 3-digit check would
+    wrongly reject.
+    """
+
+    return f"e{index + 1:03d}"
+
+
 def normalize_claim(claim: str) -> str:
     """Collapse whitespace and case so paraphrase comparison is stable."""
 
@@ -234,10 +247,32 @@ def build_evidence_table(
             if location in seen:
                 continue
             seen.add(location)
+            # This is the only point where the passage text is in hand, so it is
+            # the only place lineage can be proven rather than trusted. Slicing
+            # is silently forgiving: an end_char past the end yields a short
+            # string and an inverted range yields "", either of which would be
+            # sealed into an artifact as a citation pointing at text that was
+            # never there. The bundle deliberately stores no text, so nothing
+            # downstream can catch it.
+            text = candidate.text
+            if (
+                candidate.start_char >= candidate.end_char
+                or candidate.end_char > len(candidate.source_text)
+            ):
+                raise NuggetError(
+                    f"evidence offsets {candidate.start_char}:{candidate.end_char} "
+                    f"fall outside {candidate.document_id}"
+                )
+            if hashlib.sha256(text.encode("utf-8")).digest() != candidate.content_hash:
+                raise NuggetError(
+                    f"evidence content hash does not match the text at "
+                    f"{candidate.document_id}[{candidate.start_char}:"
+                    f"{candidate.end_char}]"
+                )
             rows.append(
                 AliasedPassage(
                     evidence=NuggetEvidence(
-                        alias=f"e{len(rows) + 1:03d}",
+                        alias=_alias_for(len(rows)),
                         document_id=candidate.document_id,
                         representation=candidate.representation,
                         language=candidate.language,
@@ -248,7 +283,7 @@ def build_evidence_table(
                         document_rank=candidate.document_rank,
                         facet_index=facet.facet_index,
                     ),
-                    text=candidate.text,
+                    text=text,
                 )
             )
     return tuple(rows)
@@ -301,13 +336,17 @@ class NuggetClusterer:
             "guard_version": GUARD_VERSION,
         }
 
-    def _resolve_embedder(self) -> Embedder:
+    def _embed_batch(self, keys: Sequence[str]) -> Sequence[Sequence[float]]:
         # run_topics shares one clusterer across threads, so without this every
         # worker in the first wave would load its own copy of the pinned model.
+        # The lock spans inference too, not just construction: encode() on a
+        # shared model is not documented thread-safe, and clustering decides
+        # which claims merge, so letting it race would make a bundle depend on
+        # thread scheduling.
         with self._embed_lock:
             if self._embed is None:
                 self._embed = default_embedder()
-            return self._embed
+            return self._embed(keys)
 
     def cluster(self, claims: Sequence[str]) -> tuple[tuple[int, ...], ...]:
         """Return claim index groups, each ordered, leaders in input order."""
@@ -319,7 +358,7 @@ class NuggetClusterer:
         if len(keys) < 2:
             return tuple(tuple(groups[key]) for key in keys)
 
-        vectors = self._resolve_embedder()(keys)
+        vectors = self._embed_batch(keys)
         if len(vectors) != len(keys):
             raise NuggetError("embedder returned the wrong number of vectors")
         guards = [_guard_signature(key) for key in keys]
@@ -444,6 +483,23 @@ def check_bundle(bundle: NuggetBundle) -> None:
         aliases.add(evidence.alias)
         if evidence.end_char <= evidence.start_char:
             raise NuggetError("nugget evidence offsets do not span any text")
+        # One bundle names one selected representation. A row carrying another
+        # would resolve its offsets against a different string than the bundle
+        # claims to describe, so the citation would point somewhere real but
+        # wrong, which no hash check on the row alone would notice.
+        if evidence.representation != bundle.representation:
+            raise NuggetError("nugget evidence disagrees with the bundle representation")
+        if not math.isfinite(evidence.passage_score):
+            raise NuggetError("nugget evidence carries a non-finite passage score")
+    # Aliases are positional: build_evidence_table names each row from its own
+    # index, and evidence_digest keys the artifact on that exact order. A
+    # permuted or gapped table would silently repoint every citation.
+    if [row.alias for row in bundle.evidence] != [
+        _alias_for(index) for index in range(len(bundle.evidence))
+    ]:
+        raise NuggetError("nugget evidence aliases are not canonical or in order")
+    if len({facet.facet_index for facet in bundle.facets}) != len(bundle.facets):
+        raise NuggetError("nugget bundle repeats a facet record")
     if len(bundle.evidence) > bundle.evidence_budget:
         raise NuggetError("nugget evidence exceeds the configured budget")
     if len(bundle.nuggets) > bundle.max_nuggets:
