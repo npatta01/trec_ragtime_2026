@@ -152,8 +152,10 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   `vital`/`okay` and support labels are signals, not qrels or human judgments.
 - A nugget bundle never stores passage text. Offsets plus `content_hash` prove
   which text was used and the text stays recoverable from the retrieval
-  artifact. The request identity pins the ordered alias table, so an altered
-  alias, document, or offset cannot be read back under the same key.
+  artifact. The request identity pins the topic query and the ordered alias
+  table, so a reworded question, or an altered alias, document, or offset,
+  cannot be read back under the same key. Any new result-affecting input must
+  join the fingerprint or the request and its isolation tests.
 - Cache keys must include the endpoint, operation, namespace, and exact request,
   but never the bearer token. Cache only validated successful responses.
 - The OpenAI-compatible chat-completion cache stores the complete validated

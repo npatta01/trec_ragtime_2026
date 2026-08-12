@@ -115,6 +115,7 @@ def fingerprint(**changes: Any) -> NuggetFingerprint:
 def request(bundle: Any, **changes: Any) -> NuggetRequest:
     base: dict[str, Any] = {
         "topic_id": "2000",
+        "query": "grain exports",
         "representation": "report_text",
         "inputs": (
             NuggetInput(
@@ -221,6 +222,7 @@ class IsolationTestCase(unittest.TestCase):
     def test_a_changed_request_never_hits(self) -> None:
         variants = {
             "topic_id": "2001",
+            "query": "port closures",
             "representation": "canonical",
             "passage_source_fingerprint": "langchain-spacy-v1/feedface",
             "evidence_digest": hashlib.sha256(b"other-evidence").digest(),
@@ -310,6 +312,11 @@ class PutValidationTestCase(unittest.TestCase):
     def test_refuses_a_bundle_for_another_topic(self) -> None:
         other = request(self.bundle, topic_id="2001")
         with self.assertRaisesRegex(NuggetError, "different topic"):
+            self.cache.put(fingerprint(), other, self.bundle)
+
+    def test_refuses_a_bundle_answering_another_query(self) -> None:
+        other = request(self.bundle, query="port closures")
+        with self.assertRaisesRegex(NuggetError, "different query"):
             self.cache.put(fingerprint(), other, self.bundle)
 
     def test_refuses_a_bundle_whose_evidence_was_swapped(self) -> None:

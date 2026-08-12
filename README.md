@@ -693,6 +693,12 @@ the topic's exact inputs:
 nuggets/v1/<nuggetizer-fingerprint>/<request-prefix>/<request-digest>.mpk
 ```
 
+The request identity covers the topic, the exact question asked, the source
+representation, the input retrieval artifacts, the passage-source fingerprint,
+and a digest of the ordered alias table. Rewording the question, or altering an
+alias, document, or offset, therefore yields a different key rather than a stale
+hit.
+
 The bundle carries the complete evidence-alias table, ordered nuggets with
 their attesting passages, facet coverage, and sanitized rejection counts. It
 deliberately stores no passage text: the offsets and `content_hash` prove which

@@ -106,6 +106,28 @@ class RunTopicTestCase(unittest.TestCase):
         self.assertIn(outcome.object_key, self.store.evictions)
         self.assertEqual(self.store.reads.count(outcome.object_key), 2)
 
+    def test_a_reworded_topic_query_is_not_a_cache_hit(self) -> None:
+        """The query drives create() and assign(), so it must be in the identity."""
+
+        first = self._run()
+        self.assertEqual(first.status, "written")
+        reworded = run_topic(
+            TopicWork(
+                topic_id=work().topic_id,
+                query="what happened to port closures",
+                representation=work().representation,
+                facets=work().facets,
+                inputs=work().inputs,
+                passage_source_fingerprint=work().passage_source_fingerprint,
+            ),
+            cache=self.cache,
+            fingerprint=FINGERPRINT,
+            backend_factory=backend_factory(),
+            clusterer=clusterer(),
+        )
+        self.assertEqual(reworded.status, "written")
+        self.assertNotEqual(reworded.object_key, first.object_key)
+
     def test_a_warm_topic_costs_no_provider_calls(self) -> None:
         self._run()
 
@@ -239,16 +261,18 @@ class ManifestTestCase(unittest.TestCase):
 class RerankingProjectionTestCase(unittest.TestCase):
     """Structural stand-ins matching the reranking stage's published records."""
 
-    def _result(self, representation: str = "report_text") -> Any:
+    def _result(
+        self, representation: str = "report_text", document_id: str = "doc-a"
+    ) -> Any:
         passage = SimpleNamespace(
-            document_id="doc-a",
+            document_id=document_id,
             start_char=6,
             end_char=13,
             score=0.75,
             content_hash=hashlib.sha256(b"passage").digest(),
         )
         document = SimpleNamespace(
-            document_id="doc-a",
+            document_id=document_id,
             language="spa",
             text="ORIG: cargamento original",
             english_text="hello passage text",
@@ -277,7 +301,7 @@ class RerankingProjectionTestCase(unittest.TestCase):
 
     def test_slices_text_from_the_selected_representation(self) -> None:
         result = self._result()
-        facets = evidence_from_reranking([result], queries=["grain"])
+        facets = evidence_from_reranking([result], queries=["grain"], facet_indices=[0])
         self.assertEqual(len(facets), 1)
         prepared = facets[0].candidates
         self.assertEqual(len(prepared), 1)
@@ -290,20 +314,46 @@ class RerankingProjectionTestCase(unittest.TestCase):
 
     def test_uses_the_source_language_for_canonical_text(self) -> None:
         result = self._result(representation="canonical")
-        prepared = evidence_from_reranking([result], queries=["grain"])[0].candidates
+        prepared = evidence_from_reranking([result], queries=["grain"], facet_indices=[0])[0].candidates
         self.assertEqual(prepared[0].language, "spa")
         self.assertEqual(prepared[0].text, "cargame")
 
     def test_indexes_facets_by_position(self) -> None:
         facets = evidence_from_reranking(
-            [self._result(), self._result()], queries=["a", "b"]
+            [self._result(), self._result()], queries=["a", "b"], facet_indices=[0, 1]
         )
         self.assertEqual([facet.facet_index for facet in facets], [0, 1])
         self.assertEqual([facet.query for facet in facets], ["a", "b"])
 
     def test_requires_a_query_per_result(self) -> None:
         with self.assertRaises(ValueError):
-            evidence_from_reranking([self._result()], queries=[])
+            evidence_from_reranking([self._result()], queries=[], facet_indices=[])
+
+    def test_keeps_plan_indices_when_a_facet_retrieval_is_missing(self) -> None:
+        """Facet 1 has no cached retrieval; facet 2 must not be renumbered to 1."""
+
+        facets = evidence_from_reranking(
+            [self._result(document_id="doc-a"), self._result(document_id="doc-b")],
+            queries=["facet zero", "facet two"],
+            facet_indices=[0, 2],
+        )
+        self.assertEqual([facet.facet_index for facet in facets], [0, 2])
+        # The plan's numbering must reach the persisted evidence rows, since
+        # that is what the cache key and facet coverage are built from.
+        from trec_ragtime.nuggets import build_evidence_table
+
+        rows = build_evidence_table(facets, budget=24)
+        self.assertEqual(
+            sorted({row.evidence.facet_index for row in rows}), [0, 2]
+        )
+
+    def test_rejects_duplicate_facet_indices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unique"):
+            evidence_from_reranking(
+                [self._result(), self._result()],
+                queries=["a", "b"],
+                facet_indices=[1, 1],
+            )
 
 
 if __name__ == "__main__":
@@ -382,7 +432,7 @@ class RealRerankingIntegrationTestCase(unittest.TestCase):
 
     def test_projects_real_passages_with_exact_offsets(self) -> None:
         english, result = self._reranked()
-        facets = evidence_from_reranking([result], queries=[self.query])
+        facets = evidence_from_reranking([result], queries=[self.query], facet_indices=[0])
         prepared = facets[0].candidates
         self.assertGreater(len(prepared), 1, "the chunker should split this document")
         for row in prepared:
@@ -396,7 +446,7 @@ class RealRerankingIntegrationTestCase(unittest.TestCase):
 
     def test_real_passages_flow_through_to_a_sealed_bundle(self) -> None:
         _, result = self._reranked()
-        facets = evidence_from_reranking([result], queries=[self.query])
+        facets = evidence_from_reranking([result], queries=[self.query], facet_indices=[0])
         claim = "grain exports fell in the quarter"
         supported = facets[0].candidates[0].text
         backend = lambda: ScriptedBackend(  # noqa: E731

@@ -60,11 +60,16 @@ class NuggetInput(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 class NuggetRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """The exact inputs that produce one topic's bundle.
 
+    ``query`` is the topic question handed to both nugget creation and
+    assignment, so it belongs in the identity: without it, rewording the
+    question while the evidence stays fixed returns the previous bundle.
+
     ``evidence_digest`` pins the ordered alias table, so an artifact whose
     aliases, documents, or offsets were altered cannot resolve to this key.
     """
 
     topic_id: str
+    query: str
     representation: str
     inputs: tuple[NuggetInput, ...]
     passage_source_fingerprint: str
@@ -201,6 +206,8 @@ def _validate(
         raise TypeError("bundle must be a NuggetBundle")
     if bundle.topic_id != request.topic_id:
         raise NuggetError("nugget bundle names a different topic")
+    if bundle.query != request.query:
+        raise NuggetError("nugget bundle answers a different query")
     if bundle.representation != request.representation:
         raise NuggetError("nugget bundle uses a different source representation")
     if (

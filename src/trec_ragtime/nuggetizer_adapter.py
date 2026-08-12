@@ -65,7 +65,12 @@ class BoundedHandler(LLMHandler):
         self, messages: list[dict[str, str]], temperature: float = 0
     ) -> tuple[str, int]:
         if self.remaining <= 0:
-            raise NuggetizerError("nuggetizer provider call budget is exhausted")
+            # Surface the provider failure that consumed the budget; otherwise a
+            # bad key is reported only as an exhausted budget.
+            raise NuggetizerError(
+                "nuggetizer provider call budget is exhausted"
+                + (f" after {type(self.error).__name__}" if self.error else "")
+            ) from self.error
         self.remaining -= 1
         try:
             completion = self.client.chat.completions.create(

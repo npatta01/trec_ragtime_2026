@@ -79,19 +79,30 @@ class TopicOutcome:
 
 
 def evidence_from_reranking(
-    results: Sequence[Any], *, queries: Sequence[str]
+    results: Sequence[Any],
+    *,
+    queries: Sequence[str],
+    facet_indices: Sequence[int],
 ) -> tuple[FacetEvidence, ...]:
     """Project reranked passages onto facet evidence, preserving lineage.
 
     Offsets and content hashes were already proven by the reranking stage, so
     they are carried across rather than recomputed. Only scored documents carry
     passage evidence; every other status contributes nothing.
+
+    ``facet_indices`` is explicit rather than positional. A topic whose facet
+    retrievals are sparse would otherwise have its surviving facets renumbered,
+    which silently changes facet coverage and the artifact's cache key.
     """
 
-    if len(results) != len(queries):
-        raise ValueError("each reranking result needs its originating facet query")
+    if len(results) != len(queries) or len(results) != len(facet_indices):
+        raise ValueError(
+            "each reranking result needs its originating facet query and index"
+        )
+    if len(set(facet_indices)) != len(facet_indices):
+        raise ValueError("facet indices must be unique")
     facets: list[FacetEvidence] = []
-    for facet_index, (result, query) in enumerate(zip(results, queries, strict=True)):
+    for facet_index, result, query in zip(facet_indices, results, queries, strict=True):
         representation = result.representation
         candidates: list[EvidenceCandidate] = []
         for row in result.documents:
@@ -171,6 +182,7 @@ def run_topic(
         return TopicOutcome(work.topic_id, "failed", reason="no ranked passages")
     request = NuggetRequest(
         topic_id=work.topic_id,
+        query=work.query,
         representation=work.representation,
         inputs=work.inputs,
         passage_source_fingerprint=work.passage_source_fingerprint,
