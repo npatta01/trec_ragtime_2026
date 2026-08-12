@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import importlib.metadata
 import json
 import inspect
 from io import StringIO
 import math
 import msgspec
+import os
+from pathlib import Path
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -31,7 +35,6 @@ from trec_ragtime.flash_passage_scorer import (
 )
 import trec_ragtime.flash_passage_scorer as flash_passage_scorer
 from trec_ragtime.flash_worker import FlashPassageWorker, build_flash_worker
-from trec_ragtime.artifact_store import ArtifactValidationError
 from trec_ragtime.passage_scoring import (
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
@@ -198,29 +201,54 @@ class WorkerCacheStore:
         self.evict_local_calls.append(key)
 
 
-class ArtifactStoreRepairingFake(WorkerCacheStore):
-    """ArtifactStore-like fake: ArtifactValidationError repairs L1 from L2."""
+class DirectStoreApiFake:
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
 
-    def __init__(self, *, l1: dict[str, bytes], l2: dict[str, bytes]) -> None:
-        super().__init__()
-        self.l1 = l1
-        self.objects = l2
-
-    def read_validated(
-        self, key: str, decoder: Callable[[bytes], object]
-    ) -> object | None:
-        self.read_validated_calls.append(key)
-        payload = self.l1.get(key)
-        if payload is not None:
-            try:
-                return decoder(payload)
-            except ArtifactValidationError:
-                del self.l1[key]
-        payload = self.objects.get(key)
-        return None if payload is None else decoder(payload)
+    def bucket_info(self, bucket_id: str) -> object:
+        return types.SimpleNamespace(private=True)
 
 
-ArtifactStoreRepairingFake.__module__ = "trec_ragtime.artifact_store"
+class DirectStoreHandleFake:
+    def __init__(self, filesystem: "DirectStoreFilesystemFake", path: str, mode: str) -> None:
+        self.filesystem = filesystem
+        self.path = path
+        self.mode = mode
+        self.payload = bytearray()
+
+    def __enter__(self) -> "DirectStoreHandleFake":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if exc_type is None and "w" in self.mode:
+            key = self.path.removeprefix("hf://")
+            payload = bytes(self.payload)
+            self.filesystem.remote[key] = payload
+            candidate = self.filesystem.cache_storage / hashlib.sha256(
+                key.encode("utf-8")
+            ).hexdigest()
+            candidate.write_bytes(payload)
+
+    def read(self) -> bytes:
+        return self.filesystem.remote[self.path.removeprefix("hf://")]
+
+    def write(self, payload: bytes) -> int:
+        self.payload.extend(payload)
+        return len(payload)
+
+
+class DirectStoreFilesystemFake:
+    remote: dict[str, bytes] = {}
+
+    def __init__(self, cache_storage: str) -> None:
+        self.cache_storage = Path(cache_storage)
+        self.remote = type(self).remote
+
+    def open(self, path: str, mode: str) -> DirectStoreHandleFake:
+        key = path.removeprefix("hf://")
+        if "r" in mode and key not in self.remote:
+            raise FileNotFoundError(key)
+        return DirectStoreHandleFake(self, path, mode)
 
 
 def _request_for_rows(
@@ -1215,7 +1243,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "worker cache artifact is malformed"):
             worker.score(_request_for_config(policy))
 
-    def test_normal_artifact_store_repairs_malformed_l1_from_valid_l2(self) -> None:
+    def test_direct_store_repairs_malformed_l1_from_valid_l2(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=100)
         request = _request_for_config(policy)
         content_hash = sha256_bytes("text")
@@ -1226,23 +1254,94 @@ class StaticFlashWorkerTests(unittest.TestCase):
         payload = FlashPassageWorker._encode_cache_artifact(
             identity, {content_hash: 4.0}
         )
-        store = ArtifactStoreRepairingFake(
-            l1={key: b"malformed-l1"},
-            l2={key: payload},
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            DirectStoreFilesystemFake.remote = {}
+            fake_fsspec = types.ModuleType("fsspec")
+            fake_fsspec.filesystem = lambda protocol, **kwargs: DirectStoreFilesystemFake(
+                kwargs["cache_storage"]
+            )
+            fake_huggingface = types.ModuleType("huggingface_hub")
+            fake_huggingface.HfApi = DirectStoreApiFake
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "trec_ragtime.artifact_store": None,
+                        "fsspec": fake_fsspec,
+                        "huggingface_hub": fake_huggingface,
+                    },
+                    clear=False,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "RAGTIME_HF_BUCKET_ID": "private-owner/private-bucket",
+                        "RAGTIME_ARTIFACT_CACHE_DIR": directory,
+                    },
+                    clear=False,
+                ),
+            ):
+                worker = build_flash_worker(policy)(
+                    loader=lambda config: (_ for _ in ()).throw(
+                        AssertionError("valid L2 hit must not load the model")
+                    )
+                )
+                store = worker._cache_store
+                store._local_candidate(key).write_bytes(b"malformed-l1")
+                DirectStoreFilesystemFake.remote[
+                    "buckets/private-owner/private-bucket/" + key
+                ] = payload
 
-        def failing_loader(config: object) -> object:
-            raise AssertionError("valid L2 hit must not load the model")
+                response = worker.score(request)
 
-        worker = build_flash_worker(policy)(
-            loader=failing_loader,
-            cache_store=store,
-        )
-        response = worker.score(request)
+                self.assertEqual(response["cache"]["status"], "hit")
+                self.assertFalse(store._local_candidate(key).exists())
 
-        self.assertEqual(response["cache"]["status"], "hit")
-        self.assertNotIn(key, store.l1)
-        self.assertEqual(store.read_validated_calls, [key])
+    def test_direct_store_rejects_malformed_l2_as_fatal(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        request = _request_for_config(policy)
+        with tempfile.TemporaryDirectory() as directory:
+            DirectStoreFilesystemFake.remote = {}
+            fake_fsspec = types.ModuleType("fsspec")
+            fake_fsspec.filesystem = lambda protocol, **kwargs: DirectStoreFilesystemFake(
+                kwargs["cache_storage"]
+            )
+            fake_huggingface = types.ModuleType("huggingface_hub")
+            fake_huggingface.HfApi = DirectStoreApiFake
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "trec_ragtime.artifact_store": None,
+                        "fsspec": fake_fsspec,
+                        "huggingface_hub": fake_huggingface,
+                    },
+                    clear=False,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "RAGTIME_HF_BUCKET_ID": "private-owner/private-bucket",
+                        "RAGTIME_ARTIFACT_CACHE_DIR": directory,
+                    },
+                    clear=False,
+                ),
+            ):
+                worker = build_flash_worker(policy)(
+                    loader=lambda config: (_ for _ in ()).throw(
+                        AssertionError("malformed L2 must not load the model")
+                    )
+                )
+                identity = FlashPassageWorker._cache_identity(
+                    policy.fingerprint, "query", [sha256_bytes("text")]
+                )
+                key = FlashPassageWorker._cache_object_key(identity)
+                DirectStoreFilesystemFake.remote[
+                    "buckets/private-owner/private-bucket/" + key
+                ] = b"malformed-l2"
+
+                with self.assertRaisesRegex(ValueError, "worker cache artifact is malformed"):
+                    worker.score(request)
 
     def test_isolated_worker_scores_with_injected_store_without_project_imports(
         self,
@@ -1267,43 +1366,42 @@ class StaticFlashWorkerTests(unittest.TestCase):
     def test_default_store_uses_private_bucket_configuration_without_leaking_secrets(
         self,
     ) -> None:
-        captured: dict[str, object] = {}
-        fake_module = types.ModuleType("trec_ragtime.artifact_store")
-
-        class FakeProductionStore(WorkerCacheStore):
-            @classmethod
-            def from_env(cls, **kwargs: object) -> "FakeProductionStore":
-                captured.update(kwargs)
-                return cls()
-
-        fake_module.ArtifactStore = FakeProductionStore  # type: ignore[attr-defined]
         policy = LocalCrossEncoderConfig(max_length=100)
         secret_bucket = "private-owner/private-bucket"
         secret_token = "hf_secret_token_value"
-        with (
-            patch.dict(
-                sys.modules,
-                {"trec_ragtime.artifact_store": fake_module},
-                clear=False,
-            ),
-            patch.dict(
-                __import__("os").environ,
-                {
-                    "RAGTIME_HF_BUCKET_ID": secret_bucket,
-                    "RAGTIME_ARTIFACT_CACHE_DIR": "/tmp/trec-ragtime-test-artifacts",
-                    "HF_TOKEN": secret_token,
-                    "HF_ENDPOINT": "https://huggingface.example",
-                },
-                clear=False,
-            ),
-        ):
-            worker = build_flash_worker(policy)(
-                loader=CountingLoader(FakeModel(), BatchEncodingTokenizer())
+        with tempfile.TemporaryDirectory() as directory:
+            fake_fsspec = types.ModuleType("fsspec")
+            fake_fsspec.filesystem = lambda protocol, **kwargs: DirectStoreFilesystemFake(
+                kwargs["cache_storage"]
             )
+            fake_huggingface = types.ModuleType("huggingface_hub")
+            fake_huggingface.HfApi = DirectStoreApiFake
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "trec_ragtime.artifact_store": None,
+                        "fsspec": fake_fsspec,
+                        "huggingface_hub": fake_huggingface,
+                    },
+                    clear=False,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "RAGTIME_HF_BUCKET_ID": secret_bucket,
+                        "RAGTIME_ARTIFACT_CACHE_DIR": directory,
+                        "HF_TOKEN": secret_token,
+                        "HF_ENDPOINT": "https://huggingface.example",
+                    },
+                    clear=False,
+                ),
+            ):
+                worker = build_flash_worker(policy)(
+                    loader=CountingLoader(FakeModel(), BatchEncodingTokenizer())
+                )
 
-        self.assertEqual(captured["bucket_id"], secret_bucket)
-        self.assertEqual(captured["local_dir"], "/tmp/trec-ragtime-test-artifacts")
-        self.assertEqual(captured["endpoint"], "https://huggingface.example")
+        self.assertEqual(worker._cache_store.__class__.__name__, "DirectArtifactStore")
         self.assertNotIn(secret_token, repr(worker))
 
     def test_worker_tokenizer_metadata_matches_local_token_length_contract(

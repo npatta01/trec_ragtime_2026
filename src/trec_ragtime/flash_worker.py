@@ -429,27 +429,6 @@ class FlashPassageWorker:
         import os
 
         try:
-            from trec_ragtime.artifact_store import ArtifactStore
-
-            bucket_id = os.getenv("RAGTIME_HF_BUCKET_ID", "").strip()
-            if not bucket_id:
-                raise ValueError("RAGTIME_HF_BUCKET_ID is required")
-            local_dir = (
-                os.getenv("RAGTIME_ARTIFACT_CACHE_DIR", "").strip()
-                or "/tmp/trec-ragtime-artifacts"
-            )
-            endpoint = os.getenv("HF_ENDPOINT", "").strip() or None
-            return ArtifactStore.from_env(
-                bucket_id=bucket_id,
-                local_dir=local_dir,
-                endpoint=endpoint,
-            )
-        except ImportError:
-            pass
-        except Exception as error:
-            raise ValueError("worker cache store is unavailable") from error
-
-        try:
             import hashlib
             from pathlib import Path
 
@@ -954,23 +933,11 @@ class FlashPassageWorker:
         except cls._ERROR as error:
             raise cls._error("worker cache artifact is malformed") from error
 
-    def _decode_cached_payload(self, payload: bytes, identity: object) -> object:
-        try:
-            return self._decode_cache_artifact(payload, identity)
-        except self._ERROR as error:
-            if self._cache_store.__class__.__module__ != "trec_ragtime.artifact_store":
-                raise
-            try:
-                from trec_ragtime.artifact_store import ArtifactValidationError
-            except ImportError:
-                raise
-            raise ArtifactValidationError("invalid worker cache artifact") from error
-
     def _read_cache(self, key: str, identity: object) -> dict[bytes, float] | None:
         try:
             value = self._cache_store.read_validated(
                 key,
-                lambda payload: self._decode_cached_payload(payload, identity),
+                lambda payload: self._decode_cache_artifact(payload, identity),
             )
         except self._ERROR as error:
             raise self._error("worker cache artifact is malformed") from error
@@ -984,7 +951,7 @@ class FlashPassageWorker:
         try:
             value = self._cache_store.read_validated(
                 key,
-                lambda payload: self._decode_cached_payload(payload, identity),
+                lambda payload: self._decode_cache_artifact(payload, identity),
             )
         except Exception as error:
             raise self._error("worker cache reread failed") from error
