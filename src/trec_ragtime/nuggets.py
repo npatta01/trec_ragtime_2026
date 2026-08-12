@@ -5,6 +5,10 @@ comes from its assigner: every claim is judged against every evidence passage,
 and the resulting support matrix is the lineage. A claim no passage supports is
 quarantined rather than emitted.
 
+``support`` and ``partial_support`` both retain a claim, and the distinction is
+preserved per link rather than collapsed. Nothing here asserts entailment: a
+consumer that needs fully attested claims filters on the label.
+
 Each record is one ``msgspec.Struct`` used as both the domain and the wire type.
 ``Meta`` and ``Literal`` constraints are enforced on decode, so
 ``check_bundle`` gets alias formats, offset ranges, enum membership and unknown
@@ -75,7 +79,12 @@ class NuggetEvidence(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
 
 class NuggetSupport(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """One judged link from a nugget to an aliased passage."""
+    """One judged link from a nugget to an aliased passage.
+
+    ``partial_support`` is retained, so a nugget may be attested only partially.
+    That is model-indicated partial support, not entailment: a consumer that
+    needs full support must filter on this label rather than assume it.
+    """
 
     alias: _Alias
     assignment: Literal["support", "partial_support"]

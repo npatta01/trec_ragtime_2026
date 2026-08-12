@@ -294,6 +294,29 @@ class StageTestCase(unittest.TestCase):
         self.assertEqual(len(support), 1)
         self.assertEqual(support[0].assignment, "support")
 
+    def test_retains_a_claim_attested_only_partially(self) -> None:
+        """partial_support keeps a claim, and the weaker label is preserved."""
+
+        class PartialOnly(ScriptedBackend):
+            def assign(self, *, query, passage_text, nuggets):
+                self.assign_calls.append(passage_text)
+                return tuple(
+                    "partial_support" if passage_text == "grain passage" else "not_support"
+                    for _ in nuggets
+                )
+
+        backend = PartialOnly(claims=(("grain exports fell", "vital"),), supported={})
+        bundle = run_topic_nuggets(
+            topic_id="2000", query="grain", representation="report_text",
+            facets=self.facets, backend=backend,
+            clusterer=self._clusterer(**{"grain exports fell": [1.0, 0.0]}),
+        )
+        self.assertEqual(len(bundle.nuggets), 1)
+        self.assertEqual(
+            [link.assignment for link in bundle.nuggets[0].support], ["partial_support"]
+        )
+        self.assertEqual(bundle.rejected, ())
+
     def test_keeps_claims_with_decimals_and_abbreviations(self) -> None:
         """A numeric or abbreviated claim must not be quarantined as non-atomic."""
 

@@ -107,6 +107,11 @@ def fingerprint(**changes: Any) -> NuggetFingerprint:
         "guard_version": "numeric-negation-guard-v1",
         "evidence_budget": 24,
         "max_nuggets": 20,
+        "output_limits": {
+            "max_claim_characters": 400,
+            "max_claim_words": 30,
+            "max_completion_tokens": 2048,
+        },
     }
     base.update(changes)
     return NuggetFingerprint(**base)
@@ -212,6 +217,11 @@ class IsolationTestCase(unittest.TestCase):
             "similarity_threshold": 0.85,
             "guard_version": "guard-v2",
             "evidence_budget": 12,
+            "output_limits": {
+                "max_claim_characters": 400,
+                "max_claim_words": 12,
+                "max_completion_tokens": 2048,
+            },
         }
         for field, value in variants.items():
             with self.subTest(field=field):

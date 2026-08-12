@@ -14,7 +14,7 @@ result-affecting logic out of `nuggets_runner`.
 
 ## Part 1 — What already shipped
 
-Four modules and four test files. 516 tests pass; 87 are new.
+Four modules and four test files. 517 tests pass; 90 are new.
 
 | Module | Responsibility |
 | --- | --- |
@@ -60,6 +60,7 @@ NuggetizerConfig(model, max_nuggets=20, creator_window_size=10,
                  scorer_window_size=20, max_calls=64)
 NuggetRequest(topic_id, query, representation, inputs, passage_source_fingerprint,
               evidence_digest)
+NuggetFingerprint(..., evidence_budget, max_nuggets, output_limits)
 NuggetInput(facet_index, query, object_key, request_digest)
 ```
 
@@ -150,9 +151,22 @@ bundle; it is real on the write path, where it comes from the candidate rows.
 That is intentional — do not "fix" it by deleting the parameter.
 
 Any new result-affecting input must join `NuggetFingerprint` or `NuggetRequest`
-and the isolation test matrix. `MAX_COMPLETION_TOKENS` and
-`REQUEST_TIMEOUT_SECONDS` are currently outside both; changing them needs a
-manual `behavior_version` bump.
+and the isolation test matrix. `NuggetFingerprint.output_limits` covers the
+knobs that decide what the model may emit and what survives the atomicity
+guard — `max_claim_characters`, `max_claim_words`, `max_completion_tokens` —
+and `build_fingerprint` reads them from the modules that enforce them, so
+editing a constant retires artifacts without anyone remembering to plumb it.
+`REQUEST_TIMEOUT_SECONDS` is deliberately excluded: a timeout aborts a call, it
+does not change a successful result.
+
+### `partial_support` retains a claim, and says so
+
+`SUPPORT_LABELS` is `("support", "partial_support")`, so a nugget may be
+attested only partially. The distinction is preserved per link on
+`NuggetSupport.assignment` rather than collapsed. Nothing in the bundle asserts
+entailment — a consumer that needs fully attested claims filters on the label.
+Do not silently drop the weaker label when merging paraphrases; `_merge_cluster`
+already promotes `support` over `partial_support` for the same alias only.
 
 ### The atomicity guard's regex shape is deliberate
 

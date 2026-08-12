@@ -31,7 +31,7 @@ from .nugget_cache import (
     NuggetRequest,
     evidence_digest,
 )
-from .nuggetizer_adapter import NuggetizerConfig, package_identity
+from .nuggetizer_adapter import MAX_COMPLETION_TOKENS, NuggetizerConfig, package_identity
 from .nuggets import (
     BEHAVIOR_VERSION,
     DEFAULT_EVIDENCE_BUDGET,
@@ -40,6 +40,8 @@ from .nuggets import (
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
     GUARD_VERSION,
+    MAX_CLAIM_CHARACTERS,
+    MAX_CLAIM_WORDS,
     SCHEMA_VERSION,
     EvidenceCandidate,
     FacetEvidence,
@@ -164,6 +166,13 @@ def build_fingerprint(
         guard_version=GUARD_VERSION,
         evidence_budget=evidence_budget,
         max_nuggets=max_nuggets,
+        # Read from the modules that enforce them, so editing a constant
+        # changes the fingerprint without anyone remembering to plumb it.
+        output_limits={
+            "max_claim_characters": MAX_CLAIM_CHARACTERS,
+            "max_claim_words": MAX_CLAIM_WORDS,
+            "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        },
     )
 
 

@@ -181,6 +181,7 @@ def _label(value: Any, allowed: frozenset[str], field: str) -> str:
 
 __all__ = [
     "DEFAULT_MAX_CALLS",
+    "MAX_COMPLETION_TOKENS",
     "BoundedHandler",
     "NuggetizerBackend",
     "NuggetizerConfig",

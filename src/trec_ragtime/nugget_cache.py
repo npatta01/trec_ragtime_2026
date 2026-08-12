@@ -42,6 +42,10 @@ class NuggetFingerprint(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     guard_version: str
     evidence_budget: int
     max_nuggets: int
+    # Limits that decide what the model may emit and what survives the atomicity
+    # guard. They live here so editing one retires previous artifacts instead of
+    # silently changing what a cached bundle means.
+    output_limits: Mapping[str, int]
 
     @property
     def digest(self) -> bytes:
