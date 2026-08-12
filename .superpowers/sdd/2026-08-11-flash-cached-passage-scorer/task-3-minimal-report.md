@@ -52,3 +52,22 @@ git diff --check
 
 - Live Hugging Face Bucket permissions, simplecache transport, Runpod Flash deployment, and one-GPU smoke remain for the parent task. Offline tests cover configuration and store seams, not live remote behavior.
 - Existing `ruff check` reports the pre-existing unused `PropertyMock` import in `tests/test_flash_passage_scorer.py`.
+
+## Round 1 fix
+
+Commit: pending at report update time.
+
+The normal `ArtifactStore` adapter now translates worker codec `ValueError` into `ArtifactValidationError`, allowing the store to evict malformed L1 bytes and retry valid L2 bytes. The class-only fallback keeps its own local repair behavior. Added `test_normal_artifact_store_repairs_malformed_l1_from_valid_l2` using a precise `ArtifactStore` exception-contract fake.
+
+Verification:
+
+```text
+uv run python -m unittest tests.test_flash_passage_scorer.StaticFlashWorkerTests.test_normal_artifact_store_repairs_malformed_l1_from_valid_l2 -v
+=> Ran 1 test — OK
+uv run python -m unittest tests.test_flash_passage_scorer -v
+=> 64 tests — OK
+uv run python -m unittest tests.test_passage_reranking_integration -v
+=> 3 tests — OK
+git diff --check
+=> exit 0, no output
+```

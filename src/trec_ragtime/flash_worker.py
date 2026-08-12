@@ -954,11 +954,23 @@ class FlashPassageWorker:
         except cls._ERROR as error:
             raise cls._error("worker cache artifact is malformed") from error
 
+    def _decode_cached_payload(self, payload: bytes, identity: object) -> object:
+        try:
+            return self._decode_cache_artifact(payload, identity)
+        except self._ERROR as error:
+            if self._cache_store.__class__.__module__ != "trec_ragtime.artifact_store":
+                raise
+            try:
+                from trec_ragtime.artifact_store import ArtifactValidationError
+            except ImportError:
+                raise
+            raise ArtifactValidationError("invalid worker cache artifact") from error
+
     def _read_cache(self, key: str, identity: object) -> dict[bytes, float] | None:
         try:
             value = self._cache_store.read_validated(
                 key,
-                lambda payload: self._decode_cache_artifact(payload, identity),
+                lambda payload: self._decode_cached_payload(payload, identity),
             )
         except self._ERROR as error:
             raise self._error("worker cache artifact is malformed") from error
@@ -972,7 +984,7 @@ class FlashPassageWorker:
         try:
             value = self._cache_store.read_validated(
                 key,
-                lambda payload: self._decode_cache_artifact(payload, identity),
+                lambda payload: self._decode_cached_payload(payload, identity),
             )
         except Exception as error:
             raise self._error("worker cache reread failed") from error

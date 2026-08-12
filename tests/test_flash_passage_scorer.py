@@ -31,6 +31,7 @@ from trec_ragtime.flash_passage_scorer import (
 )
 import trec_ragtime.flash_passage_scorer as flash_passage_scorer
 from trec_ragtime.flash_worker import FlashPassageWorker, build_flash_worker
+from trec_ragtime.artifact_store import ArtifactValidationError
 from trec_ragtime.passage_scoring import (
     LocalCrossEncoderConfig,
     LocalCrossEncoderScorer,
@@ -195,6 +196,31 @@ class WorkerCacheStore:
 
     def evict_local(self, key: str) -> None:
         self.evict_local_calls.append(key)
+
+
+class ArtifactStoreRepairingFake(WorkerCacheStore):
+    """ArtifactStore-like fake: ArtifactValidationError repairs L1 from L2."""
+
+    def __init__(self, *, l1: dict[str, bytes], l2: dict[str, bytes]) -> None:
+        super().__init__()
+        self.l1 = l1
+        self.objects = l2
+
+    def read_validated(
+        self, key: str, decoder: Callable[[bytes], object]
+    ) -> object | None:
+        self.read_validated_calls.append(key)
+        payload = self.l1.get(key)
+        if payload is not None:
+            try:
+                return decoder(payload)
+            except ArtifactValidationError:
+                del self.l1[key]
+        payload = self.objects.get(key)
+        return None if payload is None else decoder(payload)
+
+
+ArtifactStoreRepairingFake.__module__ = "trec_ragtime.artifact_store"
 
 
 def _request_for_rows(
@@ -1188,6 +1214,35 @@ class StaticFlashWorkerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "worker cache artifact is malformed"):
             worker.score(_request_for_config(policy))
+
+    def test_normal_artifact_store_repairs_malformed_l1_from_valid_l2(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        request = _request_for_config(policy)
+        content_hash = sha256_bytes("text")
+        identity = FlashPassageWorker._cache_identity(
+            policy.fingerprint, "query", [content_hash]
+        )
+        key = FlashPassageWorker._cache_object_key(identity)
+        payload = FlashPassageWorker._encode_cache_artifact(
+            identity, {content_hash: 4.0}
+        )
+        store = ArtifactStoreRepairingFake(
+            l1={key: b"malformed-l1"},
+            l2={key: payload},
+        )
+
+        def failing_loader(config: object) -> object:
+            raise AssertionError("valid L2 hit must not load the model")
+
+        worker = build_flash_worker(policy)(
+            loader=failing_loader,
+            cache_store=store,
+        )
+        response = worker.score(request)
+
+        self.assertEqual(response["cache"]["status"], "hit")
+        self.assertNotIn(key, store.l1)
+        self.assertEqual(store.read_validated_calls, [key])
 
     def test_isolated_worker_scores_with_injected_store_without_project_imports(
         self,
