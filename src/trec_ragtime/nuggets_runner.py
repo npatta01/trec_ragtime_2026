@@ -198,7 +198,13 @@ def run_topic(
     )
     key = cache.object_key(fingerprint, request)
 
-    cached = cache.get(fingerprint, request)
+    # The lookup is guarded too. It reads the bucket, so under load it can fail
+    # for reasons that say nothing about this topic, and an unguarded miss here
+    # took down the whole worker along with every topic still queued behind it.
+    try:
+        cached = cache.get(fingerprint, request)
+    except Exception as error:  # noqa: BLE001 - one topic must not stop a run
+        return TopicOutcome(work.topic_id, "failed", reason=_sanitize(error))
     if cached is not None:
         return _outcome(work.topic_id, "cached", key, cached)
 

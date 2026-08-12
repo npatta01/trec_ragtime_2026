@@ -28,6 +28,9 @@ T = TypeVar("T")
 
 DEFAULT_ARTIFACT_CACHE_SUBDIRECTORY = "artifacts-v1"
 DEFAULT_CACHE_NAMESPACE = "ragtime2-2026-v1"
+# Base for the retry backoff, in seconds. Module level so the offline suite can
+# drop it to zero instead of sleeping through every simulated failure.
+RETRY_BASE_SECONDS = 2.0
 
 
 def _http_status(error: BaseException) -> int | None:
@@ -339,7 +342,7 @@ class ArtifactStore:
                     raise ArtifactStoreRemoteError(
                         "failed to inspect the configured Hugging Face bucket"
                     ) from None
-                time.sleep(2.0 * 2**attempt)
+                time.sleep(RETRY_BASE_SECONDS * 2**attempt)
         if getattr(info, "private", None) is not True:
             raise ArtifactStoreRemoteError(
                 "configured Hugging Face bucket is not private"
@@ -386,27 +389,34 @@ class ArtifactStore:
         because the filesystem memoises the listing ``open()`` would repeat.
         """
 
-        try:
-            self._get_filesystem().info(remote_path)
-        except FileNotFoundError as error:
-            # FileNotFoundError is itself an OSError, so it has to be caught
-            # ahead of the HfHubHTTPError branch below.
-            status = _http_status(error)
-            if status is not None and status != 404:
+        # A throttle is not an answer, so retry it rather than handing the
+        # caller an error it can only treat as fatal. Several workers starting
+        # together reliably trip the bucket's rate limit, and every one of those
+        # calls would otherwise kill a topic.
+        for attempt in range(4):
+            try:
+                self._get_filesystem().info(remote_path)
+            except FileNotFoundError as error:
+                # FileNotFoundError is itself an OSError, so it has to be caught
+                # ahead of the HfHubHTTPError branch below.
+                status = _http_status(error)
+                if status is None or status == 404:
+                    if isinstance(error.__cause__, BucketNotFoundError):
+                        # The bucket, not the object, is missing: configuration.
+                        raise ArtifactStoreRemoteError(
+                            "configured Hugging Face bucket is unavailable"
+                        ) from None
+                    return False
+            except Exception:
+                pass
+            else:
+                return True
+            if attempt == 3:
                 raise ArtifactStoreRemoteError(
                     "artifact store could not determine whether the object exists"
                 ) from None
-            if isinstance(error.__cause__, BucketNotFoundError):
-                # The bucket, not the object, is missing: configuration.
-                raise ArtifactStoreRemoteError(
-                    "configured Hugging Face bucket is unavailable"
-                ) from None
-            return False
-        except Exception:
-            raise ArtifactStoreRemoteError(
-                "artifact store could not determine whether the object exists"
-            ) from None
-        return True
+            time.sleep(RETRY_BASE_SECONDS * 2**attempt)
+        return False
 
     def _read_remote(self, object_key: str) -> bytes | None:
         """Return bytes, or None only when the object is confirmed absent."""

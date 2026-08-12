@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import fsspec
 import httpx
+
+from trec_ragtime import artifact_store
 from huggingface_hub.errors import HfHubHTTPError
 
 from trec_ragtime.artifact_store import (
@@ -190,6 +192,11 @@ class FakeHfApi:
 
 class ArtifactStoreTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        # The store retries transient remote failures; sleeping through that in
+        # every failure-path test took the suite from 19s to over three minutes.
+        patcher = patch.object(artifact_store, "RETRY_BASE_SECONDS", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tempdir = tempfile.TemporaryDirectory()
         self.local_dir = Path(self.tempdir.name) / "artifacts"
         self.remote: dict[str, bytes] = {"owner/bucket/foo/object.mpk": b"remote"}
