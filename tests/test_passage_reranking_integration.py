@@ -288,6 +288,14 @@ class InMemoryFlashWireRunner:
             rows,
             schema_version=request["schema_version"],
             scorer_fingerprint=request["scorer_fingerprint"],
+            cache={
+                "status": "miss_written",
+                "object_key": "passage-score-requests/v1/integration/00/"
+                + "0" * 64
+                + ".mpk",
+                "row_count": len(rows),
+                "batch_count": 1,
+            },
         )
 
 
