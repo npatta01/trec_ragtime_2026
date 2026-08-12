@@ -5,16 +5,13 @@ from __future__ import annotations
 import hashlib
 import unittest
 from collections.abc import Sequence
-from dataclasses import replace
 from typing import Any
 
 import msgspec
 
 from trec_ragtime.nuggets import (
-    DEFAULT_MAX_NUGGETS,
     EvidenceCandidate,
     FacetEvidence,
-    Nugget,
     NuggetBundle,
     NuggetClusterer,
     NuggetError,
