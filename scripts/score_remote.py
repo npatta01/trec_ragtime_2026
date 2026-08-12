@@ -54,7 +54,12 @@ def main() -> int:
     parser.add_argument("--plan-key", default=None,
                         help="object key holding the plan, for remote runs")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--batch-size", type=int, default=32)
+    # Imported rather than repeated: this value feeds the scorer fingerprint,
+    # so a literal here that drifts from the library default would key remote
+    # scores under an identity no local run would ever look up.
+    from trec_ragtime.passage_scoring import DEFAULT_BATCH_SIZE
+
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
         "--shard", default="1/1",
         help="process only this shard of the plan, as i/n. Several single-process "

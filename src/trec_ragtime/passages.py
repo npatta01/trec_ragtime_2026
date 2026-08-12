@@ -40,7 +40,18 @@ def _load_splitters() -> tuple[type[Any], type[Any]]:
 
 
 def _paragraph_aware_spacy_splitter(spacy_splitter: type[Any]) -> type[Any]:
-    """Keep LangChain sentence merging inside blank-line-separated paragraphs."""
+    """Prefer paragraph boundaries as split points, but still fill the budget.
+
+    Sentence merging stays inside a paragraph, so a passage never straddles a
+    blank line mid-thought. Whole paragraphs are then packed together until the
+    next one would not fit.
+
+    Flushing at every blank line instead, as this did, made each paragraph its
+    own passage no matter how short. A headline or byline became a standalone
+    75-character passage while the sentence naming its subject sat in the next
+    one, which is how a citation ended up a few dozen characters away from the
+    entity its claim named.
+    """
 
     class ParagraphAwareSpacyTextSplitter(spacy_splitter):
         def _merge_splits(
@@ -48,15 +59,30 @@ def _paragraph_aware_spacy_splitter(spacy_splitter: type[Any]) -> type[Any]:
             splits: Iterable[str],
             separator: str,
         ) -> list[str]:
-            chunks: list[str] = []
-            paragraph: list[str] = []
+            paragraphs: list[list[str]] = []
+            current: list[str] = []
             for split in splits:
-                paragraph.append(split)
+                current.append(split)
                 if _BLANK_LINE_RE.search(split):
-                    chunks.extend(super()._merge_splits(paragraph, separator))
-                    paragraph = []
-            if paragraph:
-                chunks.extend(super()._merge_splits(paragraph, separator))
+                    paragraphs.append(current)
+                    current = []
+            if current:
+                paragraphs.append(current)
+
+            chunks: list[str] = []
+            group: list[str] = []
+            for paragraph in paragraphs:
+                combined = group + paragraph
+                too_long = (
+                    self._length_function(separator.join(combined)) > self._chunk_size
+                )
+                if group and too_long:
+                    chunks.extend(super()._merge_splits(group, separator))
+                    group = list(paragraph)
+                else:
+                    group = combined
+            if group:
+                chunks.extend(super()._merge_splits(group, separator))
             return chunks
 
     return ParagraphAwareSpacyTextSplitter
@@ -204,7 +230,9 @@ class PassageChunker:
         self,
         pair_length: object,
         *,
-        overlap_tokens: int = 64,
+        # Only documents past the window are split at all now, which is rare
+        # in this corpus; when it happens the seam deserves real context.
+        overlap_tokens: int = 256,
     ) -> None:
         if not callable(pair_length):
             raise PassageChunkingError("pair_length must be callable")

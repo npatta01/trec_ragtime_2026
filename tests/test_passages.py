@@ -189,7 +189,13 @@ class PassageValidationTests(unittest.TestCase):
 
 
 class PassageChunkerTests(unittest.TestCase):
-    def test_paragraph_preference_keeps_fit_paragraphs_separate(self) -> None:
+    def test_paragraphs_that_cannot_fit_together_split_on_the_blank_line(self) -> None:
+        """Renamed: the two paragraphs here total 8 words against a 6-word
+        budget, so this has only ever shown that a split lands on the paragraph
+        boundary rather than mid-paragraph. Whether paragraphs that DO fit stay
+        separate is a different property, covered by the test below.
+        """
+
         case = PARAGRAPH_PREFERENCE_CASE
         selected_text = str(case["selected_text"])
         passages = self.chunk_case(case)
@@ -209,6 +215,29 @@ class PassageChunkerTests(unittest.TestCase):
         self.assertEqual(
             [passage.boundary for passage in passages],
             case["expected_boundaries"],
+        )
+
+    def test_paragraphs_that_fit_are_packed_into_one_passage(self) -> None:
+        """A short paragraph must not become a passage of its own.
+
+        Flushing at every blank line made headlines and bylines standalone
+        passages of 75-200 characters, so the sentence naming their subject
+        landed in the next passage and the citation missed it by a few dozen
+        characters. Splitting still only happens on a blank line; it just waits
+        until the budget is actually spent.
+        """
+
+        case = dict(PARAGRAPH_PREFERENCE_CASE)
+        case["name"] = "paragraph_packing"
+        case["max_length"] = 64
+        case["max_passage_length"] = 32
+        case["expected_spans"] = [[0, 52]]
+        case["expected_boundaries"] = ["sentence"]
+        passages = self.chunk_case(case)
+
+        self.assertEqual(len(passages), 1)
+        self.assertEqual(
+            passages[0].text, "First alpha. First beta.\n\nSecond alpha. Second beta."
         )
 
     def test_oversized_span_uses_full_document_sentence_context(self) -> None:

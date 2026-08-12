@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import pathlib
 import unittest
 from types import SimpleNamespace
 from typing import Any
@@ -366,9 +367,16 @@ class ScorerIdentityTestCase(unittest.TestCase):
 
         from trec_ragtime.passage_scoring import DEFAULT_BATCH_SIZE, LocalCrossEncoderConfig
 
-        self.assertEqual(DEFAULT_BATCH_SIZE, 32)
+        # Assert the two agree, not what the number is. Pinning the literal
+        # made a deliberate change look like a regression while still not
+        # proving the remote scorer had followed it.
+        source = pathlib.Path("scripts/score_remote.py").read_text()
+        self.assertIn("default=DEFAULT_BATCH_SIZE", source)
+        self.assertNotRegex(source, r'"--batch-size", type=int, default=\d')
         self.assertEqual(
-            LocalCrossEncoderConfig(device="cuda", batch_size=32).fingerprint,
+            LocalCrossEncoderConfig(
+                device="cuda", batch_size=DEFAULT_BATCH_SIZE
+            ).fingerprint,
             LocalCrossEncoderConfig(device="cuda").fingerprint,
         )
 
