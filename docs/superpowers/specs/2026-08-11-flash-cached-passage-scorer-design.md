@@ -158,13 +158,13 @@ the scorer fingerprint.
 strict request/response validation and the synchronous-to-asynchronous bridge,
 but removes client-side model-batch job waves.
 
-### Exact-request cache codec
+### Worker-owned exact-request cache codec
 
-A small codec owns request digest construction, object-key construction,
-canonical artifact encoding, and typed validation. The local tests can exercise
-this codec directly. The self-contained Flash worker carries the same behavior
-inside its class boundary because `flash dev` ships only that class body.
-Parity tests prove both implementations produce the same keys and bytes.
+The self-contained Flash worker is the sole owner of request-digest
+construction, object-key construction, canonical artifact encoding, and typed
+validation. The local caller neither imports nor duplicates this cache code.
+Tests exercise the worker directly and execute its extracted class body with
+project imports blocked, matching `flash dev` transport.
 
 ### Flash worker
 
@@ -192,7 +192,7 @@ Offline tests must prove:
 - distinct requests cannot cross-hit;
 - transport size and model batch size are independent;
 - public scorer output is unchanged and contains no cache metadata;
-- worker/class-only and local codec behavior have byte-for-byte parity;
+- worker codec behavior survives class-only transport with identical bytes;
 - cache and worker errors contain no queries, passages, credentials, or raw
   exception payloads;
 - focused passage-scoring tests and the complete offline suite pass.

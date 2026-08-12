@@ -24,113 +24,93 @@
 
 ## File Structure
 
-- Create `src/trec_ragtime/flash_score_cache.py` for canonical identity, codec, and cache adapter.
 - Modify `src/trec_ragtime/flash_passage_scorer.py` for one-call transport and strict telemetry.
 - Modify `src/trec_ragtime/flash_worker.py` for cache-first execution, durable L1/L2, and internal batches.
-- Modify `src/trec_ragtime/__init__.py` for intentional exports.
-- Create `tests/test_flash_score_cache.py` and modify `tests/test_flash_passage_scorer.py` and `tests/test_passage_reranking_integration.py`.
+- Modify `tests/test_flash_passage_scorer.py` and `tests/test_passage_reranking_integration.py`.
 - Modify `README.md`.
 - Create `scripts/flash_cached_passage_smoke.py` and `docs/experiments/2026-08-11-flash-cached-passage-smoke.md`.
 
 ---
 
-### Task 1: Exact-Request Score Artifact
+### Task 1: Worker-Owned Exact-Request Score Artifact
 
 **Files:**
-- Create: `src/trec_ragtime/flash_score_cache.py`
-- Create: `tests/test_flash_score_cache.py`
-- Modify: `src/trec_ragtime/__init__.py`
+- Modify: `src/trec_ragtime/flash_worker.py`
+- Modify: `tests/test_flash_passage_scorer.py`
 
 **Interfaces:**
-- Consumes: `ArtifactStoreLike` and validated `bytes -> float` maps.
-- Produces: `FlashScoreIdentity`, `build_flash_score_identity()`, `flash_score_object_key()`, `encode_flash_score_artifact()`, `decode_flash_score_artifact()`, `ExactRequestScoreCache`.
+- Consumes: validated Flash request fields and finite `bytes -> float` maps.
+- Produces: private `FlashPassageWorker` methods `_cache_identity()`, `_cache_object_key()`, `_encode_cache_artifact()`, and `_decode_cache_artifact()`.
 
-- [ ] **Step 1: Write failing identity tests**
+- [ ] **Step 1: Write failing worker identity tests**
 
 ~~~python
-class IdentityTests(unittest.TestCase):
+class WorkerCacheIdentityTests(unittest.TestCase):
     def test_hash_order_does_not_change_identity(self) -> None:
-        left = build_flash_score_identity("scorer-v1", "query", [b"a" * 32, b"b" * 32])
-        right = build_flash_score_identity("scorer-v1", "query", [b"b" * 32, b"a" * 32])
-        self.assertEqual(left, right)
-        self.assertEqual(flash_score_object_key(left), flash_score_object_key(right))
-
-    def test_each_input_dimension_rotates_identity(self) -> None:
-        base = build_flash_score_identity("scorer-v1", "query", [b"a" * 32])
-        variants = (
-            build_flash_score_identity("scorer-v2", "query", [b"a" * 32]),
-            build_flash_score_identity("scorer-v1", "query!", [b"a" * 32]),
-            build_flash_score_identity("scorer-v1", "query", [b"b" * 32]),
+        left = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"a" * 32, b"b" * 32]
         )
-        self.assertTrue(all(value != base for value in variants))
+        right = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"b" * 32, b"a" * 32]
+        )
+        self.assertEqual(left, right)
+        self.assertEqual(
+            FlashPassageWorker._cache_object_key(left),
+            FlashPassageWorker._cache_object_key(right),
+        )
 ~~~
 
-- [ ] **Step 2: Run and verify the missing-module failure**
+Also prove scorer, exact query bytes, passage set, schema, and behavior each rotate identity.
 
-Run: `sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && uv run python -m unittest tests.test_flash_score_cache -v`
+- [ ] **Step 2: Run and verify the missing-method failure**
 
-Expected: FAIL because `trec_ragtime.flash_score_cache` does not exist.
+Run: `sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && uv run python -m unittest tests.test_flash_passage_scorer.WorkerCacheIdentityTests -v`
 
-- [ ] **Step 3: Implement frozen identity and digest**
+Expected: FAIL because the worker has no cache identity methods.
 
-~~~python
-CACHE_SCHEMA_VERSION = 1
-CACHE_BEHAVIOR_VERSION = "exact-request-v1"
-CACHE_OBJECT_ROOT = "passage-score-requests/v1"
-
-class FlashScoreIdentity(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    scorer_fingerprint: str
-    query_hash: bytes
-    passage_hashes: tuple[bytes, ...]
-    request_digest: bytes
-~~~
-
-`build_flash_score_identity()` validates nonblank/newline-free strings, exact 32-byte hashes, at least one passage, deduplicates/sorts hashes, hashes exact UTF-8 query bytes, and hashes canonical MessagePack over every identity field. The object path contains only fingerprint/request digests.
-
-- [ ] **Step 4: Write failing canonical artifact tests**
-
-Test stable bytes, sorted complete coverage, non-finite values, wrong identity, truncation, extra fields, noncanonical bytes, and absence of source text.
+- [ ] **Step 3: Implement private worker identity methods**
 
 ~~~python
-payload = encode_flash_score_artifact(
-    identity, {b"b" * 32: 2.0, b"a" * 32: 1.0}
+identity = (
+    CACHE_SCHEMA_VERSION,
+    CACHE_BEHAVIOR_VERSION,
+    scorer_fingerprint,
+    hashlib.sha256(query.encode("utf-8")).digest(),
+    tuple(sorted(set(passage_hashes))),
 )
+~~~
+
+Validate nonblank/newline-free strings, exact 32-byte hashes, and at least one passage. Hash canonical MessagePack over the identity. The object path contains only fingerprint and request digests.
+
+- [ ] **Step 4: Write failing artifact tests**
+
+Test stable canonical bytes, sorted complete coverage, non-finite values, wrong identity, truncation, extra fields, noncanonical bytes, and absence of source text.
+
+~~~python
+payload = FlashPassageWorker._encode_cache_artifact(identity, scores)
 self.assertEqual(
-    decode_flash_score_artifact(payload, identity),
-    {b"a" * 32: 1.0, b"b" * 32: 2.0},
+    FlashPassageWorker._decode_cache_artifact(payload, identity), scores
 )
 self.assertNotIn(b"query", payload)
 ~~~
 
-- [ ] **Step 5: Implement tuple-based canonical codec**
+- [ ] **Step 5: Implement private canonical artifact codec**
 
-Encode schema, behavior, scorer fingerprint, query hash, ordered passage hashes, and ordered hash/score pairs. Decode generic MessagePack, validate exact shape/types/coverage/finite values, re-encode, and require byte equality. Errors use `FlashScoreArtifactValidationError` and never echo payload values.
+Encode schema, behavior, scorer fingerprint, query hash, ordered passage hashes, and ordered hash/score pairs. Decode generic MessagePack, validate exact shape/types/coverage/finite values, re-encode, and require byte equality. Use fixed credential-safe worker errors.
 
-- [ ] **Step 6: Write failing cache-adapter tests**
+- [ ] **Step 6: Prove class-only ownership**
 
-~~~python
-cache = ExactRequestScoreCache(store)
-self.assertIsNone(cache.get(identity))
-winner = cache.put(identity, scores)
-self.assertEqual(winner, scores)
-self.assertEqual(cache.get(identity), scores)
-~~~
+Extract and execute `FlashPassageWorker` with project imports blocked, then assert the isolated class derives identical keys and artifact bytes. Do not create a local cache module, cache adapter, or public cache export.
 
-Cover refused write, exact L1 eviction, reread failure, malformed hit, and two complete duplicate writers.
+- [ ] **Step 7: Verify and commit**
 
-- [ ] **Step 7: Implement `ExactRequestScoreCache`**
-
-`get()` uses `read_validated`. `put()` validates, writes, evicts only the exact L1 candidate, independently rereads, and returns the validated winner. No locks or mutable merging.
-
-- [ ] **Step 8: Verify and commit**
-
-Run: `uv run python -m unittest tests.test_flash_score_cache -v`
+Run: `uv run python -m unittest tests.test_flash_passage_scorer.WorkerCacheIdentityTests tests.test_flash_passage_scorer.StaticFlashWorkerTests -v`
 
 Expected: PASS.
 
 ~~~bash
-git add src/trec_ragtime/flash_score_cache.py src/trec_ragtime/__init__.py tests/test_flash_score_cache.py
-git commit -m "feat: add exact-request passage score artifacts"
+git add src/trec_ragtime/flash_worker.py tests/test_flash_passage_scorer.py
+git commit -m "feat: add worker-owned passage score artifacts"
 ~~~
 
 ### Task 2: One-Call Flash Transport
@@ -140,7 +120,7 @@ git commit -m "feat: add exact-request passage score artifacts"
 - Modify: `tests/test_flash_passage_scorer.py`
 
 **Interfaces:**
-- Consumes: existing strict request codec and Task 1 identity.
+- Consumes: existing strict wire request and the worker-owned cache identity from Task 1.
 - Produces: one-request `RunpodFlashPassageScorer.score()` and strict private cache telemetry.
 
 - [ ] **Step 1: Replace wave tests with failing one-call tests**
@@ -198,7 +178,7 @@ git commit -m "refactor: send one logical Flash scoring request"
 - Modify: `tests/test_passage_reranking_integration.py`
 
 **Interfaces:**
-- Consumes: Task 1 tuple format and Task 2 response envelope.
+- Consumes: Task 1 worker-owned artifact format and Task 2 response envelope.
 - Produces: `FlashPassageWorker(loader=None, cache_store=None)` with cache-before-model behavior and internal batches.
 
 - [ ] **Step 1: Write failing hit/miss and micro-batch tests**
@@ -222,9 +202,9 @@ Run: `uv run python -m unittest tests.test_flash_passage_scorer.StaticFlashWorke
 
 Expected: FAIL because the worker always loads/scores.
 
-- [ ] **Step 3: Add class-contained cache identity/codec parity**
+- [ ] **Step 3: Connect Task 1's codec to cache I/O**
 
-Implement equivalents of Task 1 entirely inside `FlashPassageWorker` using method-local imports. Compare local and isolated-class digests, keys, bytes, and decoded maps. Preserve extracted-class execution with project imports blocked.
+Use only the existing private worker methods from Task 1. Preserve extracted-class execution with project imports blocked; do not introduce a caller-side or public cache implementation.
 
 - [ ] **Step 4: Add injected store and cache-first flow**
 
@@ -325,7 +305,6 @@ Keep caller usage as ordinary `rerank_retrieval(..., scorer=flash_scorer)`. Expl
 sops decrypt --output .env config/secrets.sops.env
 git check-ignore .env
 uv run python -m unittest \
-  tests.test_flash_score_cache \
   tests.test_passage_scoring \
   tests.test_passage_score_cache \
   tests.test_flash_passage_scorer \
