@@ -9,6 +9,9 @@ class FlashPassageWorker:
     """Self-contained Flash worker; only this class body is sent remotely."""
 
     _WIRE_SCHEMA_VERSION = 1
+    CACHE_SCHEMA_VERSION = 1
+    CACHE_BEHAVIOR_VERSION = "exact-request-v1"
+    CACHE_OBJECT_ROOT = "passage-score-requests/v1"
     _FINGERPRINT_PREFIX = "local-cross-encoder-v3/"
     _ERROR = ValueError
     _CONFIG_FIELDS = (
@@ -217,6 +220,207 @@ class FlashPassageWorker:
             )
         )
         return cls._FINGERPRINT_PREFIX + hashlib.sha256(material).hexdigest()
+
+    @classmethod
+    def _cache_identity(
+        cls,
+        scorer_fingerprint: object,
+        query: object,
+        passage_hashes: object,
+    ) -> tuple[object, ...]:
+        """Return the canonical identity for one exact scoring request."""
+
+        import hashlib
+
+        import msgspec
+
+        scorer = cls._non_blank(scorer_fingerprint, "scorer_fingerprint")
+        query_text = cls._non_blank(query, "query")
+        if isinstance(passage_hashes, (str, bytes, bytearray)):
+            raise cls._error("cache passage hashes must be a sequence")
+        try:
+            values = tuple(passage_hashes)  # type: ignore[arg-type]
+        except Exception as error:
+            raise cls._error("cache passage hashes must be a sequence") from error
+        if not values:
+            raise cls._error("cache identity requires at least one passage")
+
+        unique: set[bytes] = set()
+        for content_hash in values:
+            if not isinstance(content_hash, bytes) or len(content_hash) != 32:
+                raise cls._error("cache passage hash must be exactly 32 bytes")
+            unique.add(content_hash)
+        try:
+            query_hash = hashlib.sha256(query_text.encode("utf-8")).digest()
+            identity = (
+                cls.CACHE_SCHEMA_VERSION,
+                cls.CACHE_BEHAVIOR_VERSION,
+                scorer,
+                query_hash,
+                tuple(sorted(unique)),
+            )
+            msgspec.msgpack.encode(identity)
+        except Exception as error:
+            raise cls._error("cache identity is invalid") from error
+        return identity
+
+    @classmethod
+    def _validated_cache_identity(cls, identity: object) -> tuple[object, ...]:
+        """Validate the private tuple representation used by cache methods."""
+
+        if not isinstance(identity, tuple) or len(identity) != 5:
+            raise cls._error("cache identity is invalid")
+        schema_version, behavior_version, scorer, query_hash, passage_hashes = identity
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version <= 0
+        ):
+            raise cls._error("cache identity is invalid")
+        try:
+            behavior = cls._non_blank(behavior_version, "cache behavior")
+            scorer_name = cls._non_blank(scorer, "scorer_fingerprint")
+        except ValueError as error:
+            raise cls._error("cache identity is invalid") from error
+        if not isinstance(query_hash, bytes) or len(query_hash) != 32:
+            raise cls._error("cache identity is invalid")
+        if not isinstance(passage_hashes, tuple) or not passage_hashes:
+            raise cls._error("cache identity is invalid")
+        if any(
+            not isinstance(content_hash, bytes) or len(content_hash) != 32
+            for content_hash in passage_hashes
+        ):
+            raise cls._error("cache identity is invalid")
+        if tuple(sorted(set(passage_hashes))) != passage_hashes:
+            raise cls._error("cache identity is invalid")
+        return (schema_version, behavior, scorer_name, query_hash, passage_hashes)
+
+    @classmethod
+    def _cache_object_key(cls, identity: object) -> str:
+        """Return a content-addressed, source-text-free artifact path."""
+
+        import hashlib
+
+        import msgspec
+
+        normalized = cls._validated_cache_identity(identity)
+        scorer = normalized[2]
+        try:
+            request_digest = hashlib.sha256(msgspec.msgpack.encode(normalized)).hexdigest()
+        except Exception as error:
+            raise cls._error("cache identity is invalid") from error
+        return (
+            f"{cls.CACHE_OBJECT_ROOT}/{scorer}/"
+            f"{request_digest[:2]}/{request_digest}.mpk"
+        )
+
+    @classmethod
+    def _encode_cache_artifact(cls, identity: object, scores: object) -> bytes:
+        """Encode a complete finite score map in canonical MessagePack."""
+
+        import math
+        import numbers
+        from collections.abc import Mapping
+
+        import msgspec
+
+        normalized_identity = cls._validated_cache_identity(identity)
+        if not isinstance(scores, Mapping):
+            raise cls._error("cache scores must be a map")
+        passage_hashes = normalized_identity[4]
+        normalized_scores: dict[bytes, float] = {}
+        try:
+            for content_hash, value in scores.items():
+                if not isinstance(content_hash, bytes) or len(content_hash) != 32:
+                    raise cls._error("cache score hash must be exactly 32 bytes")
+                if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                    raise cls._error("cache score must be finite")
+                score = float(value)
+                if not math.isfinite(score):
+                    raise cls._error("cache score must be finite")
+                normalized_scores[content_hash] = score
+        except (OverflowError, TypeError, ValueError) as error:
+            if isinstance(error, cls._ERROR):
+                raise
+            raise cls._error("cache score must be finite") from error
+        if set(normalized_scores) != set(passage_hashes):
+            raise cls._error("cache scores do not cover the request")
+
+        pairs = tuple(
+            (content_hash, normalized_scores[content_hash])
+            for content_hash in passage_hashes
+        )
+        envelope = (
+            normalized_identity[0],
+            normalized_identity[1],
+            normalized_identity[2],
+            normalized_identity[3],
+            normalized_identity[4],
+            pairs,
+        )
+        try:
+            return msgspec.msgpack.encode(envelope)
+        except Exception as error:
+            raise cls._error("cache artifact encoding failed") from error
+
+    @classmethod
+    def _decode_cache_artifact(
+        cls,
+        payload: object,
+        identity: object,
+    ) -> dict[bytes, float]:
+        """Decode and strictly validate one complete cache artifact."""
+
+        import math
+        import numbers
+
+        import msgspec
+
+        normalized_identity = cls._validated_cache_identity(identity)
+        if not isinstance(payload, bytes):
+            raise cls._error("cache artifact is malformed")
+        try:
+            decoded = msgspec.msgpack.decode(payload)
+        except Exception as error:
+            raise cls._error("cache artifact is malformed") from error
+        if not isinstance(decoded, list) or len(decoded) != 6:
+            raise cls._error("cache artifact is malformed")
+        if decoded[:5] != [
+            normalized_identity[0],
+            normalized_identity[1],
+            normalized_identity[2],
+            normalized_identity[3],
+            list(normalized_identity[4]),
+        ]:
+            raise cls._error("cache artifact identity mismatch")
+        pairs = decoded[5]
+        if not isinstance(pairs, list) or len(pairs) != len(normalized_identity[4]):
+            raise cls._error("cache artifact coverage is incomplete")
+
+        scores: dict[bytes, float] = {}
+        for expected_hash, pair in zip(normalized_identity[4], pairs, strict=True):
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise cls._error("cache artifact scores are malformed")
+            content_hash, value = pair
+            if content_hash != expected_hash:
+                raise cls._error("cache artifact coverage is invalid")
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                raise cls._error("cache artifact score is invalid")
+            try:
+                score = float(value)
+            except (OverflowError, TypeError, ValueError) as error:
+                raise cls._error("cache artifact score is invalid") from error
+            if not math.isfinite(score):
+                raise cls._error("cache artifact score is invalid")
+            scores[content_hash] = score
+
+        try:
+            canonical = cls._encode_cache_artifact(normalized_identity, scores)
+        except cls._ERROR:
+            raise cls._error("cache artifact is malformed")
+        if canonical != payload:
+            raise cls._error("cache artifact is not canonical")
+        return scores
 
     def __init__(self, loader: object | None = None) -> None:
         import threading

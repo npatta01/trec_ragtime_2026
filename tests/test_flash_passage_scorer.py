@@ -7,6 +7,7 @@ import json
 import inspect
 from io import StringIO
 import math
+import msgspec
 import sys
 import threading
 import types
@@ -709,6 +710,186 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         with self.assertRaises(FlashScoringError):
             runner.run_batch_sync(request)
         self.assertEqual(cancelled, [True])
+
+
+class WorkerCacheIdentityTests(unittest.TestCase):
+    def test_hash_order_does_not_change_identity(self) -> None:
+        left = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"a" * 32, b"b" * 32]
+        )
+        right = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"b" * 32, b"a" * 32]
+        )
+
+        self.assertEqual(left, right)
+        self.assertEqual(
+            FlashPassageWorker._cache_object_key(left),
+            FlashPassageWorker._cache_object_key(right),
+        )
+
+    def test_identity_rotates_for_every_request_dimension(self) -> None:
+        base = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"a" * 32]
+        )
+        variants = (
+            FlashPassageWorker._cache_identity(
+                "scorer-v2", "query", [b"a" * 32]
+            ),
+            FlashPassageWorker._cache_identity(
+                "scorer-v1", "query!", [b"a" * 32]
+            ),
+            FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"b" * 32]
+            ),
+        )
+
+        self.assertTrue(all(value != base for value in variants))
+        self.assertEqual(base[0], FlashPassageWorker.CACHE_SCHEMA_VERSION)
+        self.assertEqual(base[1], FlashPassageWorker.CACHE_BEHAVIOR_VERSION)
+
+    def test_schema_and_behavior_versions_rotate_identity(self) -> None:
+        original_schema = FlashPassageWorker.CACHE_SCHEMA_VERSION
+        original_behavior = FlashPassageWorker.CACHE_BEHAVIOR_VERSION
+        try:
+            base = FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"a" * 32]
+            )
+            FlashPassageWorker.CACHE_SCHEMA_VERSION = original_schema + 1
+            schema_variant = FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"a" * 32]
+            )
+            FlashPassageWorker.CACHE_SCHEMA_VERSION = original_schema
+            FlashPassageWorker.CACHE_BEHAVIOR_VERSION = original_behavior + "-next"
+            behavior_variant = FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"a" * 32]
+            )
+        finally:
+            FlashPassageWorker.CACHE_SCHEMA_VERSION = original_schema
+            FlashPassageWorker.CACHE_BEHAVIOR_VERSION = original_behavior
+
+        self.assertNotEqual(base, schema_variant)
+        self.assertNotEqual(base, behavior_variant)
+
+    def test_identity_rejects_malformed_fields(self) -> None:
+        invalid = (
+            ("", "query", [b"a" * 32]),
+            ("scorer\n", "query", [b"a" * 32]),
+            ("scorer", "", [b"a" * 32]),
+            ("scorer", "query\n", [b"a" * 32]),
+            ("scorer", "query", []),
+            ("scorer", "query", [b"a" * 31]),
+            ("scorer", "query", ["a" * 32]),
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                FlashPassageWorker._cache_identity(*values)
+
+
+class WorkerCacheArtifactTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.identity = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query-sensitive", [b"b" * 32, b"a" * 32]
+        )
+        self.scores = {b"b" * 32: 2, b"a" * 32: 1.5}
+
+    def test_artifact_bytes_are_canonical_and_complete(self) -> None:
+        payload = FlashPassageWorker._encode_cache_artifact(
+            self.identity, self.scores
+        )
+
+        self.assertEqual(
+            FlashPassageWorker._decode_cache_artifact(payload, self.identity),
+            {b"a" * 32: 1.5, b"b" * 32: 2.0},
+        )
+        self.assertEqual(
+            payload,
+            FlashPassageWorker._encode_cache_artifact(
+                self.identity, {b"a" * 32: 1.5, b"b" * 32: 2.0}
+            ),
+        )
+        self.assertNotIn(b"query-sensitive", payload)
+        decoded = msgspec.msgpack.decode(payload)
+        self.assertEqual(
+            [row[0] for row in decoded[-1]], [b"a" * 32, b"b" * 32]
+        )
+
+    def test_encode_requires_exact_finite_score_coverage(self) -> None:
+        for scores in (
+            {b"a" * 32: 1.0},
+            {b"a" * 32: 1.0, b"b" * 32: 2.0, b"c" * 32: 3.0},
+            {b"a" * 32: math.nan, b"b" * 32: 2.0},
+            {b"a" * 32: math.inf, b"b" * 32: 2.0},
+            {b"a" * 32: True, b"b" * 32: 2.0},
+        ):
+            with self.subTest(scores=scores), self.assertRaises(ValueError):
+                FlashPassageWorker._encode_cache_artifact(self.identity, scores)
+
+    def test_decode_rejects_foreign_truncated_extra_noncanonical_and_bad_artifacts(
+        self,
+    ) -> None:
+        payload = FlashPassageWorker._encode_cache_artifact(
+            self.identity, self.scores
+        )
+        foreign = FlashPassageWorker._cache_identity(
+            "scorer-v1", "other-query", [b"b" * 32, b"a" * 32]
+        )
+        decoded = msgspec.msgpack.decode(payload)
+        cases = (
+            (payload[:-1], self.identity),
+            (msgspec.msgpack.encode(list(decoded) + ["extra"]), self.identity),
+            (msgspec.msgpack.encode(decoded[:-1]), self.identity),
+            (msgspec.msgpack.encode(decoded), foreign),
+            (msgspec.msgpack.encode(decoded[:-1] + [decoded[-1][::-1]]), self.identity),
+            (payload + b"\x00", self.identity),
+        )
+        for candidate, identity in cases:
+            with self.subTest(candidate=candidate[:20], identity=identity), self.assertRaises(
+                ValueError
+            ):
+                FlashPassageWorker._decode_cache_artifact(candidate, identity)
+
+        malformed = msgspec.msgpack.encode(
+            [
+                decoded[0],
+                decoded[1],
+                decoded[2],
+                decoded[3],
+                decoded[4],
+                [[b"a" * 32, math.nan], [b"b" * 32, 2.0]],
+            ]
+        )
+        with self.assertRaises(ValueError):
+            FlashPassageWorker._decode_cache_artifact(malformed, self.identity)
+
+    def test_codec_errors_do_not_echo_source_text(self) -> None:
+        query = b"query-sensitive"
+        payload = FlashPassageWorker._encode_cache_artifact(
+            FlashPassageWorker._cache_identity("scorer-v1", query.decode(), [b"a" * 32]),
+            {b"a" * 32: 1.0},
+        )
+        with self.assertRaises(ValueError) as raised:
+            FlashPassageWorker._decode_cache_artifact(payload[:-1], self.identity)
+        self.assertNotIn(query.decode(), str(raised.exception))
+
+    def test_isolated_worker_has_identical_identity_and_artifact_codec(self) -> None:
+        source = inspect.getsource(FlashPassageWorker)
+        namespace = {"__name__": "flash_worker_isolated"}
+        with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
+            exec(compile(source, "<flash-worker>", "exec"), namespace)
+        isolated = namespace["FlashPassageWorker"]
+
+        isolated_identity = isolated._cache_identity(
+            "scorer-v1", "query-sensitive", [b"b" * 32, b"a" * 32]
+        )
+        self.assertEqual(isolated_identity, self.identity)
+        self.assertEqual(
+            isolated._cache_object_key(isolated_identity),
+            FlashPassageWorker._cache_object_key(self.identity),
+        )
+        self.assertEqual(
+            isolated._encode_cache_artifact(isolated_identity, self.scores),
+            FlashPassageWorker._encode_cache_artifact(self.identity, self.scores),
+        )
 
 
 class StaticFlashWorkerTests(unittest.TestCase):
