@@ -252,6 +252,44 @@ class RerankDocumentCapTestCase(unittest.TestCase):
         self.assertEqual(len(_head(self._retrieval(5), 20).documents), 5)
 
 
+class ScorerTransportTestCase(unittest.TestCase):
+    def test_local_is_the_default_and_honours_device(self) -> None:
+        from contextlib import ExitStack
+
+        from trec_ragtime.nuggets_cli import _open_scorer
+
+        arguments = build_parser().parse_args(["--model", "m", "--device", "cuda"])
+        with ExitStack() as stack:
+            config, scorer = _open_scorer(arguments, stack)
+        self.assertEqual(config.effective_device, "cuda")
+        self.assertEqual(type(scorer).__name__, "LocalCrossEncoderScorer")
+
+    def test_rocm_is_normalised_to_the_torch_device(self) -> None:
+        from contextlib import ExitStack
+
+        from trec_ragtime.nuggets_cli import _open_scorer
+
+        arguments = build_parser().parse_args(["--model", "m", "--device", "rocm"])
+        with ExitStack() as stack:
+            config, _ = _open_scorer(arguments, stack)
+        self.assertEqual(config.effective_device, "cuda")
+
+    def test_flash_without_an_endpoint_is_refused(self) -> None:
+        from contextlib import ExitStack
+
+        from trec_ragtime.nuggets_cli import _open_scorer
+
+        arguments = build_parser().parse_args(["--model", "m", "--scorer", "flash"])
+        with ExitStack() as stack:
+            with self.assertRaisesRegex(ValueError, "flash-endpoint-id"):
+                _open_scorer(arguments, stack)
+
+    def test_flash_exits_two_rather_than_traceback(self) -> None:
+        from trec_ragtime.nuggets_cli import main
+
+        self.assertEqual(main(["--model", "m", "--scorer", "flash"]), 2)
+
+
 class ParserTestCase(unittest.TestCase):
     def test_requires_a_model(self) -> None:
         with self.assertRaises(SystemExit):

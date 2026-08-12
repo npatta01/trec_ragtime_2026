@@ -20,6 +20,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,36 @@ def _head(retrieval: Any, documents: int) -> Any:
     )
 
 
+def _open_scorer(arguments: argparse.Namespace, stack: ExitStack) -> tuple[Any, Any]:
+    """Return ``(model_config, scorer)`` for the requested transport.
+
+    Flash scores on a remote GPU; the chunker still needs the *same* model
+    policy, so it comes from the Flash config rather than being rebuilt locally.
+    """
+
+    from .passage_scoring import LocalCrossEncoderConfig, LocalCrossEncoderScorer
+
+    if arguments.scorer == "local":
+        config = LocalCrossEncoderConfig(device=arguments.device)
+        return config, LocalCrossEncoderScorer(config)
+
+    if not arguments.flash_endpoint_id:
+        raise ValueError("--scorer flash requires --flash-endpoint-id")
+    from .flash_passage_scorer import (
+        FlashEndpointBatchRunner,
+        RunpodFlashConfig,
+        RunpodFlashPassageScorer,
+    )
+
+    flash = RunpodFlashConfig(
+        endpoint_id=arguments.flash_endpoint_id,
+        model_config=LocalCrossEncoderConfig(device="cuda"),
+    )
+    runner = stack.enter_context(FlashEndpointBatchRunner(flash))
+    scorer = stack.enter_context(RunpodFlashPassageScorer(flash, runner))
+    return flash.effective_model_config, scorer
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ragtime-nuggets",
@@ -224,6 +255,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--representation", choices=("canonical", "report_text"), default="report_text"
     )
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument(
+        "--scorer", choices=("local", "flash"), default="local",
+        help="cross-encoder transport. 'flash' scores on a Runpod GPU endpoint "
+             "and needs --flash-endpoint-id.",
+    )
+    parser.add_argument(
+        "--flash-endpoint-id", default=None,
+        help="an existing Runpod endpoint running the passage-scoring worker",
+    )
     parser.add_argument(
         "--device", default="cpu",
         help="cross-encoder device: cpu, cuda, cuda:N, or rocm. "
@@ -261,12 +301,12 @@ def select_plans(
 def main(argv: Sequence[str] | None = None) -> int:
     from dotenv import load_dotenv
 
-    from .passage_scoring import LocalCrossEncoderConfig, LocalCrossEncoderScorer
-
     arguments = build_parser().parse_args(argv)
     load_dotenv()
 
     try:
+        if arguments.scorer == "flash" and not arguments.flash_endpoint_id:
+            raise ValueError("--scorer flash requires --flash-endpoint-id")
         plans = select_plans(
             load_query_plans(arguments.query_plan or default_query_plan_path()),
             arguments.topic_ids,
@@ -298,12 +338,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_nuggets=arguments.max_nuggets,
     )
     store = ArtifactStore.from_env()
-    scorer_config = LocalCrossEncoderConfig(device=arguments.device)
-    scorer = LocalCrossEncoderScorer(scorer_config)
 
     outcomes: list[TopicOutcome] = []
     work: list[TopicWork] = []
-    with RagtimeRetriever.from_env() as retriever:
+    with ExitStack() as stack:
+        scorer_config, scorer = _open_scorer(arguments, stack)
+        retriever = stack.enter_context(RagtimeRetriever.from_env())
         for plan in plans:
             prepared = prepare_topic(
                 plan,
