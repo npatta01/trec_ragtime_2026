@@ -134,6 +134,16 @@ class NuggetizerBackend:
         self.config = config
         self._nuggetizer = build(config) if nuggetizer is None else nuggetizer
 
+    @property
+    def fingerprint(self) -> Mapping[str, object]:
+        """Identify everything about this backend that can change a result."""
+
+        return {
+            "package": dict(package_identity()),
+            "config": msgspec.structs.asdict(self.config),
+            "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        }
+
     def create(
         self, *, topic_id: str, query: str, passages: Sequence[tuple[str, str]]
     ) -> tuple[tuple[str, str], ...]:

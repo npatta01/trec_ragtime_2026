@@ -184,6 +184,9 @@ class AliasedPassage:
 class NuggetBackend(Protocol):
     """The nuggetization operations the stage may use."""
 
+    @property
+    def fingerprint(self) -> Mapping[str, object]: ...
+
     def create(
         self, *, topic_id: str, query: str, passages: Sequence[tuple[str, str]]
     ) -> tuple[tuple[str, str], ...]: ...
@@ -277,6 +280,26 @@ class NuggetClusterer:
         self._embed = embed
         self._threshold = threshold
         self._embed_lock = threading.Lock()
+        self._injected = embed is not None
+
+    @property
+    def fingerprint(self) -> Mapping[str, object]:
+        """Identify what this clusterer will actually do, not what it defaults to.
+
+        An injected embedder reports as such rather than borrowing the pinned
+        model's identity, so a bundle clustered by a stand-in can never share a
+        cache key with one clustered by the real model.
+        """
+
+        return {
+            "embedder": (
+                "injected"
+                if self._injected
+                else f"{EMBEDDING_MODEL}@{EMBEDDING_REVISION}"
+            ),
+            "threshold": self._threshold,
+            "guard_version": GUARD_VERSION,
+        }
 
     def _resolve_embedder(self) -> Embedder:
         # run_topics shares one clusterer across threads, so without this every

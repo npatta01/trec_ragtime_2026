@@ -156,6 +156,16 @@ uv run jupyter lab notebooks/ragtime_single_query.ipynb
   table, so a reworded question, or an altered alias, document, or offset,
   cannot be read back under the same key. Any new result-affecting input must
   join the fingerprint or the request and its isolation tests.
+- The nugget fingerprint asks `NuggetizerBackend` and `NuggetClusterer` for
+  their own identity rather than copying their settings, the same contract
+  `PassageScoreCache` has with `PassageScorer`. A clusterer built with an
+  injected embedder reports as `injected`, so a stand-in can never write under
+  a key the pinned model would produce. Keep new collaborators reporting their
+  own identity instead of adding fields that restate it.
+- `facet_index` is caller-supplied and no downstream check can independently
+  verify it, so `ragtime-nuggets` carries the query plan's numbering into both
+  the projected facets and the recorded inputs from one loop. A facet with no
+  cached retrieval is skipped, never renumbered.
 - Cache keys must include the endpoint, operation, namespace, and exact request,
   but never the bearer token. Cache only validated successful responses.
 - The OpenAI-compatible chat-completion cache stores the complete validated

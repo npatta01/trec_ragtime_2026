@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from trec_ragtime.nugget_cache import NuggetArtifactCache, NuggetInput
-from trec_ragtime.nuggetizer_adapter import NuggetizerConfig
+from trec_ragtime.nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig
 from trec_ragtime.nuggets import (
     FacetEvidence,
     NuggetClusterer,
@@ -35,7 +35,9 @@ from tests.test_nuggets import ScriptedBackend, candidate, fixed_embedder
 
 CLAIM = "grain exports fell"
 FINGERPRINT = build_fingerprint(
-    NuggetizerConfig(model="test-model", max_nuggets=20),
+    NuggetizerBackend(NuggetizerConfig(model="test-model", max_nuggets=20),
+                      nuggetizer=object()),
+    NuggetClusterer(embed=fixed_embedder({})),
     provider_base_url="https://provider/v1",
 )
 

@@ -1,0 +1,258 @@
+"""``ragtime-nuggets``: build sealed nugget bundles for planned topics.
+
+A thin shell over :mod:`trec_ragtime.nuggets_runner`, which stays the supported
+Python API. Nothing result-affecting lives here; this module resolves inputs,
+prepares passages through the reranking stage, and reports sanitized outcomes.
+
+This is also where facet numbering is decided. ``facet_index`` is caller-supplied
+data that no downstream check can independently verify, so the query plan's own
+enumeration is carried through to both the projected facets and the recorded
+inputs from a single loop -- a facet with no cached retrieval is skipped without
+renumbering the ones around it.
+
+Retrieval is read from the artifact cache only. A topic whose facets have not
+been retrieved yet is reported, never turned into an organizer request.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from .artifact_store import ArtifactStore
+from .nugget_cache import NuggetArtifactCache, NuggetInput
+from .nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig
+from .nuggets import DEFAULT_EVIDENCE_BUDGET, DEFAULT_MAX_NUGGETS, NuggetClusterer
+from .nuggets_runner import (
+    DEFAULT_CONCURRENCY,
+    TopicOutcome,
+    TopicWork,
+    build_fingerprint,
+    evidence_from_reranking,
+    run_topics,
+    write_manifest,
+)
+from .query_baselines import PIPELINE, QueryPlan, default_query_plan_path, load_query_plans
+from .retriever import RagtimeRetriever
+
+
+DEFAULT_TOP_K = 100
+
+
+def plan_queries(plan: QueryPlan) -> tuple[tuple[int, str], ...]:
+    """Enumerate one topic's facets: index 0 is the single query."""
+
+    return tuple(enumerate((plan.single_query, *plan.facet_queries)))
+
+
+def prepare_topic(
+    plan: QueryPlan,
+    *,
+    retriever: Any,
+    store: Any,
+    scorer: Any,
+    scorer_config: Any,
+    representation: str,
+    top_k: int,
+) -> TopicWork | None:
+    """Rerank each planned facet that has a cached retrieval, keeping its index.
+
+    Returns ``None`` when no facet has one, so an unretrieved topic is reported
+    rather than silently half-processed.
+    """
+
+    from .passage_score_cache import CachedPassageScorer, PassageScoreCache
+    from .passage_scoring import CrossEncoderPairLengthFunction
+    from .passages import PassageChunker
+    from .reranking import rerank_retrieval
+
+    indices: list[int] = []
+    queries: list[str] = []
+    results: list[Any] = []
+    inputs: list[NuggetInput] = []
+    sources: list[str] = []
+
+    for facet_index, query in plan_queries(plan):
+        retrieval = retriever.get_cached_retrieval(query, pipeline=PIPELINE, top_k=top_k)
+        if retrieval is None:
+            continue
+        # The pair-length function is query-specific, so the chunker is too.
+        chunker = PassageChunker(CrossEncoderPairLengthFunction(scorer_config, query))
+        score_cache = PassageScoreCache(
+            store,
+            scorer,
+            chunker_fingerprint=chunker.fingerprint,
+            representation=representation,
+        )
+        results.append(
+            rerank_retrieval(
+                retrieval,
+                chunker=chunker,
+                scorer=CachedPassageScorer(score_cache),
+                representation=representation,  # type: ignore[arg-type]
+            )
+        )
+        # Both sides of the facet mapping are appended here, from the same
+        # plan index, so they cannot drift apart.
+        indices.append(facet_index)
+        queries.append(query)
+        reference = retrieval.retrieval_artifact
+        inputs.append(
+            NuggetInput(
+                facet_index=facet_index,
+                query=query,
+                object_key=getattr(reference, "object_key", ""),
+                request_digest=getattr(reference, "request_digest", b"\x00" * 32),
+            )
+        )
+        sources.append(f"{chunker.fingerprint}|{score_cache.fingerprint}")
+
+    if not results:
+        return None
+    return TopicWork(
+        topic_id=plan.topic_id,
+        query=plan.single_query,
+        representation=representation,
+        facets=evidence_from_reranking(
+            results, queries=queries, facet_indices=indices
+        ),
+        inputs=tuple(inputs),
+        passage_source_fingerprint="|".join((representation, *sources)),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ragtime-nuggets",
+        description="Build sealed source-linked nugget bundles per topic.",
+    )
+    parser.add_argument("--model", required=True, help="provider model identifier")
+    parser.add_argument(
+        "--topic-id", action="append", dest="topic_ids", default=None,
+        help="restrict the run to these topics (repeatable)",
+    )
+    parser.add_argument("--query-plan", type=Path, default=None)
+    parser.add_argument(
+        "--representation", choices=("canonical", "report_text"), default="report_text"
+    )
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--evidence-budget", type=int, default=DEFAULT_EVIDENCE_BUDGET)
+    parser.add_argument("--max-nuggets", type=int, default=DEFAULT_MAX_NUGGETS)
+    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    parser.add_argument("--manifest", type=Path, default=None)
+    return parser
+
+
+def select_plans(
+    plans: Sequence[QueryPlan], topic_ids: Sequence[str] | None
+) -> tuple[QueryPlan, ...]:
+    """Filter to the requested topics, rejecting any that the plan lacks."""
+
+    if not topic_ids:
+        return tuple(plans)
+    wanted = set(topic_ids)
+    selected = tuple(plan for plan in plans if plan.topic_id in wanted)
+    missing = wanted - {plan.topic_id for plan in selected}
+    if missing:
+        raise ValueError(f"unknown topics: {sorted(missing)}")
+    return selected
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    from dotenv import load_dotenv
+
+    from .passage_scoring import LocalCrossEncoderConfig, LocalCrossEncoderScorer
+
+    arguments = build_parser().parse_args(argv)
+    load_dotenv()
+
+    try:
+        plans = select_plans(
+            load_query_plans(arguments.query_plan or default_query_plan_path()),
+            arguments.topic_ids,
+        )
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if not plans:
+        print("no topics selected", file=sys.stderr)
+        return 2
+
+    config = NuggetizerConfig(model=arguments.model, max_nuggets=arguments.max_nuggets)
+    clusterer = NuggetClusterer()
+    fingerprint = build_fingerprint(
+        NuggetizerBackend(config),
+        clusterer,
+        provider_base_url=os.environ.get(
+            "OPENAI_BASE_URL", "https://api.openai.com/v1"
+        ),
+        evidence_budget=arguments.evidence_budget,
+        max_nuggets=arguments.max_nuggets,
+    )
+    store = ArtifactStore.from_env()
+    scorer_config = LocalCrossEncoderConfig()
+    scorer = LocalCrossEncoderScorer(scorer_config)
+
+    outcomes: list[TopicOutcome] = []
+    work: list[TopicWork] = []
+    with RagtimeRetriever.from_env() as retriever:
+        for plan in plans:
+            prepared = prepare_topic(
+                plan,
+                retriever=retriever,
+                store=store,
+                scorer=scorer,
+                scorer_config=scorer_config,
+                representation=arguments.representation,
+                top_k=arguments.top_k,
+            )
+            if prepared is None:
+                outcomes.append(
+                    TopicOutcome(
+                        plan.topic_id, "failed", reason="no cached facet retrieval"
+                    )
+                )
+            else:
+                work.append(prepared)
+
+    outcomes.extend(
+        run_topics(
+            work,
+            cache=NuggetArtifactCache(store),
+            fingerprint=fingerprint,
+            backend_factory=lambda: NuggetizerBackend(config),
+            clusterer=clusterer,
+            concurrency=arguments.concurrency,
+        )
+    )
+    outcomes.sort(key=lambda outcome: outcome.topic_id)
+    if arguments.manifest is not None:
+        write_manifest(arguments.manifest, outcomes, model=arguments.model)
+    print(
+        json.dumps(
+            {
+                status: sum(outcome.status == status for outcome in outcomes)
+                for status in ("written", "cached", "failed")
+            }
+        )
+    )
+    return 0 if all(outcome.status != "failed" for outcome in outcomes) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = [
+    "DEFAULT_TOP_K",
+    "build_parser",
+    "main",
+    "plan_queries",
+    "prepare_topic",
+    "select_plans",
+]

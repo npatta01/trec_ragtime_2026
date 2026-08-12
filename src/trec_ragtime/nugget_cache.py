@@ -33,20 +33,19 @@ class NuggetFingerprint(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
 
     schema_version: int
     behavior_version: str
-    package: Mapping[str, str]
-    nuggetizer_config: Mapping[str, object]
+    # Reported by the objects that do the work, not copied from their defaults,
+    # so a fingerprint cannot describe a backend or clusterer other than the one
+    # that will run. See NuggetizerBackend.fingerprint / NuggetClusterer.fingerprint.
+    backend: Mapping[str, object]
+    clusterer: Mapping[str, object]
     provider_base_url_digest: bytes
-    embedding_model: str
-    embedding_revision: str
-    similarity_threshold: float
-    guard_version: str
+    # Limits enforced by module constants rather than by an object: they decide
+    # what the model may emit and what survives the atomicity guard, so editing
+    # one has to retire previous artifacts.
+    claim_limits: Mapping[str, int]
     support_labels: tuple[str, ...]
     evidence_budget: int
     max_nuggets: int
-    # Limits that decide what the model may emit and what survives the atomicity
-    # guard. They live here so editing one retires previous artifacts instead of
-    # silently changing what a cached bundle means.
-    output_limits: Mapping[str, int]
 
     @property
     def digest(self) -> bytes:

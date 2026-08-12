@@ -10,7 +10,7 @@ from typing import Any
 import msgspec
 
 from trec_ragtime.artifact_store import ArtifactValidationError
-from trec_ragtime.nuggetizer_adapter import NuggetizerConfig
+from trec_ragtime.nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig
 from trec_ragtime.nugget_cache import (
     NUGGET_OBJECT_KEY_PREFIX,
     NuggetArtifactCache,
@@ -99,21 +99,21 @@ def fingerprint(**changes: Any) -> NuggetFingerprint:
     base: dict[str, Any] = {
         "schema_version": 1,
         "behavior_version": "nuggets-v1",
-        "package": {"name": "nuggetizer", "version": "0.0.5"},
-        "nuggetizer_config": {"model": "test-model", "max_nuggets": 20},
+        "backend": {
+            "package": {"name": "nuggetizer", "version": "0.0.5"},
+            "config": {"model": "test-model", "max_nuggets": 20},
+            "max_completion_tokens": 2048,
+        },
+        "clusterer": {
+            "embedder": "injected",
+            "threshold": 0.92,
+            "guard_version": "numeric-negation-guard-v1",
+        },
         "provider_base_url_digest": hashlib.sha256(b"https://provider/v1").digest(),
-        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-        "embedding_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-        "similarity_threshold": 0.92,
-        "guard_version": "numeric-negation-guard-v1",
+        "claim_limits": {"max_claim_characters": 400, "max_claim_words": 30},
         "support_labels": ("support", "partial_support"),
         "evidence_budget": 24,
         "max_nuggets": 20,
-        "output_limits": {
-            "max_claim_characters": 400,
-            "max_claim_words": 30,
-            "max_completion_tokens": 2048,
-        },
     }
     base.update(changes)
     return NuggetFingerprint(**base)
@@ -212,18 +212,12 @@ class IsolationTestCase(unittest.TestCase):
 
     def test_a_changed_fingerprint_never_hits(self) -> None:
         variants = {
-            "package": {"name": "nuggetizer", "version": "0.0.6"},
-            "nuggetizer_config": {"model": "other-model", "max_nuggets": 20},
+            "backend": {"package": {"name": "nuggetizer", "version": "0.0.6"}},
+            "clusterer": {"embedder": "other-model", "threshold": 0.85},
             "provider_base_url_digest": hashlib.sha256(b"https://other/v1").digest(),
-            "embedding_revision": "0" * 40,
-            "similarity_threshold": 0.85,
-            "guard_version": "guard-v2",
+            "support_labels": ("support",),
             "evidence_budget": 12,
-            "output_limits": {
-                "max_claim_characters": 400,
-                "max_claim_words": 12,
-                "max_completion_tokens": 2048,
-            },
+            "claim_limits": {"max_claim_characters": 400, "max_claim_words": 12},
         }
         for field, value in variants.items():
             with self.subTest(field=field):
@@ -377,19 +371,19 @@ class FingerprintCoverageTestCase(unittest.TestCase):
         "trec_ragtime.nuggets": {
             "SCHEMA_VERSION": "fingerprinted directly",
             "BEHAVIOR_VERSION": "fingerprinted directly",
-            "EMBEDDING_MODEL": "fingerprinted directly",
-            "EMBEDDING_REVISION": "fingerprinted directly",
-            "GUARD_VERSION": "fingerprinted directly",
+            "EMBEDDING_MODEL": "reported by NuggetClusterer.fingerprint",
+            "EMBEDDING_REVISION": "reported by NuggetClusterer.fingerprint",
+            "GUARD_VERSION": "reported by NuggetClusterer.fingerprint",
             "DEFAULT_EVIDENCE_BUDGET": "a default for the fingerprinted budget",
             "DEFAULT_MAX_NUGGETS": "a default for the fingerprinted maximum",
             "DEFAULT_SIMILARITY_THRESHOLD": "a default for the fingerprinted threshold",
-            "MAX_CLAIM_CHARACTERS": "fingerprinted via output_limits",
-            "MAX_CLAIM_WORDS": "fingerprinted via output_limits",
+            "MAX_CLAIM_CHARACTERS": "fingerprinted via claim_limits",
+            "MAX_CLAIM_WORDS": "fingerprinted via claim_limits",
             "SUPPORT_LABELS": "fingerprinted directly",
         },
         "trec_ragtime.nuggetizer_adapter": {
             "PACKAGE_NAME": "identifies the package already fingerprinted by version",
-            "MAX_COMPLETION_TOKENS": "fingerprinted via output_limits",
+            "MAX_COMPLETION_TOKENS": "reported by NuggetizerBackend.fingerprint",
             "DEFAULT_MAX_CALLS": "a default for the fingerprinted nuggetizer_config",
             "REQUEST_TIMEOUT_SECONDS": "a timeout aborts a call, it never alters a result",
         },
@@ -414,7 +408,7 @@ class FingerprintCoverageTestCase(unittest.TestCase):
                 f"{module_name} declares {sorted(uncovered)}; add each to "
                 "NuggetFingerprint or excuse it here with a reason",
             )
-        self.assertIn(b"output_limits", encoded)
+        self.assertIn(b"claim_limits", encoded)
 
     def test_the_fingerprint_carries_the_live_constant_values(self) -> None:
         """An excuse of "fingerprinted via X" has to actually be true."""
@@ -422,17 +416,29 @@ class FingerprintCoverageTestCase(unittest.TestCase):
         from trec_ragtime import nuggets, nuggetizer_adapter
         from trec_ragtime.nuggets_runner import build_fingerprint
 
+        clusterer = nuggets.NuggetClusterer()
+        backend = NuggetizerBackend(
+            NuggetizerConfig(model="test-model"), nuggetizer=object()
+        )
         built = build_fingerprint(
-            NuggetizerConfig(model="test-model"), provider_base_url="https://provider/v1"
+            backend, clusterer, provider_base_url="https://provider/v1"
         )
         self.assertEqual(
-            dict(built.output_limits),
+            dict(built.claim_limits),
             {
                 "max_claim_characters": nuggets.MAX_CLAIM_CHARACTERS,
                 "max_claim_words": nuggets.MAX_CLAIM_WORDS,
-                "max_completion_tokens": nuggetizer_adapter.MAX_COMPLETION_TOKENS,
             },
         )
         self.assertEqual(built.support_labels, tuple(nuggets.SUPPORT_LABELS))
-        self.assertEqual(built.guard_version, nuggets.GUARD_VERSION)
-        self.assertEqual(built.embedding_revision, nuggets.EMBEDDING_REVISION)
+        # The collaborators supply their own identity, so these cannot drift.
+        self.assertEqual(dict(built.backend), dict(backend.fingerprint))
+        self.assertEqual(dict(built.clusterer), dict(clusterer.fingerprint))
+        self.assertEqual(
+            built.clusterer["embedder"],
+            f"{nuggets.EMBEDDING_MODEL}@{nuggets.EMBEDDING_REVISION}",
+        )
+        self.assertEqual(
+            built.backend["max_completion_tokens"],
+            nuggetizer_adapter.MAX_COMPLETION_TOKENS,
+        )

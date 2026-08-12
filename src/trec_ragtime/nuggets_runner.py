@@ -22,8 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from msgspec.structs import asdict
-
 from .cache import base_url_digest
 
 from .nugget_cache import (
@@ -33,15 +31,10 @@ from .nugget_cache import (
     NuggetRequest,
     evidence_digest,
 )
-from .nuggetizer_adapter import MAX_COMPLETION_TOKENS, NuggetizerConfig, package_identity
 from .nuggets import (
     BEHAVIOR_VERSION,
     DEFAULT_EVIDENCE_BUDGET,
     DEFAULT_MAX_NUGGETS,
-    DEFAULT_SIMILARITY_THRESHOLD,
-    EMBEDDING_MODEL,
-    EMBEDDING_REVISION,
-    GUARD_VERSION,
     MAX_CLAIM_CHARACTERS,
     MAX_CLAIM_WORDS,
     SCHEMA_VERSION,
@@ -148,35 +141,36 @@ def evidence_from_reranking(
 
 
 def build_fingerprint(
-    config: NuggetizerConfig,
+    backend: NuggetBackend,
+    clusterer: NuggetClusterer,
     *,
     provider_base_url: str,
     evidence_budget: int = DEFAULT_EVIDENCE_BUDGET,
     max_nuggets: int = DEFAULT_MAX_NUGGETS,
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
 ) -> NuggetFingerprint:
-    """Describe every result-affecting setting that is not topic specific."""
+    """Describe every result-affecting setting that is not topic specific.
+
+    The backend and clusterer are asked for their identity rather than having
+    their settings copied here, so the fingerprint cannot describe a
+    configuration other than the one that will actually run. This is the same
+    contract ``PassageScoreCache`` has with ``PassageScorer``.
+    """
 
     return NuggetFingerprint(
         schema_version=SCHEMA_VERSION,
         behavior_version=BEHAVIOR_VERSION,
-        package=dict(package_identity()),
-        nuggetizer_config=asdict(config),
+        backend=dict(backend.fingerprint),
+        clusterer=dict(clusterer.fingerprint),
         provider_base_url_digest=base_url_digest(provider_base_url),
-        embedding_model=EMBEDDING_MODEL,
-        embedding_revision=EMBEDDING_REVISION,
-        similarity_threshold=similarity_threshold,
-        guard_version=GUARD_VERSION,
+        # Read from the module that enforces them, so editing a constant changes
+        # the fingerprint without anyone remembering to plumb it.
+        claim_limits={
+            "max_claim_characters": MAX_CLAIM_CHARACTERS,
+            "max_claim_words": MAX_CLAIM_WORDS,
+        },
         support_labels=tuple(SUPPORT_LABELS),
         evidence_budget=evidence_budget,
         max_nuggets=max_nuggets,
-        # Read from the modules that enforce them, so editing a constant
-        # changes the fingerprint without anyone remembering to plumb it.
-        output_limits={
-            "max_claim_characters": MAX_CLAIM_CHARACTERS,
-            "max_claim_words": MAX_CLAIM_WORDS,
-            "max_completion_tokens": MAX_COMPLETION_TOKENS,
-        },
     )
 
 

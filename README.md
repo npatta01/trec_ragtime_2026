@@ -708,13 +708,18 @@ pinned `sentence-transformers/all-MiniLM-L6-v2` cosine threshold guarded by a
 numeric and negation check, so `fell 30%` never collapses into `fell 13%`, and
 a merge keeps every attesting source.
 
-Passage preparation belongs to the reranking stage, which owns chunking, the
-cross-encoder, and where it runs. `trec_ragtime.nuggets_runner` provides the
-complete per-topic orchestration—`evidence_from_reranking` to project reranked
-passages onto facet evidence, `run_topics` for bounded parallel execution, and
-`write_manifest` for a sanitized owner-only report. A `ragtime-nuggets` command
-lands once that stage exposes its scorer configuration; wiring one now would
-bake in a contract this stage does not own.
+Run it over the planned topics after decrypting `.env`:
+
+```bash
+uv run ragtime-nuggets --model <model-id> --topic-id 2000 --evidence-budget 24
+```
+
+Retrieval is read from the artifact cache only; a topic whose facets have not
+been retrieved is reported rather than turned into an organizer request. The
+query plan's own facet numbering is carried through to both the projected
+evidence and the recorded inputs, so a facet with no cached retrieval is skipped
+without renumbering the ones around it. `trec_ragtime.nuggets_runner` remains
+the supported Python API for callers that want the stage without the command.
 
 ## Repository Map
 
