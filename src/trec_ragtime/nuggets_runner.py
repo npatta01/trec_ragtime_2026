@@ -45,6 +45,7 @@ from .nuggets import (
     NuggetBundle,
     NuggetError,
     NuggetClusterer,
+    AliasedPassage,
     build_evidence_table,
     run_topic_nuggets,
 )
@@ -185,17 +186,9 @@ def run_topic(
 ) -> TopicOutcome:
     """Return a cached bundle, or compute, verify, and store a fresh one."""
 
-    rows = build_evidence_table(work.facets, budget=fingerprint.evidence_budget)
+    rows, request = prepare_nugget_request(work, fingerprint)
     if not rows:
         return TopicOutcome(work.topic_id, "failed", reason="no ranked passages")
-    request = NuggetRequest(
-        topic_id=work.topic_id,
-        query=work.query,
-        representation=work.representation,
-        inputs=work.inputs,
-        passage_source_fingerprint=work.passage_source_fingerprint,
-        evidence_digest=evidence_digest(tuple(row.evidence for row in rows)),
-    )
     key = cache.object_key(fingerprint, request)
 
     # The lookup is guarded too. It reads the bucket, so under load it can fail
@@ -247,6 +240,23 @@ def run_topic(
     if verified is None:
         return TopicOutcome(work.topic_id, "failed", reason="artifact reread failed")
     return _outcome(work.topic_id, "written", key, verified)
+
+
+def prepare_nugget_request(
+    work: TopicWork,
+    fingerprint: NuggetFingerprint,
+) -> tuple[tuple[AliasedPassage, ...], NuggetRequest]:
+    """Build the exact ordered evidence table and cache request without a provider."""
+
+    rows = build_evidence_table(work.facets, budget=fingerprint.evidence_budget)
+    return rows, NuggetRequest(
+        topic_id=work.topic_id,
+        query=work.query,
+        representation=work.representation,
+        inputs=work.inputs,
+        passage_source_fingerprint=work.passage_source_fingerprint,
+        evidence_digest=evidence_digest(tuple(row.evidence for row in rows)),
+    )
 
 
 def run_topics(
@@ -326,6 +336,7 @@ __all__ = [
     "TopicWork",
     "build_fingerprint",
     "evidence_from_reranking",
+    "prepare_nugget_request",
     "run_topic",
     "run_topics",
     "write_manifest",
