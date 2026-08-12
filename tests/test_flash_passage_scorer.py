@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import importlib.metadata
 import json
 import inspect
 from io import StringIO
 import math
+import msgspec
+import os
+from pathlib import Path
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -85,6 +90,20 @@ def _request_for_config(
     }
 
 
+def _cache_telemetry(
+    row_count: int,
+    *,
+    status: str = "miss_written",
+    batch_count: int = 1,
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "object_key": "passage-score-requests/v1/fake/00/" + "0" * 64 + ".mpk",
+        "row_count": row_count,
+        "batch_count": batch_count,
+    }
+
+
 class BatchEncodingTokenizer:
     def __init__(self, *, overflow_text: str = "overflow") -> None:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
@@ -152,6 +171,103 @@ class CountingLoader:
         return self.model, self.tokenizer
 
 
+class WorkerCacheStore:
+    """Tiny strict store fake for the worker-owned cache seam."""
+
+    def __init__(self, *, write_result: bool = True, reread: object = "stored") -> None:
+        self.objects: dict[str, bytes] = {}
+        self.read_validated_calls: list[str] = []
+        self.write_calls: list[tuple[str, bytes]] = []
+        self.evict_local_calls: list[str] = []
+        self.write_result = write_result
+        self.reread = reread
+
+    def read_validated(
+        self, key: str, decoder: Callable[[bytes], object]
+    ) -> object | None:
+        self.read_validated_calls.append(key)
+        if self.reread != "stored":
+            return self.reread
+        payload = self.objects.get(key)
+        return None if payload is None else decoder(payload)
+
+    def write(self, key: str, payload: bytes) -> bool:
+        self.write_calls.append((key, payload))
+        if self.write_result:
+            self.objects[key] = payload
+        return self.write_result
+
+    def evict_local(self, key: str) -> None:
+        self.evict_local_calls.append(key)
+
+
+class DirectStoreApiFake:
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+    def bucket_info(self, bucket_id: str) -> object:
+        return types.SimpleNamespace(private=True)
+
+
+class DirectStoreHandleFake:
+    def __init__(self, filesystem: "DirectStoreFilesystemFake", path: str, mode: str) -> None:
+        self.filesystem = filesystem
+        self.path = path
+        self.mode = mode
+        self.payload = bytearray()
+
+    def __enter__(self) -> "DirectStoreHandleFake":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if exc_type is None and "w" in self.mode:
+            key = self.path.removeprefix("hf://")
+            payload = bytes(self.payload)
+            self.filesystem.remote[key] = payload
+            candidate = self.filesystem.cache_storage / hashlib.sha256(
+                key.encode("utf-8")
+            ).hexdigest()
+            candidate.write_bytes(payload)
+
+    def read(self) -> bytes:
+        return self.filesystem.remote[self.path.removeprefix("hf://")]
+
+    def write(self, payload: bytes) -> int:
+        self.payload.extend(payload)
+        return len(payload)
+
+
+class DirectStoreFilesystemFake:
+    remote: dict[str, bytes] = {}
+
+    def __init__(self, cache_storage: str) -> None:
+        self.cache_storage = Path(cache_storage)
+        self.remote = type(self).remote
+
+    def open(self, path: str, mode: str) -> DirectStoreHandleFake:
+        key = path.removeprefix("hf://")
+        if "r" in mode and key not in self.remote:
+            raise FileNotFoundError(key)
+        return DirectStoreHandleFake(self, path, mode)
+
+
+def _request_for_rows(
+    config: LocalCrossEncoderConfig,
+    rows: list[tuple[str, str]],
+    *,
+    query: str = "query",
+) -> dict[str, object]:
+    return {
+        "schema_version": WIRE_SCHEMA_VERSION,
+        "scorer_fingerprint": config.fingerprint,
+        "model_config": _wire_model_config(config),
+        "query": query,
+        "rows": [
+            {"hash": sha256_bytes(text).hex(), "text": text} for _, text in rows
+        ],
+    }
+
+
 class FakeAsyncRunner:
     def __init__(self, *, delay: float = 0.0, mode: str = "normal") -> None:
         self.delay = delay
@@ -175,9 +291,10 @@ class FakeAsyncRunner:
                 rows = rows + [{"hash": "00" * 32, "score": 0.0}]
             elif self.mode == "fingerprint":
                 return encode_flash_response(
-                    [],
+                    [{"hash": request["rows"][0]["hash"], "score": 0.0}],
                     schema_version=WIRE_SCHEMA_VERSION,
                     scorer_fingerprint="drifted-fingerprint",
+                    cache=_cache_telemetry(1),
                 )
             elif self.mode == "nonfinite":
                 rows = [{"hash": row["hash"], "score": math.nan} for row in rows]
@@ -190,6 +307,7 @@ class FakeAsyncRunner:
                 rows,
                 schema_version=request["schema_version"],
                 scorer_fingerprint=request["scorer_fingerprint"],
+                cache=_cache_telemetry(len(rows)),
             )
         finally:
             self.active -= 1
@@ -246,6 +364,54 @@ class FlashWireCodecTests(unittest.TestCase):
                 b'[{"hash":"' + sha256_bytes("text").hex().encode() + b'","score":NaN}]'
             )
 
+    def test_response_requires_strict_cache_telemetry(self) -> None:
+        row = {"hash": sha256_bytes("text").hex(), "score": 1.0}
+        cache = {
+            "status": "hit",
+            "object_key": "passage-score-requests/v1/fake/00/" + "0" * 64 + ".mpk",
+            "row_count": 1,
+            "batch_count": 0,
+        }
+        payload = encode_flash_response(
+            [row], scorer_fingerprint="fingerprint", cache=cache
+        )
+        self.assertEqual(
+            decode_flash_response(payload),
+            {
+                "schema_version": 1,
+                "scorer_fingerprint": "fingerprint",
+                "scores": [row],
+                "cache": cache,
+            },
+        )
+        decoded = json.loads(payload)
+        for invalid_cache in (
+            {**cache, "extra": 1},
+            {**cache, "status": "unknown"},
+            {**cache, "object_key": "../unsafe"},
+            {**cache, "object_key": "safe?query"},
+            {**cache, "object_key": "safe#fragment"},
+            {**cache, "row_count": 2},
+            {**cache, "batch_count": 1},
+            {**cache, "row_count": 1.0},
+            {**cache, "batch_count": -1},
+            {**cache, "row_count": 1, "status": "hit\nunsafe"},
+        ):
+            with self.subTest(invalid_cache=invalid_cache):
+                candidate = dict(decoded)
+                candidate["cache"] = invalid_cache
+                with self.assertRaises(FlashScoringError):
+                    decode_flash_response(candidate)
+
+        with self.assertRaises(FlashScoringError):
+            encode_flash_response([row], scorer_fingerprint="fingerprint")
+
+        for extra_field in ("extra",):
+            candidate = dict(decoded)
+            candidate[extra_field] = 1
+            with self.assertRaises(FlashScoringError):
+                decode_flash_response(candidate)
+
     def test_model_config_schema_version_is_distinct_from_wire_schema(self) -> None:
         config = LocalCrossEncoderConfig(schema_version=2)
         payload = encode_flash_request(
@@ -272,6 +438,49 @@ class FlashWireCodecTests(unittest.TestCase):
 
 
 class RunpodFlashConfigTests(unittest.TestCase):
+    def test_worker_tuple_range_and_max_concurrency_reach_endpoint_factory(
+        self,
+    ) -> None:
+        config = RunpodFlashConfig(
+            endpoint_id="endpoint",
+            workers=(0, 2),
+            max_concurrency=3,
+        )
+        calls: list[dict[str, object]] = []
+
+        def endpoint_factory(
+            **kwargs: object,
+        ) -> Callable[[type[object]], type[object]]:
+            calls.append(kwargs)
+            return lambda worker: worker
+
+        build_flash_worker(
+            config,
+            endpoint_factory=endpoint_factory,
+            gpu_resolver=lambda name: name,
+        )
+
+        self.assertEqual(calls[0]["workers"], (0, 2))
+        self.assertEqual(calls[0]["max_concurrency"], 3)
+
+    def test_worker_tuple_range_is_validated(self) -> None:
+        for workers in ((1,), (2, 1), (-1, 1), (0, 0), (0, 1.0), True):
+            with self.subTest(workers=workers), self.assertRaises(ValueError):
+                RunpodFlashConfig(  # type: ignore[arg-type]
+                    endpoint_id="endpoint", workers=workers
+                )
+
+    def test_max_concurrency_must_be_positive_integer(self) -> None:
+        for value in (0, -1, 1.0, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RunpodFlashConfig(  # type: ignore[arg-type]
+                    endpoint_id="endpoint", max_concurrency=value
+                )
+
+    def test_worker_range_must_scale_to_zero(self) -> None:
+        with self.assertRaisesRegex(ValueError, "minimum must be zero"):
+            RunpodFlashConfig(endpoint_id="endpoint", workers=(1, 2))
+
     def test_transport_settings_do_not_change_model_fingerprint(self) -> None:
         policy = LocalCrossEncoderConfig(batch_size=2)
         base = RunpodFlashConfig(
@@ -329,54 +538,54 @@ class RunpodFlashConfigTests(unittest.TestCase):
 
 
 class RunpodFlashPassageScorerTests(unittest.TestCase):
-    def test_batch_sizing_uses_scalar_totals_and_builds_body_only_on_flush(
+    def test_one_logical_request_handles_65_passages_without_model_batch_waves(
         self,
     ) -> None:
+        passages = tuple(
+            _passage(f"text-{index}", document_id=str(index)) for index in range(65)
+        )
+        config = RunpodFlashConfig(endpoint_id="fake", batch_size=32)
+        runner = FakeAsyncRunner()
+        scorer = RunpodFlashPassageScorer(config, runner)
+        self.addCleanup(scorer.close)
+
+        scores = scorer.score("query", passages)
+
+        self.assertEqual(len(scores), 65)
+        self.assertEqual(len(runner.payloads), 1)
+        self.assertEqual(len(decode_flash_request(runner.payloads[0])["rows"]), 65)
+
+    def test_wrapped_request_at_10_mb_fails_without_splitting(self) -> None:
+        text = "x" * (FLASH_PAYLOAD_LIMIT_BYTES + 100)
+        config = RunpodFlashConfig(endpoint_id="fake", batch_size=32)
+        runner = FakeAsyncRunner()
+        scorer = RunpodFlashPassageScorer(config, runner)
+        self.addCleanup(scorer.close)
+
+        with self.assertRaises(FlashScoringError):
+            scorer.score("query", (_passage(text),))
+        self.assertEqual(runner.payloads, [])
+
+    def test_build_request_encodes_and_measures_one_wrapped_body(self) -> None:
         config = RunpodFlashConfig(endpoint_id="fake", batch_size=7)
         unique = {sha256_bytes(f"text-{index}"): f"text-{index}" for index in range(7)}
-        original_body_size = flash_passage_scorer._RunpodRequestBodySizer.body_size
         original_request_body = flash_passage_scorer._runpod_request_body
-        body_size_calls: list[int] = []
         request_body_calls = 0
-
-        def record_body_size(sizer: object, serialized_row_bytes: int) -> int:
-            if not isinstance(serialized_row_bytes, int):
-                raise AssertionError("batch sizing must pass a scalar row-byte total")
-            body_size_calls.append(serialized_row_bytes)
-            return original_body_size(sizer, serialized_row_bytes)
 
         def count_request_body_builds(payload: bytes) -> bytes:
             nonlocal request_body_calls
             request_body_calls += 1
             return original_request_body(payload)
 
-        def reject_sequence_sum(_: object) -> int:
-            raise AssertionError("batch sizing must not sum candidate row sequences")
-
-        with (
-            patch.object(
-                flash_passage_scorer._RunpodRequestBodySizer,
-                "body_size",
-                record_body_size,
-            ),
-            patch.object(
-                flash_passage_scorer,
-                "_runpod_request_body",
-                count_request_body_builds,
-            ),
-            patch.object(
-                RunpodFlashConfig,
-                "effective_batch_size",
-                new_callable=PropertyMock,
-                return_value=7,
-            ) as effective_batch_size,
-            patch.object(flash_passage_scorer, "sum", reject_sequence_sum, create=True),
+        with patch.object(
+            flash_passage_scorer,
+            "_runpod_request_body",
+            count_request_body_builds,
         ):
-            batches = RunpodFlashPassageScorer._build_batches("query", unique, config)
+            payload = RunpodFlashPassageScorer._build_request("query", unique, config)
 
-        self.assertEqual(len(body_size_calls), len(unique) + len(batches))
-        self.assertEqual(request_body_calls, len(batches))
-        self.assertEqual(effective_batch_size.call_count, 1)
+        self.assertEqual(request_body_calls, 1)
+        self.assertEqual(len(decode_flash_request(payload)["rows"]), len(unique))
 
     def test_adapter_and_worker_failures_do_not_emit_sensitive_literals(self) -> None:
         query = "query-sensitive-7f"
@@ -405,7 +614,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             finally:
                 scorer.close()
 
-            worker = build_flash_worker(config)(loader=failing_loader)
+            worker = build_flash_worker(config)(
+                loader=failing_loader, cache_store=WorkerCacheStore()
+            )
             with self.assertRaises(ValueError):
                 worker.score(_request_for_config(config, query=query, text=text))
 
@@ -413,7 +624,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         for sensitive in (query, text, content_hash, credential):
             self.assertNotIn(sensitive, output)
 
-    def test_batches_by_count_and_returns_exact_unique_hash_coverage(self) -> None:
+    def test_one_request_returns_exact_unique_hash_coverage(self) -> None:
         passages = (
             _passage("first", document_id="first"),
             _passage("first", document_id="duplicate"),
@@ -435,7 +646,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 passages[3].content_hash: 5.0,
             },
         )
-        self.assertEqual(len(runner.payloads), 2)
+        self.assertEqual(len(runner.payloads), 1)
         for payload in runner.payloads:
             self.assertEqual(
                 decode_flash_request(payload)["scorer_fingerprint"], config.fingerprint
@@ -445,7 +656,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 _wire_model_config(config.effective_model_config),
             )
 
-    def test_payloads_are_below_both_limits_and_oversized_rows_fail(self) -> None:
+    def test_one_request_obeys_payload_limit_without_splitting(self) -> None:
         passages = tuple(
             _passage("漢字-é" * count, document_id=str(count)) for count in range(1, 8)
         )
@@ -456,13 +667,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         scorer = RunpodFlashPassageScorer(config, runner)
         self.addCleanup(scorer.close)
 
-        scorer.score("query-é", passages)
-
-        self.assertGreater(len(runner.payloads), 1)
-        self.assertTrue(all(len(payload) < 1200 for payload in runner.payloads))
-        self.assertTrue(
-            all(len(payload) < FLASH_PAYLOAD_LIMIT_BYTES for payload in runner.payloads)
-        )
+        with self.assertRaises(FlashScoringError):
+            scorer.score("query-é", passages)
+        self.assertEqual(runner.payloads, [])
         with self.assertRaises(FlashScoringError):
             scorer.score("q", (_passage("x" * 500, document_id="too-large"),))
 
@@ -503,9 +710,10 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         self.addCleanup(scorer.close)
 
         self.assertEqual(len(scorer.score("query", passages)), 8)
-        self.assertLessEqual(runner.maximum_active, 2)
+        self.assertEqual(runner.maximum_active, 1)
+        self.assertEqual(len(runner.payloads), 1)
 
-    def test_failed_batch_cancels_and_awaits_siblings(self) -> None:
+    def test_failed_request_is_cancelled_and_awaited(self) -> None:
         class QuiescingFailureRunner:
             def __init__(self) -> None:
                 self.dispatches = 0
@@ -516,27 +724,29 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                 self.dispatches += 1
                 self.active += 1
                 try:
-                    if self.dispatches == 1:
-                        raise RuntimeError("transport failure")
-                    try:
-                        await asyncio.sleep(60.0)
-                    except asyncio.CancelledError:
-                        self.cancelled += 1
-                        raise
-                    raise AssertionError("sibling was not cancelled")
+                    await asyncio.sleep(60.0)
+                except asyncio.CancelledError:
+                    self.cancelled += 1
+                    raise
                 finally:
                     self.active -= 1
 
         runner = QuiescingFailureRunner()
         passages = tuple(_passage(f"text-{i}", document_id=str(i)) for i in range(4))
         scorer = RunpodFlashPassageScorer(
-            RunpodFlashConfig(endpoint_id="fake", batch_size=1, concurrency=2), runner
+            RunpodFlashConfig(
+                endpoint_id="fake",
+                batch_size=1,
+                concurrency=2,
+                request_timeout=0.01,
+            ),
+            runner,
         )
         self.addCleanup(scorer.close)
 
         with self.assertRaises(FlashScoringError):
             scorer.score("query", passages)
-        self.assertLessEqual(runner.dispatches, 2)
+        self.assertEqual(runner.dispatches, 1)
         self.assertGreaterEqual(runner.cancelled, 1)
         self.assertEqual(runner.active, 0)
 
@@ -549,15 +759,8 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
             async def run_batch(self, payload: bytes) -> bytes:
                 self.dispatches += 1
-                if self.dispatches == 1:
-                    raise asyncio.CancelledError
-                try:
-                    await asyncio.sleep(60.0)
-                except asyncio.CancelledError:
-                    self.cancelled += 1
-                    raise
-                self.completed += 1
-                raise AssertionError("sibling was not cancelled")
+                self.cancelled += 1
+                raise asyncio.CancelledError
 
         runner = QuiescingCancellationRunner()
         passages = tuple(_passage(f"text-{index}") for index in range(2))
@@ -574,7 +777,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(FlashScoringError, "Flash batch cancelled"):
             scorer.score("query", passages)
-        self.assertGreaterEqual(runner.dispatches, 2)
+        self.assertEqual(runner.dispatches, 1)
         self.assertEqual(runner.cancelled, 1)
         self.assertEqual(runner.completed, 0)
 
@@ -610,6 +813,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                     ({"hash": sha256_bytes("text"), "score": 4.0},),
                     schema_version=request["schema_version"],
                     scorer_fingerprint=request["scorer_fingerprint"],
+                    cache=_cache_telemetry(1),
                 )
 
             async def wait(self, timeout: float | None = None) -> "Job":
@@ -641,7 +845,8 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         policy = LocalCrossEncoderConfig()
         config = RunpodFlashConfig(endpoint_id="endpoint", model_config=policy)
         worker = build_flash_worker(policy)(
-            loader=CountingLoader(FakeModel(), BatchEncodingTokenizer())
+            loader=CountingLoader(FakeModel(), BatchEncodingTokenizer()),
+            cache_store=WorkerCacheStore(),
         )
         request = encode_flash_request(
             "query",
@@ -667,6 +872,7 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
                         response["scores"],
                         schema_version=response["schema_version"],
                         scorer_fingerprint=response["scorer_fingerprint"],
+                        cache=_cache_telemetry(len(response["scores"])),
                     )
                 )
 
@@ -711,7 +917,497 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         self.assertEqual(cancelled, [True])
 
 
+class FlashEndpointBatchRunnerTests(unittest.TestCase):
+    def test_endpoint_runner_submits_one_job_and_waits_for_output(self) -> None:
+        config = RunpodFlashConfig(endpoint_id="endpoint", request_timeout=1.0)
+        request = encode_flash_request(
+            "query",
+            ((sha256_bytes("text"), "text"),),
+            model_config=_wire_model_config(config.effective_model_config),
+            scorer_fingerprint=config.fingerprint,
+        )
+        calls: list[tuple[str, object]] = []
+
+        class Job:
+            output = encode_flash_response(
+                ({"hash": sha256_bytes("text"), "score": 4.0},),
+                scorer_fingerprint=config.fingerprint,
+                cache=_cache_telemetry(1),
+            )
+
+            async def wait(self, timeout: float | None = None) -> "Job":
+                calls.append(("wait", timeout))
+                return self
+
+        class Endpoint:
+            async def run(self, job_input: dict[str, object]) -> Job:
+                calls.append(("run", job_input))
+                return Job()
+
+        runner = FlashEndpointBatchRunner(config, endpoint=Endpoint())
+        self.addCleanup(runner.close)
+
+        response = decode_flash_response(runner.run_batch_sync(request))
+
+        self.assertEqual(response["scores"][0]["score"], 4.0)
+        self.assertEqual(calls[0], ("run", {"request": decode_flash_request(request)}))
+        self.assertEqual(calls[1], ("wait", 1.0))
+
+
+class WorkerCacheIdentityTests(unittest.TestCase):
+    def test_hash_order_does_not_change_identity(self) -> None:
+        left = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"a" * 32, b"b" * 32]
+        )
+        right = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"b" * 32, b"a" * 32]
+        )
+
+        self.assertEqual(left, right)
+        self.assertEqual(
+            FlashPassageWorker._cache_object_key(left),
+            FlashPassageWorker._cache_object_key(right),
+        )
+
+    def test_identity_rotates_for_every_request_dimension(self) -> None:
+        base = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query", [b"a" * 32]
+        )
+        variants = (
+            FlashPassageWorker._cache_identity(
+                "scorer-v2", "query", [b"a" * 32]
+            ),
+            FlashPassageWorker._cache_identity(
+                "scorer-v1", "query!", [b"a" * 32]
+            ),
+            FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"b" * 32]
+            ),
+        )
+
+        self.assertTrue(all(value != base for value in variants))
+        self.assertEqual(base[0], FlashPassageWorker.CACHE_SCHEMA_VERSION)
+        self.assertEqual(base[1], FlashPassageWorker.CACHE_BEHAVIOR_VERSION)
+
+    def test_schema_and_behavior_versions_rotate_identity(self) -> None:
+        original_schema = FlashPassageWorker.CACHE_SCHEMA_VERSION
+        original_behavior = FlashPassageWorker.CACHE_BEHAVIOR_VERSION
+        try:
+            base = FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"a" * 32]
+            )
+            FlashPassageWorker.CACHE_SCHEMA_VERSION = original_schema + 1
+            schema_variant = FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"a" * 32]
+            )
+            FlashPassageWorker.CACHE_SCHEMA_VERSION = original_schema
+            FlashPassageWorker.CACHE_BEHAVIOR_VERSION = original_behavior + "-next"
+            behavior_variant = FlashPassageWorker._cache_identity(
+                "scorer-v1", "query", [b"a" * 32]
+            )
+        finally:
+            FlashPassageWorker.CACHE_SCHEMA_VERSION = original_schema
+            FlashPassageWorker.CACHE_BEHAVIOR_VERSION = original_behavior
+
+        self.assertNotEqual(base, schema_variant)
+        self.assertNotEqual(base, behavior_variant)
+
+    def test_identity_rejects_malformed_fields(self) -> None:
+        invalid = (
+            ("", "query", [b"a" * 32]),
+            ("scorer\n", "query", [b"a" * 32]),
+            ("scorer", "", [b"a" * 32]),
+            ("scorer", "query\n", [b"a" * 32]),
+            ("scorer", "query", []),
+            ("scorer", "query", [b"a" * 31]),
+            ("scorer", "query", ["a" * 32]),
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                FlashPassageWorker._cache_identity(*values)
+
+
+class WorkerCacheArtifactTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.identity = FlashPassageWorker._cache_identity(
+            "scorer-v1", "query-sensitive", [b"b" * 32, b"a" * 32]
+        )
+        self.scores = {b"b" * 32: 2, b"a" * 32: 1.5}
+
+    def test_artifact_bytes_are_canonical_and_complete(self) -> None:
+        payload = FlashPassageWorker._encode_cache_artifact(
+            self.identity, self.scores
+        )
+
+        self.assertEqual(
+            FlashPassageWorker._decode_cache_artifact(payload, self.identity),
+            {b"a" * 32: 1.5, b"b" * 32: 2.0},
+        )
+        self.assertEqual(
+            payload,
+            FlashPassageWorker._encode_cache_artifact(
+                self.identity, {b"a" * 32: 1.5, b"b" * 32: 2.0}
+            ),
+        )
+        self.assertNotIn(b"query-sensitive", payload)
+        decoded = msgspec.msgpack.decode(payload)
+        self.assertEqual(
+            [row[0] for row in decoded[-1]], [b"a" * 32, b"b" * 32]
+        )
+
+    def test_encode_requires_exact_finite_score_coverage(self) -> None:
+        for scores in (
+            {b"a" * 32: 1.0},
+            {b"a" * 32: 1.0, b"b" * 32: 2.0, b"c" * 32: 3.0},
+            {b"a" * 32: math.nan, b"b" * 32: 2.0},
+            {b"a" * 32: math.inf, b"b" * 32: 2.0},
+            {b"a" * 32: True, b"b" * 32: 2.0},
+        ):
+            with self.subTest(scores=scores), self.assertRaises(ValueError):
+                FlashPassageWorker._encode_cache_artifact(self.identity, scores)
+
+    def test_decode_rejects_foreign_truncated_extra_noncanonical_and_bad_artifacts(
+        self,
+    ) -> None:
+        payload = FlashPassageWorker._encode_cache_artifact(
+            self.identity, self.scores
+        )
+        foreign = FlashPassageWorker._cache_identity(
+            "scorer-v1", "other-query", [b"b" * 32, b"a" * 32]
+        )
+        decoded = msgspec.msgpack.decode(payload)
+        cases = (
+            (payload[:-1], self.identity),
+            (msgspec.msgpack.encode(list(decoded) + ["extra"]), self.identity),
+            (msgspec.msgpack.encode(decoded[:-1]), self.identity),
+            (msgspec.msgpack.encode(decoded), foreign),
+            (msgspec.msgpack.encode(decoded[:-1] + [decoded[-1][::-1]]), self.identity),
+            (payload + b"\x00", self.identity),
+        )
+        for candidate, identity in cases:
+            with self.subTest(candidate=candidate[:20], identity=identity), self.assertRaises(
+                ValueError
+            ):
+                FlashPassageWorker._decode_cache_artifact(candidate, identity)
+
+        malformed = msgspec.msgpack.encode(
+            [
+                decoded[0],
+                decoded[1],
+                decoded[2],
+                decoded[3],
+                decoded[4],
+                [[b"a" * 32, math.nan], [b"b" * 32, 2.0]],
+            ]
+        )
+        with self.assertRaises(ValueError):
+            FlashPassageWorker._decode_cache_artifact(malformed, self.identity)
+
+    def test_codec_errors_do_not_echo_source_text(self) -> None:
+        query = b"query-sensitive"
+        payload = FlashPassageWorker._encode_cache_artifact(
+            FlashPassageWorker._cache_identity("scorer-v1", query.decode(), [b"a" * 32]),
+            {b"a" * 32: 1.0},
+        )
+        with self.assertRaises(ValueError) as raised:
+            FlashPassageWorker._decode_cache_artifact(payload[:-1], self.identity)
+        self.assertNotIn(query.decode(), str(raised.exception))
+
+    def test_isolated_worker_has_identical_identity_and_artifact_codec(self) -> None:
+        source = inspect.getsource(FlashPassageWorker)
+        namespace = {"__name__": "flash_worker_isolated"}
+        with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
+            exec(compile(source, "<flash-worker>", "exec"), namespace)
+        isolated = namespace["FlashPassageWorker"]
+
+        isolated_identity = isolated._cache_identity(
+            "scorer-v1", "query-sensitive", [b"b" * 32, b"a" * 32]
+        )
+        self.assertEqual(isolated_identity, self.identity)
+        self.assertEqual(
+            isolated._cache_object_key(isolated_identity),
+            FlashPassageWorker._cache_object_key(self.identity),
+        )
+        self.assertEqual(
+            isolated._encode_cache_artifact(isolated_identity, self.scores),
+            FlashPassageWorker._encode_cache_artifact(self.identity, self.scores),
+        )
+
+
 class StaticFlashWorkerTests(unittest.TestCase):
+    def test_cold_miss_writes_rereads_and_returns_complete_scores(self) -> None:
+        policy = LocalCrossEncoderConfig(batch_size=2, max_length=100)
+        model = FakeModel(multiplier=2.0)
+        store = WorkerCacheStore()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        response = worker.score(
+            _request_for_rows(policy, [("a", "a"), ("b", "bb")])
+        )
+
+        self.assertEqual(
+            response["scores"],
+            sorted(
+                [
+                    {"hash": sha256_bytes("a").hex(), "score": 2.0},
+                    {"hash": sha256_bytes("bb").hex(), "score": 4.0},
+                ],
+                key=lambda row: row["hash"],
+            ),
+        )
+        self.assertEqual(response["cache"]["status"], "miss_written")
+        self.assertEqual(response["cache"]["row_count"], 2)
+        self.assertEqual(response["cache"]["batch_count"], 1)
+        self.assertEqual(len(store.write_calls), 1)
+        self.assertEqual(store.evict_local_calls, [store.write_calls[0][0]])
+        self.assertEqual(store.read_validated_calls, [store.write_calls[0][0]] * 2)
+
+    def test_warm_hit_on_fresh_worker_does_not_load_model(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore()
+        first_model = FakeModel()
+        first = build_flash_worker(policy)(
+            loader=CountingLoader(first_model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+        request = _request_for_config(policy)
+        first.score(request)
+
+        def failing_loader(config: object) -> object:
+            raise AssertionError("warm hit must not load the model")
+
+        second = build_flash_worker(policy)(
+            loader=failing_loader,
+            cache_store=store,
+        )
+        response = second.score(request)
+
+        self.assertEqual(response["cache"]["status"], "hit")
+        self.assertEqual(response["cache"]["row_count"], 1)
+        self.assertEqual(response["cache"]["batch_count"], 0)
+        self.assertEqual(len(store.write_calls), 1)
+
+    def test_65_rows_use_three_model_batches_and_report_three(self) -> None:
+        policy = LocalCrossEncoderConfig(batch_size=32, max_length=1000)
+        model = FakeModel()
+        store = WorkerCacheStore()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+        rows = [(str(index), f"text-{index}") for index in range(65)]
+
+        response = worker.score(_request_for_rows(policy, rows))
+
+        self.assertEqual(len(response["scores"]), 65)
+        self.assertEqual(len(model.predict_calls), 3)
+        self.assertEqual(response["cache"]["batch_count"], 3)
+
+    def test_false_write_fails_closed(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore(write_result=False)
+        model = FakeModel()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        with self.assertRaisesRegex(ValueError, "worker cache write failed"):
+            worker.score(_request_for_config(policy))
+
+    def test_missing_reread_fails_closed(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore()
+        store.reread = None
+        model = FakeModel()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        with self.assertRaisesRegex(ValueError, "worker cache reread failed"):
+            worker.score(_request_for_config(policy))
+
+    def test_malformed_hit_fails_closed_before_model_load(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore()
+        store.reread = {b"incomplete": 1.0}
+
+        def failing_loader(config: object) -> object:
+            raise AssertionError("malformed hit must not load the model")
+
+        worker = build_flash_worker(policy)(
+            loader=failing_loader,
+            cache_store=store,
+        )
+
+        with self.assertRaisesRegex(ValueError, "worker cache artifact is malformed"):
+            worker.score(_request_for_config(policy))
+
+    def test_direct_store_repairs_malformed_l1_from_valid_l2(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        request = _request_for_config(policy)
+        content_hash = sha256_bytes("text")
+        identity = FlashPassageWorker._cache_identity(
+            policy.fingerprint, "query", [content_hash]
+        )
+        key = FlashPassageWorker._cache_object_key(identity)
+        payload = FlashPassageWorker._encode_cache_artifact(
+            identity, {content_hash: 4.0}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            DirectStoreFilesystemFake.remote = {}
+            fake_fsspec = types.ModuleType("fsspec")
+            fake_fsspec.filesystem = lambda protocol, **kwargs: DirectStoreFilesystemFake(
+                kwargs["cache_storage"]
+            )
+            fake_huggingface = types.ModuleType("huggingface_hub")
+            fake_huggingface.HfApi = DirectStoreApiFake
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "trec_ragtime.artifact_store": None,
+                        "fsspec": fake_fsspec,
+                        "huggingface_hub": fake_huggingface,
+                    },
+                    clear=False,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "RAGTIME_HF_BUCKET_ID": "private-owner/private-bucket",
+                        "RAGTIME_ARTIFACT_CACHE_DIR": directory,
+                    },
+                    clear=False,
+                ),
+            ):
+                worker = build_flash_worker(policy)(
+                    loader=lambda config: (_ for _ in ()).throw(
+                        AssertionError("valid L2 hit must not load the model")
+                    )
+                )
+                store = worker._cache_store
+                store._local_candidate(key).write_bytes(b"malformed-l1")
+                DirectStoreFilesystemFake.remote[
+                    "buckets/private-owner/private-bucket/" + key
+                ] = payload
+
+                response = worker.score(request)
+
+                self.assertEqual(response["cache"]["status"], "hit")
+                self.assertFalse(store._local_candidate(key).exists())
+
+    def test_direct_store_rejects_malformed_l2_as_fatal(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        request = _request_for_config(policy)
+        with tempfile.TemporaryDirectory() as directory:
+            DirectStoreFilesystemFake.remote = {}
+            fake_fsspec = types.ModuleType("fsspec")
+            fake_fsspec.filesystem = lambda protocol, **kwargs: DirectStoreFilesystemFake(
+                kwargs["cache_storage"]
+            )
+            fake_huggingface = types.ModuleType("huggingface_hub")
+            fake_huggingface.HfApi = DirectStoreApiFake
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "trec_ragtime.artifact_store": None,
+                        "fsspec": fake_fsspec,
+                        "huggingface_hub": fake_huggingface,
+                    },
+                    clear=False,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "RAGTIME_HF_BUCKET_ID": "private-owner/private-bucket",
+                        "RAGTIME_ARTIFACT_CACHE_DIR": directory,
+                    },
+                    clear=False,
+                ),
+            ):
+                worker = build_flash_worker(policy)(
+                    loader=lambda config: (_ for _ in ()).throw(
+                        AssertionError("malformed L2 must not load the model")
+                    )
+                )
+                identity = FlashPassageWorker._cache_identity(
+                    policy.fingerprint, "query", [sha256_bytes("text")]
+                )
+                key = FlashPassageWorker._cache_object_key(identity)
+                DirectStoreFilesystemFake.remote[
+                    "buckets/private-owner/private-bucket/" + key
+                ] = b"malformed-l2"
+
+                with self.assertRaisesRegex(ValueError, "worker cache artifact is malformed"):
+                    worker.score(request)
+
+    def test_isolated_worker_scores_with_injected_store_without_project_imports(
+        self,
+    ) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        source = inspect.getsource(FlashPassageWorker)
+        namespace = {"__name__": "flash_worker_isolated"}
+        model = FakeModel()
+        store = WorkerCacheStore()
+        with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
+            exec(compile(source, "<flash-worker>", "exec"), namespace)
+        isolated = namespace["FlashPassageWorker"]
+        worker = isolated(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        response = worker.score(_request_for_config(policy))
+
+        self.assertEqual(response["cache"]["status"], "miss_written")
+
+    def test_default_store_uses_private_bucket_configuration_without_leaking_secrets(
+        self,
+    ) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        secret_bucket = "private-owner/private-bucket"
+        secret_token = "hf_secret_token_value"
+        with tempfile.TemporaryDirectory() as directory:
+            fake_fsspec = types.ModuleType("fsspec")
+            fake_fsspec.filesystem = lambda protocol, **kwargs: DirectStoreFilesystemFake(
+                kwargs["cache_storage"]
+            )
+            fake_huggingface = types.ModuleType("huggingface_hub")
+            fake_huggingface.HfApi = DirectStoreApiFake
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "trec_ragtime.artifact_store": None,
+                        "fsspec": fake_fsspec,
+                        "huggingface_hub": fake_huggingface,
+                    },
+                    clear=False,
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "RAGTIME_HF_BUCKET_ID": secret_bucket,
+                        "RAGTIME_ARTIFACT_CACHE_DIR": directory,
+                        "HF_TOKEN": secret_token,
+                        "HF_ENDPOINT": "https://huggingface.example",
+                    },
+                    clear=False,
+                ),
+            ):
+                worker = build_flash_worker(policy)(
+                    loader=CountingLoader(FakeModel(), BatchEncodingTokenizer())
+                )
+
+        self.assertEqual(worker._cache_store.__class__.__name__, "DirectArtifactStore")
+        self.assertNotIn(secret_token, repr(worker))
+
     def test_worker_tokenizer_metadata_matches_local_token_length_contract(
         self,
     ) -> None:
@@ -743,9 +1439,10 @@ class StaticFlashWorkerTests(unittest.TestCase):
 
         def worker_with(tokenizer: MetadataTokenizer) -> tuple[FakeModel, object]:
             model = FakeModel()
-            worker = build_flash_worker(
-                policy,
-            )(loader=CountingLoader(model, tokenizer))
+            worker = build_flash_worker(policy)(
+                loader=CountingLoader(model, tokenizer),
+                cache_store=WorkerCacheStore(),
+            )
             return model, worker
 
         for truncated in (None, 0, [0], (0,)):
@@ -952,7 +1649,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
         with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
             exec(compile(source, "<flash-worker>", "exec"), namespace)
         isolated_worker = namespace["FlashPassageWorker"]
-        worker = isolated_worker(loader=loader)
+        worker = isolated_worker(loader=loader, cache_store=WorkerCacheStore())
         response = worker.score(_request_for_config(policy))
 
         self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
@@ -962,7 +1659,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
     def test_constructor_is_cold_and_first_valid_request_loads_once(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=100)
         loader = CountingLoader(FakeModel(), BatchEncodingTokenizer())
-        worker = build_flash_worker(policy)(loader=loader)
+        worker = build_flash_worker(policy)(
+            loader=loader, cache_store=WorkerCacheStore()
+        )
 
         self.assertEqual(len(loader.calls), 0)
         request = _request_for_config(policy)
@@ -1000,7 +1699,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
                 raise AssertionError("test loader was not released")
             return model, BatchEncodingTokenizer()
 
-        worker = build_flash_worker(policy_a)(loader=loader)
+        worker = build_flash_worker(policy_a)(loader=loader, cache_store=WorkerCacheStore())
         original_validate = FlashPassageWorker._validate_request
 
         def synchronized_validate(
@@ -1093,7 +1792,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
             "_default_loader",
             return_value=(default_model, default_tokenizer),
         ):
-            worker = build_flash_worker(policy)(loader=loader)
+            worker = build_flash_worker(policy)(loader=loader, cache_store=WorkerCacheStore())
             worker.score(_request_for_config(policy))
 
         self.assertEqual(loader.calls, 1)
@@ -1115,7 +1814,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
 
         model = FailingModel()
         loader = CountingLoader(model, tokenizer)
-        worker = build_flash_worker(policy_a)(loader=loader)
+        worker = build_flash_worker(policy_a)(loader=loader, cache_store=WorkerCacheStore())
 
         with self.assertRaises(ValueError):
             worker.score(_request_for_config(policy_a))
@@ -1128,7 +1827,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
     def test_worker_validates_exact_request_model_config_and_pair_ceiling(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=10)
         loader = CountingLoader(FakeModel(), BatchEncodingTokenizer())
-        worker = build_flash_worker(policy)(loader=loader)
+        worker = build_flash_worker(policy)(loader=loader, cache_store=WorkerCacheStore())
         request = _request_for_config(policy)
 
         with self.assertRaises(ValueError):
@@ -1151,7 +1850,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
         with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
             exec(compile(source, "<flash-worker>", "exec"), namespace)
         isolated_worker = namespace["FlashPassageWorker"]
-        worker = isolated_worker(loader=lambda config: (model, tokenizer))
+        worker = isolated_worker(
+            loader=lambda config: (model, tokenizer), cache_store=WorkerCacheStore()
+        )
 
         with self.assertRaisesRegex(ValueError, "overflow"):
             worker.score(_request_for_config(policy, text="abc"))
@@ -1182,7 +1883,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
         policy = LocalCrossEncoderConfig(batch_size=2, max_length=100)
         model = FakeModel(multiplier=2.0)
         tokenizer = BatchEncodingTokenizer()
-        worker = build_flash_worker(policy)(loader=CountingLoader(model, tokenizer))
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, tokenizer), cache_store=WorkerCacheStore()
+        )
         response = worker.score(
             {
                 **_request_for_config(policy),
@@ -1217,7 +1920,8 @@ class StaticFlashWorkerTests(unittest.TestCase):
             loader=lambda config: (FakeModel(multiplier=2.0), BatchEncodingTokenizer()),
         )
         remote_worker = build_flash_worker(policy)(
-            loader=lambda config: (FakeModel(multiplier=2.0), BatchEncodingTokenizer())
+            loader=lambda config: (FakeModel(multiplier=2.0), BatchEncodingTokenizer()),
+            cache_store=WorkerCacheStore(),
         )
         runner = RunpodFlashPassageScorer(
             RunpodFlashConfig(endpoint_id="fake", model_config=policy),
@@ -1239,6 +1943,7 @@ class _WorkerWireRunner:
             response["scores"],
             schema_version=response["schema_version"],
             scorer_fingerprint=response["scorer_fingerprint"],
+            cache=_cache_telemetry(len(response["scores"])),
         )
 
 
@@ -1290,6 +1995,8 @@ class FlashDecorationTests(unittest.TestCase):
                 f"torch=={policy.torch_version}",
                 "msgspec==0.21.1",
                 f"packaging=={importlib.metadata.version('packaging')}",
+                f"fsspec=={importlib.metadata.version('fsspec')}",
+                f"huggingface-hub=={importlib.metadata.version('huggingface-hub')}",
             ],
         )
 

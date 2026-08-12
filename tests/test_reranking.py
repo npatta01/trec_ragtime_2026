@@ -11,7 +11,7 @@ from trec_ragtime.models import (
     SearchHit,
 )
 from trec_ragtime.passage_score_cache import CachedPassageScorer, PassageScoreCache
-from trec_ragtime.passages import Passage, sha256_bytes
+from trec_ragtime.passages import Passage, PassageChunkingError, sha256_bytes
 from trec_ragtime.reranking import (
     PassageEvidence,
     RerankedDocument,
@@ -100,6 +100,17 @@ class EmptyChunker(RecordingChunker):
         if kwargs["document_id"] not in self.passages:
             self.calls.append(dict(kwargs))
             return ()
+        return super().chunk(**kwargs)
+
+
+class SelectiveFailingChunker(RecordingChunker):
+    def __init__(self, failure: Exception) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def chunk(self, **kwargs: str) -> tuple[Passage, ...]:
+        if kwargs["document_id"] == "invalid":
+            raise self.failure
         return super().chunk(**kwargs)
 
 
@@ -391,6 +402,49 @@ class RerankingTests(unittest.TestCase):
         self.assertEqual(result.documents[0].status, "no_passages")
         self.assertIsNone(result.documents[0].score)
         self.assertEqual(result.documents[0].evidence, ())
+
+    def test_invalid_passages_discard_only_the_failing_document(self) -> None:
+        scorer = RecordingScorer({"valid text": 2.0})
+
+        result = rerank_retrieval(
+            _retrieval(
+                (
+                    _document("invalid", rank=1, score=0.9, text="invalid text"),
+                    _document("valid", rank=2, score=0.8, text="valid text"),
+                )
+            ),
+            chunker=SelectiveFailingChunker(
+                PassageChunkingError("passage positions must be strictly increasing")
+            ),
+            scorer=scorer,
+            representation="canonical",
+        )
+
+        self.assertEqual(
+            [(row.document.document_id, row.status) for row in result.documents],
+            [("valid", "scored"), ("invalid", "invalid_passages")],
+        )
+        invalid = result.documents[1]
+        self.assertIsNone(invalid.score)
+        self.assertEqual(invalid.evidence, ())
+        self.assertEqual(
+            [passage.document_id for passage in scorer.calls[0][1]],
+            ["valid"],
+        )
+
+    def test_unexpected_chunker_failure_remains_fatal(self) -> None:
+        with self.assertRaisesRegex(
+            RerankingError,
+            "chunker failed for a selected representation",
+        ):
+            rerank_retrieval(
+                _retrieval(
+                    (_document("invalid", rank=1, score=0.9, text="invalid text"),)
+                ),
+                chunker=SelectiveFailingChunker(RuntimeError("software defect")),
+                scorer=RecordingScorer({}),
+                representation="canonical",
+            )
 
     def test_maximum_aggregation_preserves_distinct_offsets_and_hash_evidence(
         self,

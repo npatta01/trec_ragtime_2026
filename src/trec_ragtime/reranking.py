@@ -9,11 +9,17 @@ from typing import Literal
 
 from .models import RetrievalResult, RetrievedDocument, SearchHit
 from .passage_scoring import PassageScorer, validate_passage_scores
-from .passages import Passage, PassageChunker, sha256_bytes
+from .passages import Passage, PassageChunker, PassageChunkingError, sha256_bytes
 
 
 max_passage_v1 = "max_passage_v1"
-_Status = Literal["scored", "missing_representation", "unresolved", "no_passages"]
+_Status = Literal[
+    "scored",
+    "missing_representation",
+    "unresolved",
+    "no_passages",
+    "invalid_passages",
+]
 
 
 class RerankingError(ValueError):
@@ -167,6 +173,9 @@ def rerank_retrieval(
                 representation=representation,
                 language=language,
             )
+        except PassageChunkingError:
+            prepared.append((document, "invalid_passages", ()))
+            continue
         except Exception as error:
             raise RerankingError(
                 "chunker failed for a selected representation"
