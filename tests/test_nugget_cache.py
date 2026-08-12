@@ -358,3 +358,61 @@ class PutValidationTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FingerprintCoverageTestCase(unittest.TestCase):
+    """Every result-affecting constant is fingerprinted, or denied on purpose.
+
+    Three separate commits fixed "a result-affecting input is missing from the
+    artifact identity". A field-by-field isolation test cannot catch the next
+    one, because a newly added constant is simply absent from every list. This
+    fails closed instead: a new tunable constant must be either covered or
+    explicitly excused.
+    """
+
+    # Constants whose value cannot change a stored bundle, with the reason.
+    EXCUSED = {
+        "trec_ragtime.nuggets": {
+            "SCHEMA_VERSION": "fingerprinted directly",
+            "BEHAVIOR_VERSION": "fingerprinted directly",
+            "EMBEDDING_MODEL": "fingerprinted directly",
+            "EMBEDDING_REVISION": "fingerprinted directly",
+            "GUARD_VERSION": "fingerprinted directly",
+            "DEFAULT_EVIDENCE_BUDGET": "a default for the fingerprinted budget",
+            "DEFAULT_MAX_NUGGETS": "a default for the fingerprinted maximum",
+            "DEFAULT_SIMILARITY_THRESHOLD": "a default for the fingerprinted threshold",
+            "MAX_CLAIM_CHARACTERS": "fingerprinted via output_limits",
+            "MAX_CLAIM_WORDS": "fingerprinted via output_limits",
+            "SUPPORT_LABELS": "changing it changes behaviour, so bump BEHAVIOR_VERSION",
+        },
+        "trec_ragtime.nuggetizer_adapter": {
+            "PACKAGE_NAME": "identifies the package already fingerprinted by version",
+            "MAX_COMPLETION_TOKENS": "fingerprinted via output_limits",
+            "DEFAULT_MAX_CALLS": "a default for the fingerprinted nuggetizer_config",
+            "REQUEST_TIMEOUT_SECONDS": "a timeout aborts a call, it never alters a result",
+        },
+    }
+
+    def test_no_result_affecting_constant_escapes_the_fingerprint(self) -> None:
+        import importlib
+
+        fingerprint = globals()['fingerprint']()
+        encoded = msgspec.msgpack.encode(fingerprint)
+        for module_name, excused in self.EXCUSED.items():
+            module = importlib.import_module(module_name)
+            declared = {
+                name
+                for name in vars(module)
+                if name.isupper() and not name.startswith("_")
+            }
+            uncovered = declared - set(excused)
+            self.assertEqual(
+                uncovered,
+                set(),
+                f"{module_name} declares {sorted(uncovered)}; add each to "
+                "NuggetFingerprint or excuse it here with a reason",
+            )
+            for name in ("MAX_CLAIM_CHARACTERS", "MAX_CLAIM_WORDS"):
+                if name in declared:
+                    self.assertIn(name.lower(), dict(fingerprint.output_limits))
+        self.assertIn(b"output_limits", encoded)

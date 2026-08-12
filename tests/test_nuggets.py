@@ -37,7 +37,7 @@ def candidate(text: str, *, document_id: str = "doc-1", rank: int = 1, score: fl
         content_hash=hashlib.sha256(text.encode("utf-8")).digest(),
         passage_score=score,
         document_rank=rank,
-        text=text,
+        source_text=text,
     )
 
 
@@ -447,17 +447,9 @@ class CheckBundleTestCase(unittest.TestCase):
             ),
         )
 
-    def _documents(self, bundle: NuggetBundle) -> set[str]:
-        return {evidence.document_id for evidence in bundle.evidence}
-
     def test_accepts_a_bundle_the_stage_produced(self) -> None:
         bundle = self._bundle()
-        check_bundle(bundle, document_ids=self._documents(bundle))
-
-    def test_rejects_an_unknown_document(self) -> None:
-        bundle = self._bundle()
-        with self.assertRaisesRegex(NuggetError, "unknown document"):
-            check_bundle(bundle, document_ids={"doc-elsewhere"})
+        check_bundle(bundle)
 
     def test_rejects_a_duplicate_alias(self) -> None:
         bundle = self._bundle()
@@ -465,7 +457,7 @@ class CheckBundleTestCase(unittest.TestCase):
             bundle, evidence=(bundle.evidence[0], bundle.evidence[0])
         )
         with self.assertRaisesRegex(NuggetError, "reuses an alias"):
-            check_bundle(broken, document_ids=self._documents(bundle))
+            check_bundle(broken)
 
     def test_rejects_support_outside_the_alias_table(self) -> None:
         bundle = self._bundle()
@@ -479,7 +471,7 @@ class CheckBundleTestCase(unittest.TestCase):
             ),
         )
         with self.assertRaisesRegex(NuggetError, "outside the alias table"):
-            check_bundle(broken, document_ids=self._documents(bundle))
+            check_bundle(broken)
 
     def test_rejects_a_nugget_with_no_support(self) -> None:
         bundle = self._bundle()
@@ -488,7 +480,7 @@ class CheckBundleTestCase(unittest.TestCase):
             nuggets=(msgspec.structs.replace(bundle.nuggets[0], support=()),),
         )
         with self.assertRaisesRegex(NuggetError, "no supporting evidence"):
-            check_bundle(broken, document_ids=self._documents(bundle))
+            check_bundle(broken)
 
     def test_rejects_a_claim_whose_id_no_longer_matches(self) -> None:
         bundle = self._bundle()
@@ -497,7 +489,7 @@ class CheckBundleTestCase(unittest.TestCase):
             nuggets=(msgspec.structs.replace(bundle.nuggets[0], claim="a different claim"),),
         )
         with self.assertRaisesRegex(NuggetError, "does not match its claim"):
-            check_bundle(broken, document_ids=self._documents(bundle))
+            check_bundle(broken)
 
     def test_rejects_an_invalid_alias_format(self) -> None:
         bundle = self._bundle()
@@ -507,13 +499,13 @@ class CheckBundleTestCase(unittest.TestCase):
             + bundle.evidence[1:],
         )
         with self.assertRaisesRegex(NuggetError, "failed schema validation"):
-            check_bundle(broken, document_ids=self._documents(bundle))
+            check_bundle(broken)
 
     def test_rejects_evidence_over_the_budget(self) -> None:
         bundle = self._bundle()
         broken = msgspec.structs.replace(bundle, evidence_budget=1)
         with self.assertRaisesRegex(NuggetError, "exceeds the configured budget"):
-            check_bundle(broken, document_ids=self._documents(bundle))
+            check_bundle(broken)
 
     def test_rejects_nuggets_out_of_deterministic_order(self) -> None:
         backend = ScriptedBackend(
@@ -537,7 +529,7 @@ class CheckBundleTestCase(unittest.TestCase):
         )
         broken = msgspec.structs.replace(bundle, nuggets=tuple(reversed(bundle.nuggets)))
         with self.assertRaisesRegex(NuggetError, "deterministic order"):
-            check_bundle(broken, document_ids=self._documents(bundle))
+            check_bundle(broken)
 
 
 if __name__ == "__main__":

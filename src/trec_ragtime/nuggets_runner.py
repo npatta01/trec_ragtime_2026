@@ -11,7 +11,7 @@ here: the artifact cache is the resume mechanism.
 
 from __future__ import annotations
 
-import hashlib
+import dataclasses
 import json
 import os
 import stat
@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from msgspec.structs import asdict
+
+from .cache import base_url_digest
 
 from .nugget_cache import (
     NuggetArtifactCache,
@@ -45,6 +47,7 @@ from .nuggets import (
     SCHEMA_VERSION,
     EvidenceCandidate,
     FacetEvidence,
+    NuggetBackend,
     NuggetBundle,
     NuggetClusterer,
     build_evidence_table,
@@ -119,21 +122,22 @@ def evidence_from_reranking(
             if not isinstance(selected, str):
                 continue
             language = "eng" if representation == "report_text" else document.language
-            for passage in row.evidence:
-                text = selected[passage.start_char : passage.end_char]
-                candidates.append(
-                    EvidenceCandidate(
-                        document_id=passage.document_id,
-                        representation=representation,
-                        language=language,
-                        start_char=passage.start_char,
-                        end_char=passage.end_char,
-                        content_hash=passage.content_hash,
-                        passage_score=float(passage.score),
-                        document_rank=row.reranked_rank,
-                        text=text,
-                    )
+            candidates.extend(
+                EvidenceCandidate(
+                    document_id=passage.document_id,
+                    representation=representation,
+                    language=language,
+                    start_char=passage.start_char,
+                    end_char=passage.end_char,
+                    content_hash=passage.content_hash,
+                    passage_score=float(passage.score),
+                    document_rank=row.reranked_rank,
+                    # Shared reference; the slice happens once a passage is
+                    # actually selected into the evidence table.
+                    source_text=selected,
                 )
+                for passage in row.evidence
+            )
         facets.append(
             FacetEvidence(
                 facet_index=facet_index, query=query, candidates=tuple(candidates)
@@ -157,9 +161,7 @@ def build_fingerprint(
         behavior_version=BEHAVIOR_VERSION,
         package=dict(package_identity()),
         nuggetizer_config=asdict(config),
-        provider_base_url_digest=hashlib.sha256(
-            provider_base_url.encode("utf-8")
-        ).digest(),
+        provider_base_url_digest=base_url_digest(provider_base_url),
         embedding_model=EMBEDDING_MODEL,
         embedding_revision=EMBEDDING_REVISION,
         similarity_threshold=similarity_threshold,
@@ -181,7 +183,7 @@ def run_topic(
     *,
     cache: NuggetArtifactCache,
     fingerprint: NuggetFingerprint,
-    backend_factory: Callable[[], Any],
+    backend_factory: Callable[[], NuggetBackend],
     clusterer: NuggetClusterer,
 ) -> TopicOutcome:
     """Return a cached bundle, or compute, verify, and store a fresh one."""
@@ -233,7 +235,7 @@ def run_topics(
     *,
     cache: NuggetArtifactCache,
     fingerprint: NuggetFingerprint,
-    backend_factory: Callable[[], Any],
+    backend_factory: Callable[[], NuggetBackend],
     clusterer: NuggetClusterer,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> tuple[TopicOutcome, ...]:
@@ -243,30 +245,17 @@ def run_topics(
         raise ValueError("concurrency must be a positive integer")
     if not work:
         return ()
-    if concurrency == 1:
-        return tuple(
-            run_topic(
-                item,
-                cache=cache,
-                fingerprint=fingerprint,
-                backend_factory=backend_factory,
-                clusterer=clusterer,
-            )
-            for item in work
+    def one(item: TopicWork) -> TopicOutcome:
+        return run_topic(
+            item,
+            cache=cache,
+            fingerprint=fingerprint,
+            backend_factory=backend_factory,
+            clusterer=clusterer,
         )
+
     with ThreadPoolExecutor(max_workers=min(concurrency, len(work))) as pool:
-        return tuple(
-            pool.map(
-                lambda item: run_topic(
-                    item,
-                    cache=cache,
-                    fingerprint=fingerprint,
-                    backend_factory=backend_factory,
-                    clusterer=clusterer,
-                ),
-                work,
-            )
-        )
+        return tuple(pool.map(one, work))
 
 
 def write_manifest(path: Path, outcomes: Sequence[TopicOutcome], **extra: Any) -> None:
@@ -275,17 +264,7 @@ def write_manifest(path: Path, outcomes: Sequence[TopicOutcome], **extra: Any) -
     payload = {
         "schema_version": SCHEMA_VERSION,
         "behavior_version": BEHAVIOR_VERSION,
-        "topics": [
-            {
-                "topic_id": outcome.topic_id,
-                "status": outcome.status,
-                "object_key": outcome.object_key,
-                "nugget_count": outcome.nugget_count,
-                "evidence_count": outcome.evidence_count,
-                "reason": outcome.reason,
-            }
-            for outcome in outcomes
-        ],
+        "topics": [dataclasses.asdict(outcome) for outcome in outcomes],
         **extra,
     }
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"

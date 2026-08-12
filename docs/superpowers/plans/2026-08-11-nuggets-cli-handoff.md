@@ -16,6 +16,10 @@ result-affecting logic out of `nuggets_runner`.
 
 Four modules and four test files. 517 tests pass; 90 are new.
 
+`EvidenceCandidate` holds the whole selected representation plus offsets and
+slices in `.text` on demand: a facet offers thousands of passages and the budget
+keeps 24, so a private slice each cost ~9x the memory for no benefit.
+
 | Module | Responsibility |
 | --- | --- |
 | `src/trec_ragtime/nuggetizer_adapter.py` | The only module that imports `nuggetizer`. Provider calls, bounded. |
@@ -145,10 +149,14 @@ Both were added after review found holes:
   `evidence_digest(bundle.evidence)`, so an altered alias, document, or offset
   cannot be read back under the same key.
 
-Keep both checks non-tautological. Note that `check_bundle`'s `document_ids`
-argument *is* tautological at cache-read time, where it is derived from the
-bundle; it is real on the write path, where it comes from the candidate rows.
-That is intentional — do not "fix" it by deleting the parameter.
+Keep both checks non-tautological. `check_bundle` used to take a `document_ids`
+argument; it was removed, because *both* call sites derived it from the bundle
+under check (on the write path `bundle.evidence` is literally the rows the set
+came from), so the "unknown document" branch could never fire. `evidence_digest`
+is the real binding. If you want a genuine document-membership check, pass the
+universe from the input retrieval artifacts — that would catch evidence
+attributed to a document never retrieved for the topic — but do not reintroduce
+the tautological form.
 
 Any new result-affecting input must join `NuggetFingerprint` or `NuggetRequest`
 and the isolation test matrix. `NuggetFingerprint.output_limits` covers the

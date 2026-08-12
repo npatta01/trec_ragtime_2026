@@ -15,6 +15,10 @@ Each record is one ``msgspec.Struct`` used as both the domain and the wire type.
 field rejection from a single encode/decode round trip and only has to check
 what types cannot express.
 
+Claims are English: the upstream prompt emits English fragments even when the
+source passage is not, so the atomicity guard and the clustering guard below are
+deliberately English-shaped.
+
 Passage text is deliberately absent from the bundle. ``content_hash`` and the
 offsets prove which text was used, and the text itself is recoverable from the
 retrieval artifact, so the artifact stays small and cannot drift from the
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -148,7 +153,15 @@ class EvidenceCandidate:
     content_hash: bytes
     passage_score: float
     document_rank: int
-    text: str
+    # The whole selected representation, shared by every candidate from the same
+    # document. Slicing here instead of at construction keeps one string alive
+    # per document rather than one private copy per offered passage, most of
+    # which never survive the evidence budget.
+    source_text: str
+
+    @property
+    def text(self) -> str:
+        return self.source_text[self.start_char : self.end_char]
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +276,15 @@ class NuggetClusterer:
     ) -> None:
         self._embed = embed
         self._threshold = threshold
+        self._embed_lock = threading.Lock()
+
+    def _resolve_embedder(self) -> Embedder:
+        # run_topics shares one clusterer across threads, so without this every
+        # worker in the first wave would load its own copy of the pinned model.
+        with self._embed_lock:
+            if self._embed is None:
+                self._embed = default_embedder()
+            return self._embed
 
     def cluster(self, claims: Sequence[str]) -> tuple[tuple[int, ...], ...]:
         """Return claim index groups, each ordered, leaders in input order."""
@@ -274,31 +296,24 @@ class NuggetClusterer:
         if len(keys) < 2:
             return tuple(tuple(groups[key]) for key in keys)
 
-        if self._embed is None:
-            self._embed = default_embedder()
-        vectors = self._embed(keys)
+        vectors = self._resolve_embedder()(keys)
         if len(vectors) != len(keys):
             raise NuggetError("embedder returned the wrong number of vectors")
         guards = [_guard_signature(key) for key in keys]
 
-        leaders: list[int] = []
-        members: list[list[int]] = []
-        for index in range(len(keys)):
-            for position, leader in enumerate(leaders):
+        clusters: list[tuple[int, list[int]]] = []
+        for index, key in enumerate(keys):
+            for leader, claims in clusters:
                 # A numeric or polarity difference blocks the merge outright, so
                 # "fell 30%" can never collapse into "fell 13%".
                 if guards[index] != guards[leader]:
                     continue
                 if _cosine(vectors[index], vectors[leader]) >= self._threshold:
-                    members[position].append(index)
+                    claims.extend(groups[key])
                     break
             else:
-                leaders.append(index)
-                members.append([index])
-        return tuple(
-            tuple(sorted(claim for key in group for claim in groups[keys[key]]))
-            for group in members
-        )
+                clusters.append((index, list(groups[key])))
+        return tuple(tuple(sorted(claims)) for _, claims in clusters)
 
 
 def run_topic_nuggets(
@@ -319,16 +334,15 @@ def run_topic_nuggets(
         raise NuggetError("no ranked passages were supplied for this topic")
 
     rejected: Counter[str] = Counter()
-    candidates = []
-    for claim, importance in backend.create(
+    created = backend.create(
         topic_id=topic_id,
         query=query,
         passages=tuple((row.evidence.alias, row.text) for row in rows),
-    ):
-        if _is_atomic(claim):
-            candidates.append((claim.strip(), importance))
-        else:
-            rejected["not_atomic"] += 1
+    )
+    candidates = [
+        (claim.strip(), importance) for claim, importance in created if _is_atomic(claim)
+    ]
+    rejected["not_atomic"] = len(created) - len(candidates)
     if not candidates:
         raise NuggetError("nuggetizer produced no atomic claims for this topic")
 
@@ -343,15 +357,19 @@ def run_topic_nuggets(
             if label in SUPPORT_LABELS:
                 support[position][row.evidence.alias] = label
 
-    kept = [index for index, links in enumerate(support) if links]
-    rejected["unsupported"] += len(candidates) - len(kept)
+    kept = [
+        (claim, importance, links)
+        for (claim, importance), links in zip(candidates, support, strict=True)
+        if links
+    ]
+    rejected["unsupported"] = len(candidates) - len(kept)
     if not kept:
         raise NuggetError("no candidate claim was supported by known evidence")
 
     scores = {row.evidence.alias: row.evidence.passage_score for row in rows}
     nuggets = [
-        _merge_cluster(topic_id, [kept[member] for member in group], candidates, support)
-        for group in clusterer.cluster([candidates[index][0] for index in kept])
+        _merge_cluster(topic_id, [kept[member] for member in group])
+        for group in clusterer.cluster([entry[0] for entry in kept])
     ]
     nuggets.sort(key=lambda nugget: _order_key(nugget, scores))
     if len(nuggets) > max_nuggets:
@@ -374,12 +392,18 @@ def run_topic_nuggets(
         evidence_budget=evidence_budget,
         max_nuggets=max_nuggets,
     )
-    check_bundle(bundle, document_ids={row.evidence.document_id for row in rows})
+    check_bundle(bundle)
     return bundle
 
 
-def check_bundle(bundle: NuggetBundle, *, document_ids: set[str]) -> None:
-    """Fail closed on any bundle whose lineage or ordering is not provable."""
+def check_bundle(bundle: NuggetBundle) -> None:
+    """Fail closed on any bundle whose lineage or ordering is not provable.
+
+    Document identity is pinned by ``NuggetRequest.evidence_digest``, so this
+    checks the structure between nuggets and the alias table rather than
+    membership of a document set both callers could only derive from the bundle
+    under check.
+    """
 
     try:
         decoded = msgspec.msgpack.decode(
@@ -397,8 +421,6 @@ def check_bundle(bundle: NuggetBundle, *, document_ids: set[str]) -> None:
         aliases.add(evidence.alias)
         if evidence.end_char <= evidence.start_char:
             raise NuggetError("nugget evidence offsets do not span any text")
-        if evidence.document_id not in document_ids:
-            raise NuggetError("nugget evidence names an unknown document")
     if len(bundle.evidence) > bundle.evidence_budget:
         raise NuggetError("nugget evidence exceeds the configured budget")
     if len(bundle.nuggets) > bundle.max_nuggets:
@@ -430,26 +452,19 @@ def check_bundle(bundle: NuggetBundle, *, document_ids: set[str]) -> None:
 
 
 def _merge_cluster(
-    topic_id: str,
-    members: Sequence[int],
-    candidates: Sequence[tuple[str, str]],
-    support: Sequence[Mapping[str, str]],
+    topic_id: str, members: Sequence[tuple[str, str, Mapping[str, str]]]
 ) -> Nugget:
     """Fold paraphrases into one nugget, keeping every attesting passage."""
 
     links: dict[str, str] = {}
-    for member in members:
-        for alias, assignment in support[member].items():
+    for _, _, member_links in members:
+        for alias, assignment in member_links.items():
             # A full support judgement outranks a partial one for the same alias.
             if links.get(alias) != "support":
                 links[alias] = assignment
-    claim, _ = candidates[members[0]]
-    importance = (
-        "vital"
-        if any(candidates[member][1] == "vital" for member in members)
-        else "okay"
-    )
-    variants = tuple(sorted({normalize_claim(candidates[m][0]) for m in members}))
+    claim = members[0][0]
+    importance = "vital" if any(m[1] == "vital" for m in members) else "okay"
+    variants = tuple(sorted({normalize_claim(m[0]) for m in members}))
     return Nugget(
         nugget_id=_nugget_id(topic_id, claim, links),
         claim=claim,
@@ -468,25 +483,23 @@ def _facet_coverage(
     rows: Sequence[AliasedPassage],
     nuggets: Sequence[Nugget],
 ) -> tuple[FacetCoverage, ...]:
-    facet_by_alias = {row.evidence.alias: row.evidence.facet_index for row in rows}
-    coverage: list[FacetCoverage] = []
-    for facet in facets:
-        aliases = {
-            alias for alias, index in facet_by_alias.items() if index == facet.facet_index
-        }
-        coverage.append(
-            FacetCoverage(
-                facet_index=facet.facet_index,
-                query=facet.query,
-                evidence_count=len(aliases),
-                nugget_count=sum(
-                    1
-                    for nugget in nuggets
-                    if aliases & {link.alias for link in nugget.support}
-                ),
-            )
+    by_facet: dict[int, set[str]] = {}
+    for row in rows:
+        by_facet.setdefault(row.evidence.facet_index, set()).add(row.evidence.alias)
+    linked = [{link.alias for link in nugget.support} for nugget in nuggets]
+    return tuple(
+        FacetCoverage(
+            facet_index=facet.facet_index,
+            query=facet.query,
+            evidence_count=len(by_facet.get(facet.facet_index, ())),
+            nugget_count=sum(
+                1
+                for aliases in linked
+                if aliases & by_facet.get(facet.facet_index, set())
+            ),
         )
-    return tuple(coverage)
+        for facet in facets
+    )
 
 
 def _order_key(nugget: Nugget, scores: Mapping[str, float]) -> tuple[int, float, str]:

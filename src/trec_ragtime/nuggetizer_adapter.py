@@ -116,9 +116,14 @@ def build(config: NuggetizerConfig) -> Nuggetizer:
         log_level=0,
     )
     handler = BoundedHandler(config.model, max_calls=config.max_calls)
-    nuggetizer.creator_llm = handler
-    nuggetizer.scorer_llm = handler
-    nuggetizer.assigner_llm = handler
+    for slot in ("creator_llm", "scorer_llm", "assigner_llm"):
+        # Upstream builds a client per operation in __init__; release each one
+        # rather than leaving three unused connection pools per topic.
+        replaced = getattr(nuggetizer, slot, None)
+        close = getattr(getattr(replaced, "client", None), "close", None)
+        if callable(close):
+            close()
+        setattr(nuggetizer, slot, handler)
     return nuggetizer
 
 

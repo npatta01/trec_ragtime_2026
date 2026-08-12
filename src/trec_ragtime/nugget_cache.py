@@ -226,19 +226,10 @@ def _validate(
     # cannot be read back under this key.
     if evidence_digest(bundle.evidence) != request.evidence_digest:
         raise NuggetError("nugget evidence does not match the requested alias table")
-    # Document identity is already pinned by the digest above, so the remaining
-    # work here is the referential structure between nuggets and that table.
-    check_bundle(
-        bundle, document_ids={evidence.document_id for evidence in bundle.evidence}
-    )
+    check_bundle(bundle)
 
 
-def _digest(value: bytes | bytearray | str, *, name: str) -> bytes:
-    if isinstance(value, str):
-        try:
-            value = bytes.fromhex(value)
-        except ValueError:
-            raise ValueError(f"{name} must be 32 SHA-256 bytes") from None
+def _digest(value: bytes | bytearray, *, name: str) -> bytes:
     if (
         not isinstance(value, (bytes, bytearray))
         or len(value) != hashlib.sha256().digest_size
