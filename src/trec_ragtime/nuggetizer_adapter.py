@@ -3,9 +3,11 @@
 Nuggetization is delegated to ``nuggetizer``; this module owns nothing but the
 call shape, so a package change cannot leak into the pipeline.
 
-Provider routing needs no wrapper: upstream builds ``OpenAI(api_key=...)`` with
-no explicit base URL, so the SDK resolves ``OPENAI_API_KEY`` and, when set,
-``OPENAI_BASE_URL``. OpenRouter and a LiteLLM proxy are both reachable that way.
+Provider routing follows this repository's convention, which upstream does not
+share: the README documents ``OPENROUTER_API_KEY`` with an OpenRouter base URL,
+while pinned 0.0.5 only ever reads ``OPEN_AI_API_KEY`` or ``OPENAI_API_KEY`` and
+always points at OpenAI. ``provider_settings`` bridges the two, so the setup the
+README already describes works here.
 
 ``BoundedHandler`` exists because upstream's ``LLMHandler.run`` retries forever:
 it catches every exception, rotates the key, sleeps, and loops with no exit
@@ -20,16 +22,19 @@ than from the provider.
 from __future__ import annotations
 
 import importlib.metadata
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import msgspec
-from nuggetizer.core.llm import LLMHandler
 from nuggetizer.core.types import Document, Query, Request, ScoredNugget
 from nuggetizer.models.nuggetizer import Nuggetizer
+from openai import OpenAI
 
 
 PACKAGE_NAME = "nuggetizer"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 MAX_COMPLETION_TOKENS = 2048
 REQUEST_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_CALLS = 64
@@ -51,13 +56,39 @@ class NuggetizerConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     max_calls: int = DEFAULT_MAX_CALLS
 
 
-class BoundedHandler(LLMHandler):
-    """An ``LLMHandler`` with a finite call budget shared across one topic."""
+def provider_settings(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """Return ``(base_url, api_key)`` using this repository's documented setup.
 
-    def __init__(self, model: str, *, max_calls: int) -> None:
-        super().__init__(model)
+    ``OPENROUTER_API_KEY`` wins because that is what the README tells people to
+    export; ``OPENAI_API_KEY`` with an optional ``OPENAI_BASE_URL`` is the
+    fallback. The key is returned for the SDK to use and is never logged, stored,
+    or placed in a fingerprint.
+    """
+
+    values = os.environ if environ is None else environ
+    router_key = values.get("OPENROUTER_API_KEY")
+    if router_key:
+        return values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL), router_key
+    openai_key = values.get("OPENAI_API_KEY") or values.get("OPEN_AI_API_KEY")
+    if openai_key:
+        return values.get("OPENAI_BASE_URL", OPENAI_BASE_URL), openai_key
+    raise NuggetizerError(
+        "no provider credential: export OPENROUTER_API_KEY, or OPENAI_API_KEY "
+        "with an optional OPENAI_BASE_URL"
+    )
+
+
+class BoundedHandler:
+    """An upstream-compatible handler with a finite call budget for one topic."""
+
+    def __init__(
+        self, model: str, *, max_calls: int, base_url: str, api_key: str
+    ) -> None:
         if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1:
             raise ValueError("max_calls must be a positive integer")
+        self.model = model
+        # max_retries=0: retries are this class's job, not the SDK's.
+        self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         self.remaining = max_calls
         self.error: Exception | None = None
 
@@ -106,7 +137,11 @@ def package_identity() -> Mapping[str, str]:
 def build(config: NuggetizerConfig) -> Nuggetizer:
     """Return a configured Nuggetizer whose provider calls are bounded."""
 
+    base_url, api_key = provider_settings()
     nuggetizer = Nuggetizer(
+        # Upstream builds a client per operation in its constructor and would
+        # fail without a key it recognises; these are replaced and closed below.
+        api_keys=api_key,
         model=config.model,
         creator_window_size=config.creator_window_size,
         scorer_window_size=config.scorer_window_size,
@@ -115,7 +150,9 @@ def build(config: NuggetizerConfig) -> Nuggetizer:
         max_nuggets=config.max_nuggets,
         log_level=0,
     )
-    handler = BoundedHandler(config.model, max_calls=config.max_calls)
+    handler = BoundedHandler(
+        config.model, max_calls=config.max_calls, base_url=base_url, api_key=api_key
+    )
     for slot in ("creator_llm", "scorer_llm", "assigner_llm"):
         # Upstream builds a client per operation in __init__; release each one
         # rather than leaving three unused connection pools per topic.
@@ -197,10 +234,12 @@ def _label(value: Any, allowed: frozenset[str], field: str) -> str:
 __all__ = [
     "DEFAULT_MAX_CALLS",
     "MAX_COMPLETION_TOKENS",
+    "OPENROUTER_BASE_URL",
     "BoundedHandler",
     "NuggetizerBackend",
     "NuggetizerConfig",
     "NuggetizerError",
     "build",
     "package_identity",
+    "provider_settings",
 ]

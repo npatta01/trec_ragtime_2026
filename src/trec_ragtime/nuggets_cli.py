@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -27,7 +26,7 @@ from typing import Any
 
 from .artifact_store import ArtifactStore
 from .nugget_cache import NuggetArtifactCache, NuggetInput
-from .nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig
+from .nuggetizer_adapter import NuggetizerBackend, NuggetizerConfig, provider_settings
 from .nuggets import DEFAULT_EVIDENCE_BUDGET, DEFAULT_MAX_NUGGETS, NuggetClusterer
 from .nuggets_runner import (
     DEFAULT_CONCURRENCY,
@@ -199,6 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--representation", choices=("canonical", "report_text"), default="report_text"
     )
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument(
+        "--device", default="cpu",
+        help="cross-encoder device: cpu, cuda, cuda:N, or rocm. "
+             "The scorer fingerprint includes it, so changing it re-scores.",
+    )
     parser.add_argument("--evidence-budget", type=int, default=DEFAULT_EVIDENCE_BUDGET)
     parser.add_argument("--max-nuggets", type=int, default=DEFAULT_MAX_NUGGETS)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
@@ -254,14 +258,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     fingerprint = build_fingerprint(
         NuggetizerBackend(config),
         clusterer,
-        provider_base_url=os.environ.get(
-            "OPENAI_BASE_URL", "https://api.openai.com/v1"
-        ),
+        # The same resolution the backend will use, so the fingerprint cannot
+        # name a provider other than the one that runs.
+        provider_base_url=provider_settings()[0],
         evidence_budget=arguments.evidence_budget,
         max_nuggets=arguments.max_nuggets,
     )
     store = ArtifactStore.from_env()
-    scorer_config = LocalCrossEncoderConfig()
+    scorer_config = LocalCrossEncoderConfig(device=arguments.device)
     scorer = LocalCrossEncoderScorer(scorer_config)
 
     outcomes: list[TopicOutcome] = []

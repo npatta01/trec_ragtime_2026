@@ -10,12 +10,14 @@ from typing import Any
 from nuggetizer.core.types import AssignedScoredNugget, ScoredNugget
 
 from trec_ragtime.nuggetizer_adapter import (
+    OPENROUTER_BASE_URL,
     BoundedHandler,
     NuggetizerBackend,
     NuggetizerConfig,
     NuggetizerError,
     build,
     package_identity,
+    provider_settings,
 )
 
 
@@ -231,7 +233,10 @@ class AssignTestCase(unittest.TestCase):
 
 class BoundedHandlerTestCase(ProviderKeyTestCase):
     def _handler(self, *outcomes: Any, max_calls: int = 8) -> BoundedHandler:
-        handler = BoundedHandler("test-model", max_calls=max_calls)
+        handler = BoundedHandler(
+            "test-model", max_calls=max_calls,
+            base_url="https://provider/v1", api_key="test-key",
+        )
         handler.client = fake_client(*outcomes)
         return handler
 
@@ -265,7 +270,35 @@ class BoundedHandlerTestCase(ProviderKeyTestCase):
         for max_calls in (0, -1, True):
             with self.subTest(max_calls=max_calls):
                 with self.assertRaises(ValueError):
-                    BoundedHandler("test-model", max_calls=max_calls)
+                    BoundedHandler(
+                        "test-model", max_calls=max_calls,
+                        base_url="https://provider/v1", api_key="k",
+                    )
+
+
+class ProviderSettingsTestCase(unittest.TestCase):
+    """This repository documents OpenRouter; pinned 0.0.5 has never heard of it."""
+
+    def test_prefers_the_documented_openrouter_variable(self) -> None:
+        base_url, key = provider_settings({"OPENROUTER_API_KEY": "router"})
+        self.assertEqual(base_url, OPENROUTER_BASE_URL)
+        self.assertEqual(key, "router")
+
+    def test_falls_back_to_openai_with_its_own_base_url(self) -> None:
+        base_url, key = provider_settings(
+            {"OPENAI_API_KEY": "direct", "OPENAI_BASE_URL": "https://proxy/v1"}
+        )
+        self.assertEqual((base_url, key), ("https://proxy/v1", "direct"))
+
+    def test_an_explicit_base_url_overrides_the_openrouter_default(self) -> None:
+        base_url, _ = provider_settings(
+            {"OPENROUTER_API_KEY": "router", "OPENAI_BASE_URL": "https://proxy/v1"}
+        )
+        self.assertEqual(base_url, "https://proxy/v1")
+
+    def test_names_both_variables_when_neither_is_set(self) -> None:
+        with self.assertRaisesRegex(NuggetizerError, "OPENROUTER_API_KEY"):
+            provider_settings({})
 
 
 if __name__ == "__main__":
