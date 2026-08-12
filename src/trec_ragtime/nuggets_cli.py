@@ -282,8 +282,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--device", default="cpu",
-        help="cross-encoder device: cpu, cuda, cuda:N, or rocm. "
-             "The scorer fingerprint includes it, so changing it re-scores.",
+        help="cross-encoder device: cpu, cuda, cuda:N, or rocm. The scorer "
+             "fingerprint includes it, so this must MATCH whatever produced the "
+             "cached passage scores or every one of them misses and is recomputed. "
+             "Scores computed on a GPU are reachable with --device cuda even on a "
+             "host without CUDA, because a cache hit never loads the model.",
     )
     parser.add_argument(
         "--rerank-documents", type=int, default=None,

@@ -347,3 +347,35 @@ class ParserTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScorerIdentityTestCase(unittest.TestCase):
+    """The device is part of the scorer fingerprint, so it selects the cache."""
+
+    def test_device_changes_which_scores_are_reachable(self) -> None:
+        from trec_ragtime.passage_scoring import LocalCrossEncoderConfig
+
+        gpu = LocalCrossEncoderConfig(device="cuda")
+        cpu = LocalCrossEncoderConfig(device="cpu")
+        # Scores computed on a GPU are invisible to a CPU-identity run, which
+        # would silently recompute all of them instead of reusing the work.
+        self.assertNotEqual(gpu.fingerprint, cpu.fingerprint)
+
+    def test_the_remote_batch_size_matches_the_cli_default(self) -> None:
+        """A batch-size drift would isolate the cache just as a device would."""
+
+        from trec_ragtime.passage_scoring import DEFAULT_BATCH_SIZE, LocalCrossEncoderConfig
+
+        self.assertEqual(DEFAULT_BATCH_SIZE, 32)
+        self.assertEqual(
+            LocalCrossEncoderConfig(device="cuda", batch_size=32).fingerprint,
+            LocalCrossEncoderConfig(device="cuda").fingerprint,
+        )
+
+    def test_a_gpu_identity_scorer_builds_without_a_gpu(self) -> None:
+        """Consuming GPU scores locally must not require CUDA to be present."""
+
+        from trec_ragtime.passage_scoring import LocalCrossEncoderConfig, LocalCrossEncoderScorer
+
+        scorer = LocalCrossEncoderScorer(LocalCrossEncoderConfig(device="cuda"))
+        self.assertIsNone(scorer._model)
