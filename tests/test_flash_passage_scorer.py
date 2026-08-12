@@ -19,7 +19,7 @@ import unittest
 from collections import UserDict
 from collections.abc import Callable
 from dataclasses import replace
-from unittest.mock import PropertyMock, patch
+from unittest.mock import patch
 
 from trec_ragtime.flash_passage_scorer import (
     FLASH_PAYLOAD_LIMIT_BYTES,
