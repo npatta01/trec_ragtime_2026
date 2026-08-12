@@ -18,7 +18,6 @@ import msgspec
 
 from .artifact_store import (
     ArtifactStoreLike,
-    ArtifactStoreRemoteError,
     ArtifactValidationError,
 )
 from .nuggets import NuggetBundle, NuggetError, NuggetEvidence, check_bundle
@@ -132,12 +131,13 @@ class NuggetArtifactCache:
     def get(
         self, fingerprint: NuggetFingerprint, request: NuggetRequest
     ) -> NuggetBundle | None:
-        try:
-            bundle = self.store.read_validated(
-                self.object_key(fingerprint, request), _decoder(fingerprint, request)
-            )
-        except (OSError, ArtifactStoreRemoteError):
-            return None
+        # Operational failures deliberately propagate. Converting them to a
+        # miss here would undo the store's whole reason for distinguishing
+        # them: the caller would recompute a bundle it already has, or record
+        # unreachable work as absent. Only a confirmed absence returns None.
+        bundle = self.store.read_validated(
+            self.object_key(fingerprint, request), _decoder(fingerprint, request)
+        )
         if bundle is not None and not isinstance(bundle, NuggetBundle):
             raise ArtifactValidationError("cached nugget decoder returned an invalid value")
         return bundle
@@ -161,16 +161,15 @@ class NuggetArtifactCache:
             stored_at=float(stored_at),
             bundle=bundle,
         )
-        try:
-            return (
-                self.store.write(
-                    self.object_key(fingerprint, request),
-                    msgspec.msgpack.encode(envelope),
-                )
-                is True
+        # A failed write raises rather than reporting False, so that a topic is
+        # recorded as failed instead of appearing to have been published.
+        return (
+            self.store.write(
+                self.object_key(fingerprint, request),
+                msgspec.msgpack.encode(envelope),
             )
-        except (OSError, ArtifactStoreRemoteError):
-            return False
+            is True
+        )
 
 
 def _decoder(
