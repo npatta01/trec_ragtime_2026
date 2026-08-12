@@ -167,6 +167,53 @@ class CountingLoader:
         return self.model, self.tokenizer
 
 
+class WorkerCacheStore:
+    """Tiny strict store fake for the worker-owned cache seam."""
+
+    def __init__(self, *, write_result: bool = True, reread: object = "stored") -> None:
+        self.objects: dict[str, bytes] = {}
+        self.read_validated_calls: list[str] = []
+        self.write_calls: list[tuple[str, bytes]] = []
+        self.evict_local_calls: list[str] = []
+        self.write_result = write_result
+        self.reread = reread
+
+    def read_validated(
+        self, key: str, decoder: Callable[[bytes], object]
+    ) -> object | None:
+        self.read_validated_calls.append(key)
+        if self.reread != "stored":
+            return self.reread
+        payload = self.objects.get(key)
+        return None if payload is None else decoder(payload)
+
+    def write(self, key: str, payload: bytes) -> bool:
+        self.write_calls.append((key, payload))
+        if self.write_result:
+            self.objects[key] = payload
+        return self.write_result
+
+    def evict_local(self, key: str) -> None:
+        self.evict_local_calls.append(key)
+
+
+def _request_for_rows(
+    config: LocalCrossEncoderConfig,
+    rows: list[tuple[str, str]],
+    *,
+    query: str = "query",
+) -> dict[str, object]:
+    return {
+        "schema_version": WIRE_SCHEMA_VERSION,
+        "scorer_fingerprint": config.fingerprint,
+        "model_config": _wire_model_config(config),
+        "query": query,
+        "rows": [
+            {"hash": sha256_bytes(text).hex(), "text": text} for _, text in rows
+        ],
+    }
+
+
 class FakeAsyncRunner:
     def __init__(self, *, delay: float = 0.0, mode: str = "normal") -> None:
         self.delay = delay
@@ -337,6 +384,45 @@ class FlashWireCodecTests(unittest.TestCase):
 
 
 class RunpodFlashConfigTests(unittest.TestCase):
+    def test_worker_tuple_range_and_max_concurrency_reach_endpoint_factory(
+        self,
+    ) -> None:
+        config = RunpodFlashConfig(
+            endpoint_id="endpoint",
+            workers=(0, 2),
+            max_concurrency=3,
+        )
+        calls: list[dict[str, object]] = []
+
+        def endpoint_factory(
+            **kwargs: object,
+        ) -> Callable[[type[object]], type[object]]:
+            calls.append(kwargs)
+            return lambda worker: worker
+
+        build_flash_worker(
+            config,
+            endpoint_factory=endpoint_factory,
+            gpu_resolver=lambda name: name,
+        )
+
+        self.assertEqual(calls[0]["workers"], (0, 2))
+        self.assertEqual(calls[0]["max_concurrency"], 3)
+
+    def test_worker_tuple_range_is_validated(self) -> None:
+        for workers in ((1,), (2, 1), (-1, 1), (0, 0), (0, 1.0), True):
+            with self.subTest(workers=workers), self.assertRaises(ValueError):
+                RunpodFlashConfig(  # type: ignore[arg-type]
+                    endpoint_id="endpoint", workers=workers
+                )
+
+    def test_max_concurrency_must_be_positive_integer(self) -> None:
+        for value in (0, -1, 1.0, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RunpodFlashConfig(  # type: ignore[arg-type]
+                    endpoint_id="endpoint", max_concurrency=value
+                )
+
     def test_transport_settings_do_not_change_model_fingerprint(self) -> None:
         policy = LocalCrossEncoderConfig(batch_size=2)
         base = RunpodFlashConfig(
@@ -470,7 +556,9 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
             finally:
                 scorer.close()
 
-            worker = build_flash_worker(config)(loader=failing_loader)
+            worker = build_flash_worker(config)(
+                loader=failing_loader, cache_store=WorkerCacheStore()
+            )
             with self.assertRaises(ValueError):
                 worker.score(_request_for_config(config, query=query, text=text))
 
@@ -699,7 +787,8 @@ class RunpodFlashPassageScorerTests(unittest.TestCase):
         policy = LocalCrossEncoderConfig()
         config = RunpodFlashConfig(endpoint_id="endpoint", model_config=policy)
         worker = build_flash_worker(policy)(
-            loader=CountingLoader(FakeModel(), BatchEncodingTokenizer())
+            loader=CountingLoader(FakeModel(), BatchEncodingTokenizer()),
+            cache_store=WorkerCacheStore(),
         )
         request = encode_flash_request(
             "query",
@@ -988,6 +1077,180 @@ class WorkerCacheArtifactTests(unittest.TestCase):
 
 
 class StaticFlashWorkerTests(unittest.TestCase):
+    def test_cold_miss_writes_rereads_and_returns_complete_scores(self) -> None:
+        policy = LocalCrossEncoderConfig(batch_size=2, max_length=100)
+        model = FakeModel(multiplier=2.0)
+        store = WorkerCacheStore()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        response = worker.score(
+            _request_for_rows(policy, [("a", "a"), ("b", "bb")])
+        )
+
+        self.assertEqual(
+            response["scores"],
+            sorted(
+                [
+                    {"hash": sha256_bytes("a").hex(), "score": 2.0},
+                    {"hash": sha256_bytes("bb").hex(), "score": 4.0},
+                ],
+                key=lambda row: row["hash"],
+            ),
+        )
+        self.assertEqual(response["cache"]["status"], "miss_written")
+        self.assertEqual(response["cache"]["row_count"], 2)
+        self.assertEqual(response["cache"]["batch_count"], 1)
+        self.assertEqual(len(store.write_calls), 1)
+        self.assertEqual(store.evict_local_calls, [store.write_calls[0][0]])
+        self.assertEqual(store.read_validated_calls, [store.write_calls[0][0]] * 2)
+
+    def test_warm_hit_on_fresh_worker_does_not_load_model(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore()
+        first_model = FakeModel()
+        first = build_flash_worker(policy)(
+            loader=CountingLoader(first_model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+        request = _request_for_config(policy)
+        first.score(request)
+
+        def failing_loader(config: object) -> object:
+            raise AssertionError("warm hit must not load the model")
+
+        second = build_flash_worker(policy)(
+            loader=failing_loader,
+            cache_store=store,
+        )
+        response = second.score(request)
+
+        self.assertEqual(response["cache"]["status"], "hit")
+        self.assertEqual(response["cache"]["row_count"], 1)
+        self.assertEqual(response["cache"]["batch_count"], 0)
+        self.assertEqual(len(store.write_calls), 1)
+
+    def test_65_rows_use_three_model_batches_and_report_three(self) -> None:
+        policy = LocalCrossEncoderConfig(batch_size=32, max_length=1000)
+        model = FakeModel()
+        store = WorkerCacheStore()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+        rows = [(str(index), f"text-{index}") for index in range(65)]
+
+        response = worker.score(_request_for_rows(policy, rows))
+
+        self.assertEqual(len(response["scores"]), 65)
+        self.assertEqual(len(model.predict_calls), 3)
+        self.assertEqual(response["cache"]["batch_count"], 3)
+
+    def test_false_write_fails_closed(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore(write_result=False)
+        model = FakeModel()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        with self.assertRaisesRegex(ValueError, "worker cache write failed"):
+            worker.score(_request_for_config(policy))
+
+    def test_missing_reread_fails_closed(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore()
+        store.reread = None
+        model = FakeModel()
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        with self.assertRaisesRegex(ValueError, "worker cache reread failed"):
+            worker.score(_request_for_config(policy))
+
+    def test_malformed_hit_fails_closed_before_model_load(self) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        store = WorkerCacheStore()
+        store.reread = {b"incomplete": 1.0}
+
+        def failing_loader(config: object) -> object:
+            raise AssertionError("malformed hit must not load the model")
+
+        worker = build_flash_worker(policy)(
+            loader=failing_loader,
+            cache_store=store,
+        )
+
+        with self.assertRaisesRegex(ValueError, "worker cache artifact is malformed"):
+            worker.score(_request_for_config(policy))
+
+    def test_isolated_worker_scores_with_injected_store_without_project_imports(
+        self,
+    ) -> None:
+        policy = LocalCrossEncoderConfig(max_length=100)
+        source = inspect.getsource(FlashPassageWorker)
+        namespace = {"__name__": "flash_worker_isolated"}
+        model = FakeModel()
+        store = WorkerCacheStore()
+        with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
+            exec(compile(source, "<flash-worker>", "exec"), namespace)
+        isolated = namespace["FlashPassageWorker"]
+        worker = isolated(
+            loader=CountingLoader(model, BatchEncodingTokenizer()),
+            cache_store=store,
+        )
+
+        response = worker.score(_request_for_config(policy))
+
+        self.assertEqual(response["cache"]["status"], "miss_written")
+
+    def test_default_store_uses_private_bucket_configuration_without_leaking_secrets(
+        self,
+    ) -> None:
+        captured: dict[str, object] = {}
+        fake_module = types.ModuleType("trec_ragtime.artifact_store")
+
+        class FakeProductionStore(WorkerCacheStore):
+            @classmethod
+            def from_env(cls, **kwargs: object) -> "FakeProductionStore":
+                captured.update(kwargs)
+                return cls()
+
+        fake_module.ArtifactStore = FakeProductionStore  # type: ignore[attr-defined]
+        policy = LocalCrossEncoderConfig(max_length=100)
+        secret_bucket = "private-owner/private-bucket"
+        secret_token = "hf_secret_token_value"
+        with (
+            patch.dict(
+                sys.modules,
+                {"trec_ragtime.artifact_store": fake_module},
+                clear=False,
+            ),
+            patch.dict(
+                __import__("os").environ,
+                {
+                    "RAGTIME_HF_BUCKET_ID": secret_bucket,
+                    "RAGTIME_ARTIFACT_CACHE_DIR": "/tmp/trec-ragtime-test-artifacts",
+                    "HF_TOKEN": secret_token,
+                    "HF_ENDPOINT": "https://huggingface.example",
+                },
+                clear=False,
+            ),
+        ):
+            worker = build_flash_worker(policy)(
+                loader=CountingLoader(FakeModel(), BatchEncodingTokenizer())
+            )
+
+        self.assertEqual(captured["bucket_id"], secret_bucket)
+        self.assertEqual(captured["local_dir"], "/tmp/trec-ragtime-test-artifacts")
+        self.assertEqual(captured["endpoint"], "https://huggingface.example")
+        self.assertNotIn(secret_token, repr(worker))
+
     def test_worker_tokenizer_metadata_matches_local_token_length_contract(
         self,
     ) -> None:
@@ -1019,9 +1282,10 @@ class StaticFlashWorkerTests(unittest.TestCase):
 
         def worker_with(tokenizer: MetadataTokenizer) -> tuple[FakeModel, object]:
             model = FakeModel()
-            worker = build_flash_worker(
-                policy,
-            )(loader=CountingLoader(model, tokenizer))
+            worker = build_flash_worker(policy)(
+                loader=CountingLoader(model, tokenizer),
+                cache_store=WorkerCacheStore(),
+            )
             return model, worker
 
         for truncated in (None, 0, [0], (0,)):
@@ -1228,7 +1492,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
         with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
             exec(compile(source, "<flash-worker>", "exec"), namespace)
         isolated_worker = namespace["FlashPassageWorker"]
-        worker = isolated_worker(loader=loader)
+        worker = isolated_worker(loader=loader, cache_store=WorkerCacheStore())
         response = worker.score(_request_for_config(policy))
 
         self.assertEqual(response["scorer_fingerprint"], policy.fingerprint)
@@ -1238,7 +1502,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
     def test_constructor_is_cold_and_first_valid_request_loads_once(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=100)
         loader = CountingLoader(FakeModel(), BatchEncodingTokenizer())
-        worker = build_flash_worker(policy)(loader=loader)
+        worker = build_flash_worker(policy)(
+            loader=loader, cache_store=WorkerCacheStore()
+        )
 
         self.assertEqual(len(loader.calls), 0)
         request = _request_for_config(policy)
@@ -1276,7 +1542,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
                 raise AssertionError("test loader was not released")
             return model, BatchEncodingTokenizer()
 
-        worker = build_flash_worker(policy_a)(loader=loader)
+        worker = build_flash_worker(policy_a)(loader=loader, cache_store=WorkerCacheStore())
         original_validate = FlashPassageWorker._validate_request
 
         def synchronized_validate(
@@ -1369,7 +1635,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
             "_default_loader",
             return_value=(default_model, default_tokenizer),
         ):
-            worker = build_flash_worker(policy)(loader=loader)
+            worker = build_flash_worker(policy)(loader=loader, cache_store=WorkerCacheStore())
             worker.score(_request_for_config(policy))
 
         self.assertEqual(loader.calls, 1)
@@ -1391,7 +1657,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
 
         model = FailingModel()
         loader = CountingLoader(model, tokenizer)
-        worker = build_flash_worker(policy_a)(loader=loader)
+        worker = build_flash_worker(policy_a)(loader=loader, cache_store=WorkerCacheStore())
 
         with self.assertRaises(ValueError):
             worker.score(_request_for_config(policy_a))
@@ -1404,7 +1670,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
     def test_worker_validates_exact_request_model_config_and_pair_ceiling(self) -> None:
         policy = LocalCrossEncoderConfig(max_length=10)
         loader = CountingLoader(FakeModel(), BatchEncodingTokenizer())
-        worker = build_flash_worker(policy)(loader=loader)
+        worker = build_flash_worker(policy)(loader=loader, cache_store=WorkerCacheStore())
         request = _request_for_config(policy)
 
         with self.assertRaises(ValueError):
@@ -1427,7 +1693,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
         with patch.dict(sys.modules, {"trec_ragtime": None}, clear=False):
             exec(compile(source, "<flash-worker>", "exec"), namespace)
         isolated_worker = namespace["FlashPassageWorker"]
-        worker = isolated_worker(loader=lambda config: (model, tokenizer))
+        worker = isolated_worker(
+            loader=lambda config: (model, tokenizer), cache_store=WorkerCacheStore()
+        )
 
         with self.assertRaisesRegex(ValueError, "overflow"):
             worker.score(_request_for_config(policy, text="abc"))
@@ -1458,7 +1726,9 @@ class StaticFlashWorkerTests(unittest.TestCase):
         policy = LocalCrossEncoderConfig(batch_size=2, max_length=100)
         model = FakeModel(multiplier=2.0)
         tokenizer = BatchEncodingTokenizer()
-        worker = build_flash_worker(policy)(loader=CountingLoader(model, tokenizer))
+        worker = build_flash_worker(policy)(
+            loader=CountingLoader(model, tokenizer), cache_store=WorkerCacheStore()
+        )
         response = worker.score(
             {
                 **_request_for_config(policy),
@@ -1493,7 +1763,8 @@ class StaticFlashWorkerTests(unittest.TestCase):
             loader=lambda config: (FakeModel(multiplier=2.0), BatchEncodingTokenizer()),
         )
         remote_worker = build_flash_worker(policy)(
-            loader=lambda config: (FakeModel(multiplier=2.0), BatchEncodingTokenizer())
+            loader=lambda config: (FakeModel(multiplier=2.0), BatchEncodingTokenizer()),
+            cache_store=WorkerCacheStore(),
         )
         runner = RunpodFlashPassageScorer(
             RunpodFlashConfig(endpoint_id="fake", model_config=policy),
@@ -1567,6 +1838,8 @@ class FlashDecorationTests(unittest.TestCase):
                 f"torch=={policy.torch_version}",
                 "msgspec==0.21.1",
                 f"packaging=={importlib.metadata.version('packaging')}",
+                f"fsspec=={importlib.metadata.version('fsspec')}",
+                f"huggingface-hub=={importlib.metadata.version('huggingface-hub')}",
             ],
         )
 

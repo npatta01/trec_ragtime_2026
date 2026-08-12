@@ -422,12 +422,208 @@ class FlashPassageWorker:
             raise cls._error("cache artifact is not canonical")
         return scores
 
-    def __init__(self, loader: object | None = None) -> None:
+    @staticmethod
+    def _default_cache_store() -> object:
+        """Construct the private HF Bucket store without module imports."""
+
+        import os
+
+        try:
+            from trec_ragtime.artifact_store import ArtifactStore
+
+            bucket_id = os.getenv("RAGTIME_HF_BUCKET_ID", "").strip()
+            if not bucket_id:
+                raise ValueError("RAGTIME_HF_BUCKET_ID is required")
+            local_dir = (
+                os.getenv("RAGTIME_ARTIFACT_CACHE_DIR", "").strip()
+                or "/tmp/trec-ragtime-artifacts"
+            )
+            endpoint = os.getenv("HF_ENDPOINT", "").strip() or None
+            return ArtifactStore.from_env(
+                bucket_id=bucket_id,
+                local_dir=local_dir,
+                endpoint=endpoint,
+            )
+        except ImportError:
+            pass
+        except Exception as error:
+            raise ValueError("worker cache store is unavailable") from error
+
+        try:
+            import hashlib
+            from pathlib import Path
+
+            import fsspec
+            from huggingface_hub import HfApi
+        except Exception as error:
+            raise ValueError("worker cache store is unavailable") from error
+
+        bucket_id = os.getenv("RAGTIME_HF_BUCKET_ID", "").strip()
+        if not bucket_id or bucket_id.count("/") != 1:
+            raise ValueError("worker cache store is unavailable")
+        bucket_parts = bucket_id.split("/")
+        if any(
+            not part
+            or part in {".", ".."}
+            or any(character.isspace() for character in part)
+            for part in bucket_parts
+        ) or any(character in bucket_id for character in "?#\\"):
+            raise ValueError("worker cache store is unavailable")
+        prefix = os.getenv("RAGTIME_ARTIFACT_PREFIX", "")
+        if prefix and (
+            prefix.startswith("/")
+            or prefix.endswith("/")
+            or any(
+                not part
+                or part in {".", ".."}
+                or any(ord(character) < 32 for character in part)
+                for part in prefix.split("/")
+            )
+            or any(character in prefix for character in "?#\\")
+        ):
+            raise ValueError("worker cache store is unavailable")
+        local_dir = (
+            os.getenv("RAGTIME_ARTIFACT_CACHE_DIR", "").strip()
+            or "/tmp/trec-ragtime-artifacts"
+        )
+        local_path = Path(local_dir)
+        if not local_path.is_absolute() or local_path.is_symlink():
+            raise ValueError("worker cache store is unavailable")
+        try:
+            local_path.mkdir(parents=True, exist_ok=True)
+            local_path.chmod(0o700)
+            if local_path.stat().st_mode & 0o777 != 0o700:
+                raise OSError
+        except OSError as error:
+            raise ValueError("worker cache store is unavailable") from error
+        token = os.getenv("HF_TOKEN") or None
+        endpoint = os.getenv("HF_ENDPOINT", "").strip() or None
+
+        class DirectArtifactStore:
+            def __init__(self) -> None:
+                self._api = HfApi(token=token, endpoint=endpoint)
+                target_options = {"token": token}
+                if endpoint is not None:
+                    target_options["endpoint"] = endpoint
+                self._filesystem = fsspec.filesystem(
+                    "simplecache",
+                    target_protocol="hf",
+                    cache_storage=str(local_path),
+                    target_options=target_options,
+                    skip_instance_cache=True,
+                )
+                self._private_verified = False
+
+            @staticmethod
+            def _validate_key(key: str) -> str:
+                if (
+                    not isinstance(key, str)
+                    or not key
+                    or key != key.strip()
+                    or key.startswith("/")
+                    or key.endswith("/")
+                    or any(character in key for character in "?#\\")
+                    or any(
+                        not part
+                        or part in {".", ".."}
+                        or any(ord(character) < 32 for character in part)
+                        for part in key.split("/")
+                    )
+                ):
+                    raise ValueError("worker cache object key is invalid")
+                return key
+
+            def _remote_path(self, key: str) -> str:
+                full_key = f"{prefix}/{key}" if prefix else key
+                return f"hf://buckets/{bucket_id}/{full_key}"
+
+            def _local_candidate(self, key: str) -> Path:
+                remote_path = self._remote_path(key).removeprefix("hf://")
+                digest = hashlib.sha256(remote_path.encode("utf-8")).hexdigest()
+                return local_path / digest
+
+            def _verify_private(self) -> None:
+                if self._private_verified:
+                    return
+                try:
+                    info = self._api.bucket_info(bucket_id)
+                except Exception as error:
+                    raise ValueError("worker cache bucket inspection failed") from error
+                if getattr(info, "private", None) is not True:
+                    raise ValueError("worker cache bucket is not private")
+                self._private_verified = True
+
+            def read_validated(self, key: str, decoder: object) -> object | None:
+                key = self._validate_key(key)
+                candidate = self._local_candidate(key)
+                try:
+                    payload = candidate.read_bytes()
+                except FileNotFoundError:
+                    payload = None
+                except OSError as error:
+                    raise ValueError("worker cache read failed") from error
+                if payload is not None:
+                    try:
+                        return decoder(payload)  # type: ignore[operator]
+                    except ValueError:
+                        try:
+                            candidate.unlink(missing_ok=True)
+                        except OSError as error:
+                            raise ValueError("worker cache read failed") from error
+                self._verify_private()
+                try:
+                    with self._filesystem.open(self._remote_path(key), "rb") as handle:
+                        payload = handle.read()
+                except FileNotFoundError:
+                    return None
+                except Exception as error:
+                    raise ValueError("worker cache read failed") from error
+                try:
+                    return decoder(bytes(payload))  # type: ignore[operator]
+                except ValueError as error:
+                    raise ValueError("worker cache artifact is malformed") from error
+
+            def write(self, key: str, payload: bytes) -> bool:
+                key = self._validate_key(key)
+                if not isinstance(payload, bytes):
+                    raise ValueError("worker cache write failed")
+                self._verify_private()
+                try:
+                    with self._filesystem.open(self._remote_path(key), "wb") as handle:
+                        handle.write(payload)
+                    candidate = self._local_candidate(key)
+                    return candidate.is_file() and candidate.read_bytes() == payload
+                except Exception as error:
+                    raise ValueError("worker cache write failed") from error
+
+            def evict_local(self, key: str) -> None:
+                candidate = self._local_candidate(self._validate_key(key))
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as error:
+                    raise ValueError("worker cache eviction failed") from error
+
+        try:
+            return DirectArtifactStore()
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError("worker cache store is unavailable") from error
+
+    def __init__(
+        self, loader: object | None = None, cache_store: object | None = None
+    ) -> None:
         import threading
 
         if loader is not None and not callable(loader):
             raise self._error("loader must be callable")
+        if cache_store is None:
+            cache_store = self._default_cache_store()
+        for method_name in ("read_validated", "write", "evict_local"):
+            if not callable(getattr(cache_store, method_name, None)):
+                raise self._error("cache store does not expose the required operations")
         self._loader = loader if loader is not None else self._default_loader
+        self._cache_store = cache_store
         self._state_lock = threading.Lock()
         self._model: object | None = None
         self._tokenizer: object | None = None
@@ -682,6 +878,7 @@ class FlashPassageWorker:
         rows: list[tuple[bytes, str]],
         model: object,
         tokenizer: object,
+        batch_count: list[int] | None = None,
     ) -> dict[bytes, float]:
         import math
         import numbers
@@ -726,6 +923,8 @@ class FlashPassageWorker:
                         }
                     },
                 )
+                if batch_count is not None:
+                    batch_count[0] += 1
             except Exception as error:
                 raise cls._error("model prediction failed") from error
             raw_scores.extend(cls._prediction_values(prediction, len(batch)))
@@ -743,18 +942,102 @@ class FlashPassageWorker:
             normalized[content_hash] = score
         return {key: normalized[key] for key in sorted(normalized)}
 
+    @classmethod
+    def _normalized_cache_scores(
+        cls, identity: object, scores: object
+    ) -> dict[bytes, float]:
+        """Validate a score map returned by a strict cache implementation."""
+
+        try:
+            payload = cls._encode_cache_artifact(identity, scores)
+            return cls._decode_cache_artifact(payload, identity)
+        except cls._ERROR as error:
+            raise cls._error("worker cache artifact is malformed") from error
+
+    def _read_cache(self, key: str, identity: object) -> dict[bytes, float] | None:
+        try:
+            value = self._cache_store.read_validated(
+                key,
+                lambda payload: self._decode_cache_artifact(payload, identity),
+            )
+        except self._ERROR as error:
+            raise self._error("worker cache artifact is malformed") from error
+        except Exception as error:
+            raise self._error("worker cache read failed") from error
+        if value is None:
+            return None
+        return self._normalized_cache_scores(identity, value)
+
+    def _reread_cache(self, key: str, identity: object) -> dict[bytes, float]:
+        try:
+            value = self._cache_store.read_validated(
+                key,
+                lambda payload: self._decode_cache_artifact(payload, identity),
+            )
+        except Exception as error:
+            raise self._error("worker cache reread failed") from error
+        if value is None:
+            raise self._error("worker cache reread failed")
+        try:
+            return self._normalized_cache_scores(identity, value)
+        except self._ERROR as error:
+            raise self._error("worker cache reread failed") from error
+
     def score(self, request: object) -> dict[str, object]:
         try:
             config, fingerprint, query, rows = self._validate_request(request)
+            identity = self._cache_identity(
+                fingerprint, query, [content_hash for content_hash, _ in rows]
+            )
+            object_key = self._cache_object_key(identity)
+            cached = self._read_cache(object_key, identity)
+            if cached is not None:
+                return {
+                    "schema_version": self._WIRE_SCHEMA_VERSION,
+                    "scorer_fingerprint": fingerprint,
+                    "scores": [
+                        {"hash": content_hash.hex(), "score": score}
+                        for content_hash, score in cached.items()
+                    ],
+                    "cache": {
+                        "status": "hit",
+                        "object_key": object_key,
+                        "row_count": len(rows),
+                        "batch_count": 0,
+                    },
+                }
             model, tokenizer = self._ensure_loaded(config, fingerprint)
-            scores = self._score_rows(config, query, rows, model, tokenizer)
+            batch_count = [0]
+            scores = self._score_rows(
+                config, query, rows, model, tokenizer, batch_count
+            )
+            if set(scores) != {content_hash for content_hash, _ in rows}:
+                raise self._error("worker scores do not cover the request")
+            payload = self._encode_cache_artifact(identity, scores)
+            try:
+                written = self._cache_store.write(object_key, payload)
+            except Exception as error:
+                raise self._error("worker cache write failed") from error
+            if written is not True:
+                raise self._error("worker cache write failed")
+            try:
+                self._cache_store.evict_local(object_key)
+            except Exception as error:
+                raise self._error("worker cache eviction failed") from error
+            durable = self._reread_cache(object_key, identity)
             return {
                 "schema_version": self._WIRE_SCHEMA_VERSION,
                 "scorer_fingerprint": fingerprint,
                 "scores": [
                     {"hash": content_hash.hex(), "score": score}
-                    for content_hash, score in scores.items()
+                    for content_hash, score in durable.items()
                 ],
+                "cache": {
+                    "status": "miss_written",
+                    "object_key": object_key,
+                    "row_count": len(rows),
+                    "batch_count": batch_count[0],
+                },
             }
         except self._ERROR:
             raise
@@ -790,6 +1073,13 @@ def _pinned_dependencies(config: object) -> list[str]:
         packaging_version = importlib.metadata.version("packaging")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError("packaging is required by the Flash worker") from error
+    try:
+        fsspec_version = importlib.metadata.version("fsspec")
+        huggingface_hub_version = importlib.metadata.version("huggingface-hub")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError(
+            "artifact-store dependencies are required by the Flash worker"
+        ) from error
     return [
         f"sentence-transformers=={config.sentence_transformers_version}",
         f"transformers=={config.transformers_version}",
@@ -797,10 +1087,14 @@ def _pinned_dependencies(config: object) -> list[str]:
         f"torch=={config.torch_version}",
         f"msgspec=={msgspec_version}",
         f"packaging=={packaging_version}",
+        f"fsspec=={fsspec_version}",
+        f"huggingface-hub=={huggingface_hub_version}",
     ]
 
 
-def _effective_config(config: object | None) -> tuple[object, str, str, int, float]:
+def _effective_config(
+    config: object | None,
+) -> tuple[object, str, str, int | tuple[int, int], int, float]:
     from .flash_passage_scorer import (
         DEFAULT_FLASH_GPU,
         DEFAULT_FLASH_IDLE_TIMEOUT,
@@ -816,6 +1110,7 @@ def _effective_config(config: object | None) -> tuple[object, str, str, int, flo
             DEFAULT_FLASH_WORKER_NAME,
             DEFAULT_FLASH_GPU,
             1,
+            1,
             DEFAULT_FLASH_IDLE_TIMEOUT,
         )
     if isinstance(config, RunpodFlashConfig):
@@ -824,6 +1119,7 @@ def _effective_config(config: object | None) -> tuple[object, str, str, int, flo
             config.worker_name,
             config.gpu,
             config.workers,
+            config.max_concurrency,
             config.idle_timeout,
         )
     if isinstance(config, LocalCrossEncoderConfig):
@@ -831,6 +1127,7 @@ def _effective_config(config: object | None) -> tuple[object, str, str, int, flo
             config,
             DEFAULT_FLASH_WORKER_NAME,
             DEFAULT_FLASH_GPU,
+            1,
             1,
             DEFAULT_FLASH_IDLE_TIMEOUT,
         )
@@ -847,9 +1144,14 @@ def build_flash_worker(
 ) -> type[FlashPassageWorker]:
     """Return the static worker and optionally apply a lazy Flash decorator."""
 
-    model_config, worker_name, gpu_name, workers, idle_timeout = _effective_config(
-        config
-    )
+    (
+        model_config,
+        worker_name,
+        gpu_name,
+        workers,
+        max_concurrency,
+        idle_timeout,
+    ) = _effective_config(config)
     if endpoint_factory is None:
         return FlashPassageWorker
 
@@ -858,6 +1160,7 @@ def build_flash_worker(
         name=worker_name,
         gpu=resolve_gpu(gpu_name),
         workers=workers,
+        max_concurrency=max_concurrency,
         idle_timeout=idle_timeout,
         dependencies=_pinned_dependencies(model_config),
     )

@@ -493,7 +493,8 @@ class RunpodFlashConfig:
     max_payload_bytes: int = FLASH_PAYLOAD_LIMIT_BYTES
     concurrency: int = DEFAULT_FLASH_CONCURRENCY
     request_timeout: float = DEFAULT_FLASH_REQUEST_TIMEOUT
-    workers: int = 1
+    workers: int | tuple[int, int] = 1
+    max_concurrency: int = 1
     idle_timeout: int = DEFAULT_FLASH_IDLE_TIMEOUT
     worker_name: str = DEFAULT_FLASH_WORKER_NAME
     gpu: str = DEFAULT_FLASH_GPU
@@ -523,10 +524,30 @@ class RunpodFlashConfig:
             or self.batch_size <= 0
         ):
             raise ValueError("batch_size must be a positive integer when provided")
-        for field_name in ("max_payload_bytes", "concurrency", "workers"):
+        for field_name in ("max_payload_bytes", "concurrency", "max_concurrency"):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{field_name} must be a positive integer")
+        workers = self.workers
+        if isinstance(workers, bool):
+            raise ValueError("workers must be a positive integer or a valid range")
+        if isinstance(workers, int):
+            if workers <= 0:
+                raise ValueError("workers must be a positive integer")
+        elif isinstance(workers, tuple) and len(workers) == 2:
+            minimum, maximum = workers
+            if (
+                isinstance(minimum, bool)
+                or isinstance(maximum, bool)
+                or not isinstance(minimum, int)
+                or not isinstance(maximum, int)
+                or minimum < 0
+                or minimum > maximum
+                or maximum < 1
+            ):
+                raise ValueError("workers must be a valid (minimum, maximum) range")
+        else:
+            raise ValueError("workers must be a positive integer or a valid range")
         if self.max_payload_bytes > FLASH_PAYLOAD_LIMIT_BYTES:
             raise ValueError("max_payload_bytes cannot exceed the Flash 10 MB limit")
         value = self.request_timeout
@@ -592,7 +613,7 @@ class RunpodFlashConfig:
         return self.idle_timeout
 
     @property
-    def worker_count(self) -> int:
+    def worker_count(self) -> int | tuple[int, int]:
         return self.workers
 
     @property
