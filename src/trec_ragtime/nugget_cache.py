@@ -40,6 +40,7 @@ class NuggetFingerprint(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     embedding_revision: str
     similarity_threshold: float
     guard_version: str
+    support_labels: tuple[str, ...]
     evidence_budget: int
     max_nuggets: int
     # Limits that decide what the model may emit and what survives the atomicity
@@ -219,8 +220,13 @@ def _validate(
         or bundle.max_nuggets != fingerprint.max_nuggets
     ):
         raise NuggetError("nugget bundle contradicts the selection fingerprint")
-    facets = {facet.facet_index for facet in bundle.facets}
-    if facets != {row.facet_index for row in request.inputs}:
+    # Pairs, not just indices: a caller that renumbers one side of the facet
+    # mapping and not the other is caught here. A caller that renumbers both
+    # consistently cannot be caught from inside, since facet_index is data the
+    # caller supplies -- that invariant belongs to whoever holds the query plan.
+    if {(facet.facet_index, facet.query) for facet in bundle.facets} != {
+        (row.facet_index, row.query) for row in request.inputs
+    }:
         raise NuggetError("nugget bundle covers a different facet set")
     # The request pins the alias table, so an altered alias, document, or offset
     # cannot be read back under this key.

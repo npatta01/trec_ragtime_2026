@@ -479,3 +479,77 @@ class RealRerankingIntegrationTestCase(unittest.TestCase):
         self.assertEqual(outcome.status, "written")
         self.assertEqual(outcome.nugget_count, 1)
         self.assertEqual(outcome.evidence_count, len(facets[0].candidates))
+
+
+class FacetNumberingTestCase(unittest.TestCase):
+    """A renumbered facet must not reach a cache key."""
+
+    def _work(self, facet_indices: Any, input_indices: Any) -> TopicWork:
+        return TopicWork(
+            topic_id="2000",
+            query="grain exports",
+            representation="report_text",
+            facets=tuple(
+                FacetEvidence(
+                    facet_index=index,
+                    query=f"facet {plan}",
+                    candidates=(candidate("grain passage", document_id=f"d-{plan}"),),
+                )
+                for index, plan in zip(facet_indices, (0, 2), strict=True)
+            ),
+            inputs=tuple(
+                NuggetInput(
+                    facet_index=index,
+                    query=f"facet {plan}",
+                    object_key=f"retrieval/v1/aa/bb/{plan}.mpk",
+                    request_digest=hashlib.sha256(str(plan).encode()).digest(),
+                )
+                for index, plan in zip(input_indices, (0, 2), strict=True)
+            ),
+            passage_source_fingerprint="fp",
+        )
+
+    def _run(self, work: TopicWork) -> TopicOutcome:
+        return run_topic(
+            work,
+            cache=NuggetArtifactCache(MemoryArtifactStore(), clock=lambda: 1.0),
+            fingerprint=FINGERPRINT,
+            backend_factory=backend_factory(),
+            clusterer=clusterer(),
+        )
+
+    def test_plan_numbering_on_both_sides_is_accepted(self) -> None:
+        self.assertEqual(self._run(self._work([0, 2], [0, 2])).status, "written")
+
+    def test_facets_renumbered_against_their_inputs_are_rejected(self) -> None:
+        outcome = self._run(self._work([0, 1], [0, 2]))
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("facet set", outcome.reason or "")
+
+    def test_inputs_renumbered_against_their_facets_are_rejected(self) -> None:
+        outcome = self._run(self._work([0, 2], [0, 1]))
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("facet set", outcome.reason or "")
+
+
+class ManifestSchemaTestCase(unittest.TestCase):
+    """The manifest is a published boundary, so its key set is a contract."""
+
+    def test_publishes_exactly_the_declared_topic_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            write_manifest(path, [TopicOutcome("2000", "written", "key", 1, 2)])
+            topic = json.loads(path.read_text(encoding="utf-8"))["topics"][0]
+        # Adding a TopicOutcome field must be a deliberate decision to publish
+        # it, not an automatic consequence of dataclasses.asdict.
+        self.assertEqual(
+            set(topic),
+            {
+                "topic_id",
+                "status",
+                "object_key",
+                "nugget_count",
+                "evidence_count",
+                "reason",
+            },
+        )

@@ -10,6 +10,7 @@ from typing import Any
 import msgspec
 
 from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.nuggetizer_adapter import NuggetizerConfig
 from trec_ragtime.nugget_cache import (
     NUGGET_OBJECT_KEY_PREFIX,
     NuggetArtifactCache,
@@ -105,6 +106,7 @@ def fingerprint(**changes: Any) -> NuggetFingerprint:
         "embedding_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
         "similarity_threshold": 0.92,
         "guard_version": "numeric-negation-guard-v1",
+        "support_labels": ("support", "partial_support"),
         "evidence_budget": 24,
         "max_nuggets": 20,
         "output_limits": {
@@ -383,7 +385,7 @@ class FingerprintCoverageTestCase(unittest.TestCase):
             "DEFAULT_SIMILARITY_THRESHOLD": "a default for the fingerprinted threshold",
             "MAX_CLAIM_CHARACTERS": "fingerprinted via output_limits",
             "MAX_CLAIM_WORDS": "fingerprinted via output_limits",
-            "SUPPORT_LABELS": "changing it changes behaviour, so bump BEHAVIOR_VERSION",
+            "SUPPORT_LABELS": "fingerprinted directly",
         },
         "trec_ragtime.nuggetizer_adapter": {
             "PACKAGE_NAME": "identifies the package already fingerprinted by version",
@@ -412,7 +414,25 @@ class FingerprintCoverageTestCase(unittest.TestCase):
                 f"{module_name} declares {sorted(uncovered)}; add each to "
                 "NuggetFingerprint or excuse it here with a reason",
             )
-            for name in ("MAX_CLAIM_CHARACTERS", "MAX_CLAIM_WORDS"):
-                if name in declared:
-                    self.assertIn(name.lower(), dict(fingerprint.output_limits))
         self.assertIn(b"output_limits", encoded)
+
+    def test_the_fingerprint_carries_the_live_constant_values(self) -> None:
+        """An excuse of "fingerprinted via X" has to actually be true."""
+
+        from trec_ragtime import nuggets, nuggetizer_adapter
+        from trec_ragtime.nuggets_runner import build_fingerprint
+
+        built = build_fingerprint(
+            NuggetizerConfig(model="test-model"), provider_base_url="https://provider/v1"
+        )
+        self.assertEqual(
+            dict(built.output_limits),
+            {
+                "max_claim_characters": nuggets.MAX_CLAIM_CHARACTERS,
+                "max_claim_words": nuggets.MAX_CLAIM_WORDS,
+                "max_completion_tokens": nuggetizer_adapter.MAX_COMPLETION_TOKENS,
+            },
+        )
+        self.assertEqual(built.support_labels, tuple(nuggets.SUPPORT_LABELS))
+        self.assertEqual(built.guard_version, nuggets.GUARD_VERSION)
+        self.assertEqual(built.embedding_revision, nuggets.EMBEDDING_REVISION)

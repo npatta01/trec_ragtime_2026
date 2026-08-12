@@ -45,6 +45,7 @@ from .nuggets import (
     MAX_CLAIM_CHARACTERS,
     MAX_CLAIM_WORDS,
     SCHEMA_VERSION,
+    SUPPORT_LABELS,
     EvidenceCandidate,
     FacetEvidence,
     NuggetBackend,
@@ -166,6 +167,7 @@ def build_fingerprint(
         embedding_revision=EMBEDDING_REVISION,
         similarity_threshold=similarity_threshold,
         guard_version=GUARD_VERSION,
+        support_labels=tuple(SUPPORT_LABELS),
         evidence_budget=evidence_budget,
         max_nuggets=max_nuggets,
         # Read from the modules that enforce them, so editing a constant
@@ -205,6 +207,9 @@ def run_topic(
     if cached is not None:
         return _outcome(work.topic_id, "cached", key, cached)
 
+    # The store is inside the guard as well as the compute: cache.put revalidates
+    # the bundle against the request, and a rejection there is this topic's
+    # failure, not grounds for aborting every other worker in the pool.
     try:
         bundle = run_topic_nuggets(
             topic_id=work.topic_id,
@@ -216,9 +221,10 @@ def run_topic(
             evidence_budget=fingerprint.evidence_budget,
             max_nuggets=fingerprint.max_nuggets,
         )
+        stored = cache.put(fingerprint, request, bundle)
     except Exception as error:  # noqa: BLE001 - one failed topic must not stop a run
         return TopicOutcome(work.topic_id, "failed", reason=_sanitize(error))
-    if not cache.put(fingerprint, request, bundle):
+    if not stored:
         return TopicOutcome(work.topic_id, "failed", reason="artifact write refused")
 
     # Prove the durable copy independently: drop the local candidate and read
