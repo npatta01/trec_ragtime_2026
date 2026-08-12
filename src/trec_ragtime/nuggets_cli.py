@@ -21,6 +21,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,22 +38,54 @@ from .nuggets_runner import (
     run_topics,
     write_manifest,
 )
-from .query_baselines import PIPELINE, QueryPlan, default_query_plan_path, load_query_plans
+from .query_baselines import (
+    EXPECTED_QUERY_PLAN_SHA256,
+    PIPELINE,
+    QueryPlan,
+    default_query_plan_path,
+    load_query_plans,
+)
+from .query_baselines import _query_context as query_context
 from .retriever import RagtimeRetriever
+from .topic_candidates import load_topics
 
 
 DEFAULT_TOP_K = 100
 
 
-def plan_queries(plan: QueryPlan) -> tuple[tuple[int, str], ...]:
-    """Enumerate one topic's facets: index 0 is the single query."""
+@dataclass(frozen=True, slots=True)
+class PlannedFacet:
+    """One planned query, and the exact identity its retrieval was written under.
 
-    return tuple(enumerate((plan.single_query, *plan.facet_queries)))
+    The baseline runner keys retrievals by a ``query_context`` carrying the
+    baseline letter, the plan digest, and a **1-based** query index. Reproducing
+    it exactly is the difference between a cache hit and silently reporting the
+    topic as unretrieved.
+    """
+
+    facet_index: int
+    query: str
+    baseline: str
+    query_index: int
+
+
+def plan_queries(plan: QueryPlan) -> tuple[PlannedFacet, ...]:
+    """Enumerate one topic's queries: facet 0 is the single baseline-B query."""
+
+    return (
+        PlannedFacet(facet_index=0, query=plan.single_query, baseline="b", query_index=1),
+        *(
+            PlannedFacet(facet_index=index, query=query, baseline="c", query_index=index)
+            for index, query in enumerate(plan.facet_queries, start=1)
+        ),
+    )
 
 
 def prepare_topic(
     plan: QueryPlan,
     *,
+    narrative: str,
+    plan_sha256: str,
     retriever: Any,
     store: Any,
     scorer: Any,
@@ -77,8 +110,22 @@ def prepare_topic(
     inputs: list[NuggetInput] = []
     sources: list[str] = []
 
-    for facet_index, query in plan_queries(plan):
-        retrieval = retriever.get_cached_retrieval(query, pipeline=PIPELINE, top_k=top_k)
+    for facet in plan_queries(plan):
+        facet_index, query = facet.facet_index, facet.query
+        retrieval = retriever.get_cached_retrieval(
+            query,
+            pipeline=PIPELINE,
+            top_k=top_k,
+            # These three are part of the retrieval identity, so they have to
+            # match how the baseline runner wrote the artifact.
+            max_content_fallbacks=0,
+            fallback_on_hf_error=False,
+            query_context=query_context(
+                baseline=facet.baseline,
+                plan_sha256=plan_sha256,
+                query_index=facet.query_index,
+            ),
+        )
         if retrieval is None:
             continue
         # The pair-length function is query-specific, so the chunker is too.
@@ -116,7 +163,10 @@ def prepare_topic(
         return None
     return TopicWork(
         topic_id=plan.topic_id,
-        query=plan.single_query,
+        # The nuggetizer judges importance and support against this, so it gets
+        # the topic's stated information need, not the keyword query that was
+        # tuned for the retriever.
+        query=narrative,
         representation=representation,
         facets=evidence_from_reranking(
             results, queries=queries, facet_indices=indices
@@ -137,6 +187,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="restrict the run to these topics (repeatable)",
     )
     parser.add_argument("--query-plan", type=Path, default=None)
+    parser.add_argument(
+        "--topics", type=Path, default=Path("topics/topics.all.2026.v0625-fix.jsonl"),
+        help="topic records supplying each topic's stated information need",
+    )
+    parser.add_argument(
+        "--plan-sha256", default=EXPECTED_QUERY_PLAN_SHA256,
+        help="digest the retrievals were written under",
+    )
     parser.add_argument(
         "--representation", choices=("canonical", "report_text"), default="report_text"
     )
@@ -182,6 +240,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not plans:
         print("no topics selected", file=sys.stderr)
         return 2
+    # The nuggetizer is asked about the topic's information need, so the topic
+    # records are required, not optional colour.
+    narratives = {topic.topic_id: topic.problem_statement
+                  for topic in load_topics(arguments.topics)}
+    missing = [plan.topic_id for plan in plans if plan.topic_id not in narratives]
+    if missing:
+        print(f"topics file has no record for: {sorted(missing)}", file=sys.stderr)
+        return 2
 
     config = NuggetizerConfig(model=arguments.model, max_nuggets=arguments.max_nuggets)
     clusterer = NuggetClusterer()
@@ -204,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for plan in plans:
             prepared = prepare_topic(
                 plan,
+                narrative=narratives[plan.topic_id],
+                plan_sha256=arguments.plan_sha256,
                 retriever=retriever,
                 store=store,
                 scorer=scorer,

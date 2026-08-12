@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import patch
 
 from trec_ragtime.nuggets_cli import (
+    PlannedFacet,
     build_parser,
     plan_queries,
     prepare_topic,
@@ -32,9 +33,13 @@ class RecordingRetriever:
     def __init__(self, available: dict[str, str]) -> None:
         self.available = available
         self.calls: list[str] = []
+        self.contexts: list[Any] = []
 
-    def get_cached_retrieval(self, query: str, **_: Any) -> Any:
+    def get_cached_retrieval(self, query: str, **kwargs: Any) -> Any:
         self.calls.append(query)
+        self.contexts.append(kwargs.get("query_context"))
+        assert kwargs.get("max_content_fallbacks") == 0
+        assert kwargs.get("fallback_on_hf_error") is False
         document_id = self.available.get(query)
         if document_id is None:
             return None
@@ -78,14 +83,22 @@ def fake_reranking(document_id: str) -> Any:
 
 
 class PlanQueriesTestCase(unittest.TestCase):
-    def test_index_zero_is_the_single_query(self) -> None:
+    def test_facet_zero_is_the_single_baseline_b_query(self) -> None:
         self.assertEqual(
             plan_queries(plan()),
             (
-                (0, "grain exports"),
-                (1, "port closures"),
-                (2, "insurance withdrawal"),
+                PlannedFacet(0, "grain exports", "b", 1),
+                PlannedFacet(1, "port closures", "c", 1),
+                PlannedFacet(2, "insurance withdrawal", "c", 2),
             ),
+        )
+
+    def test_retrieval_query_indices_are_one_based(self) -> None:
+        """The baseline runner numbers from 1; a 0-based guess misses every artifact."""
+
+        self.assertEqual(
+            [(f.baseline, f.query_index) for f in plan_queries(plan())],
+            [("b", 1), ("c", 1), ("c", 2)],
         )
 
 
@@ -129,6 +142,8 @@ class PrepareTopicTestCase(unittest.TestCase):
             score_cache.return_value.fingerprint = "scorer-v1"
             return retriever, prepare_topic(
                 plan(),
+                narrative="I need a report on grain exports.",
+                plan_sha256="0" * 64,
                 retriever=retriever,
                 store=object(),
                 scorer=object(),
@@ -168,8 +183,24 @@ class PrepareTopicTestCase(unittest.TestCase):
         _, work = self._prepare({"grain exports": "a"})
         self.assertEqual(work.inputs[0].object_key, "retrieval/v1/aa/bb/a.mpk")
         self.assertEqual(work.topic_id, "2000")
-        self.assertEqual(work.query, "grain exports")
         self.assertIn("report_text", work.passage_source_fingerprint)
+
+    def test_the_nuggetizer_query_is_the_narrative_not_the_search_query(self) -> None:
+        _, work = self._prepare({"grain exports": "a"})
+        self.assertEqual(work.query, "I need a report on grain exports.")
+
+    def test_looks_retrievals_up_with_the_baseline_identity(self) -> None:
+        """A lookup that omits this context misses every stored artifact."""
+
+        retriever, _ = self._prepare({"grain exports": "a"})
+        first = retriever.contexts[0]
+        self.assertEqual(first["kind"], "baseline_b")
+        self.assertEqual(first["query_index"], 1)
+        self.assertEqual(
+            [c["kind"] for c in retriever.contexts],
+            ["baseline_b", "baseline_c", "baseline_c"],
+        )
+        self.assertEqual([c["query_index"] for c in retriever.contexts], [1, 1, 2])
 
 
 class ParserTestCase(unittest.TestCase):
