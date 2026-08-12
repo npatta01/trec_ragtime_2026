@@ -18,6 +18,11 @@ from dotenv import load_dotenv
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--publish-key", default=None,
+        help="also store the plan at this object key so a remote job can fetch "
+             "it; the repo is uploaded without gitignored files",
+    )
     parser.add_argument("--topic-id", action="append", dest="topic_ids", default=None)
     parser.add_argument("--representation", default="report_text")
     parser.add_argument("--top-k", type=int, default=100)
@@ -75,6 +80,15 @@ def main() -> int:
         json.dumps(plan_document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(f"{len(queries)} queries across {len(plans)} topics -> {arguments.output}")
+    if arguments.publish_key:
+        from trec_ragtime.artifact_store import ArtifactStore
+
+        stored = ArtifactStore.from_env().write(
+            arguments.publish_key, arguments.output.read_bytes()
+        )
+        if not stored:
+            raise SystemExit(f"could not publish the plan to {arguments.publish_key}")
+        print(f"published -> {arguments.publish_key}")
     del missing
     return 0
 

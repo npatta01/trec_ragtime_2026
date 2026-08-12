@@ -9,11 +9,24 @@ name: ragtime-score-passages
 
 python: "3.12"
 
+# This checkout is a git worktree, so dstack's repo upload finds no tree to
+# send. Mount the sources explicitly instead.
+files:
+  # Paths resolve against this file's directory, and the repo's .venv is ~8 GB,
+  # so mount only what the job runs.
+  - ../src:src
+  - ../scripts:scripts
+  - ../pyproject.toml:pyproject.toml
+  - ../uv.lock:uv.lock
+  # pyproject declares readme = "README.md"; the build fails without it.
+  - ../README.md:README.md
+
 env:
   - HF_TOKEN
   - RAGTIME_HF_BUCKET_ID
   - RAGTIME_ARTIFACT_PREFIX
   - RAGTIME_CACHE_NAMESPACE
+  - SCORING_PLAN_KEY
 
 commands:
   - |
@@ -27,10 +40,10 @@ commands:
 
     # Cheap wiring check with the real argv before paying for the full run.
     uv run --no-managed-python --no-python-downloads --python "$py" \
-      python scripts/score_remote.py --plan scoring-plan.json --preflight
+      python scripts/score_remote.py --plan-key $SCORING_PLAN_KEY --preflight
 
     uv run --no-managed-python --no-python-downloads --python "$py" \
-      python scripts/score_remote.py --plan scoring-plan.json --device cuda
+      python scripts/score_remote.py --plan-key $SCORING_PLAN_KEY --device cuda
 
 # A pool of interchangeable small-to-mid GPUs: the reranker is a 0.5B
 # cross-encoder, so VRAM is not the constraint and pinning one model would
