@@ -10,10 +10,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fsspec
+import httpx
+
+from trec_ragtime import artifact_store
+from huggingface_hub.errors import HfHubHTTPError
 
 from trec_ragtime.artifact_store import (
     ArtifactStore,
     ArtifactStoreConfigurationError,
+    ArtifactStoreRemoteError,
     ArtifactStoreUnavailableError,
     ArtifactValidationError,
 )
@@ -68,6 +73,23 @@ class FakeSimpleCache:
         self.fail_download = fail_download
         self.fail_upload = fail_upload
         self.open_calls: list[tuple[str, str]] = []
+        self.info_calls: list[str] = []
+
+    def info(self, path: str) -> dict[str, object]:
+        """Answer presence the way the real filesystem does.
+
+        The store asks here rather than at open() because open() cannot tell a
+        throttle from an absence. A transport failure surfaces here first, so
+        fail_download raises from info() too.
+        """
+
+        self.info_calls.append(path)
+        if self.fail_download is not None:
+            raise self.fail_download
+        key = self._strip_protocol(path).removeprefix("buckets/")
+        if key not in self.remote:
+            raise FileNotFoundError(key)
+        return {"name": key, "size": len(self.remote[key]), "type": "file"}
 
     @staticmethod
     def _strip_protocol(path: str) -> str:
@@ -170,6 +192,11 @@ class FakeHfApi:
 
 class ArtifactStoreTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        # The store retries transient remote failures; sleeping through that in
+        # every failure-path test took the suite from 19s to over three minutes.
+        patcher = patch.object(artifact_store, "RETRY_BASE_SECONDS", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tempdir = tempfile.TemporaryDirectory()
         self.local_dir = Path(self.tempdir.name) / "artifacts"
         self.remote: dict[str, bytes] = {"owner/bucket/foo/object.mpk": b"remote"}
@@ -263,21 +290,24 @@ class ArtifactStoreTestCase(unittest.TestCase):
                 / sc._mapper(sc._strip_protocol(store._remote_path(key))),
             )
 
-    def test_valid_l1_read_survives_a_disabled_remote(self) -> None:
+    def test_a_valid_l1_read_still_works_after_a_remote_failure(self) -> None:
+        """An unreachable remote must not cost a usable local value."""
+
         store = self.make_store(download_error=RuntimeError("token=secret-token"))
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertIsNone(store.read("object.mpk"))
-            self.assertEqual(store.read("object.mpk"), None)
-        self.assert_one_sanitized_warning(caught)
-        self.assertEqual(self.fs_constructed, 1)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
         candidate = store.local_candidate("local.mpk")
         candidate.write_bytes(b"local")
         os.chmod(candidate, 0o600)
         self.assertEqual(store.read("local.mpk"), b"local")
-        self.assertEqual(self.fs_constructed, 1)
 
     def test_remote_absence_is_a_quiet_miss_and_does_not_disable_store(self) -> None:
+        """Only a confirmed absence may be reported as None.
+
+        Presence is settled by info(); an absent object is never opened, so the
+        miss costs one call rather than a download attempt.
+        """
+
         store = self.make_store()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -287,14 +317,21 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(self.fs_constructed, 1)
         assert self.fs is not None
         self.assertEqual(
-            self.fs.open_calls,
+            self.fs.info_calls,
             [
-                ("hf://buckets/owner/bucket/foo/missing.mpk", "rb"),
-                ("hf://buckets/owner/bucket/foo/missing.mpk", "rb"),
+                "hf://buckets/owner/bucket/foo/missing.mpk",
+                "hf://buckets/owner/bucket/foo/missing.mpk",
             ],
         )
+        self.assertEqual(self.fs.open_calls, [])
 
-    def test_remote_file_not_found_evicts_partial_l1_candidate(self) -> None:
+    def test_an_object_that_vanishes_between_probe_and_open_is_not_a_miss(self) -> None:
+        """info() said present, open() said gone: a race, not an absence.
+
+        Reporting None here would let a caller record real work as missing, so
+        it raises and still clears the partial candidate.
+        """
+
         partial_fs: PartialMissingSimpleCache | None = None
 
         def factory(protocol: str, **kwargs):
@@ -303,10 +340,8 @@ class ArtifactStoreTestCase(unittest.TestCase):
             return partial_fs
 
         store = self.make_store(filesystem_factory_override=factory)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertIsNone(store.read("object.mpk"))
-        self.assertEqual(caught, [])
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
         self.assertFalse(store.local_candidate("object.mpk").exists())
         assert partial_fs is not None
         self.assertEqual(
@@ -314,7 +349,15 @@ class ArtifactStoreTestCase(unittest.TestCase):
             [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
         )
 
-    def test_remote_failures_warn_once_disable_remote_and_preserve_l1(self) -> None:
+    def test_remote_failures_raise_and_preserve_l1(self) -> None:
+        """Every one of these once returned None, i.e. "not there".
+
+        A throttle, an auth failure and a misconfigured bucket are all reasons
+        the answer is unknown. Returning None conflated them with a confirmed
+        absence, which is how a rate-limited run recorded 1596 unscored queries
+        as missing and exited successfully.
+        """
+
         failures = (
             {"api_error": RuntimeError("Authorization: Bearer secret-token")},
             {"private": False},
@@ -326,29 +369,36 @@ class ArtifactStoreTestCase(unittest.TestCase):
                 self.setUp()
                 try:
                     store = self.make_store(**options)
-                    with warnings.catch_warnings(record=True) as caught:
-                        warnings.simplefilter("always")
-                        self.assertIsNone(store.read("object.mpk"))
-                        self.assertIsNone(store.read("object.mpk"))
-                    self.assert_one_sanitized_warning(caught)
-                    self.assertEqual(self.fs_constructed, 1 if "download_error" in options else 0)
+                    for _ in range(2):
+                        with self.assertRaises(ArtifactStoreRemoteError):
+                            store.read("object.mpk")
                     candidate = store.local_candidate("local.mpk")
                     candidate.write_bytes(b"local")
                     os.chmod(candidate, 0o600)
                     self.assertEqual(store.read("local.mpk"), b"local")
-                    self.assertEqual(self.fs_constructed, 1 if "download_error" in options else 0)
                 finally:
                     self.tearDown()
 
-    def test_public_bucket_miss_warns_once_disables_remote_and_never_writes(self) -> None:
+    def test_a_transient_failure_does_not_latch_the_store(self) -> None:
+        """One throttle must not poison the process.
+
+        Latching here would make a single 429 turn every later read into a
+        failure, so a long run could never recover by retrying.
+        """
+
+        store = self.make_store(download_error=OSError("server unavailable"))
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
+        assert self.fs is not None
+        self.fs.fail_download = None
+        self.assertEqual(store.read("object.mpk"), b"remote")
+
+    def test_a_public_bucket_is_refused_and_never_written_to(self) -> None:
         store = self.make_store(private=False)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertIsNone(store.read("object.mpk"))
-            self.assertFalse(store.write("new.mpk", b"payload"))
-            self.assertIsNone(store.read("object.mpk"))
-        self.assert_one_sanitized_warning(caught)
-        self.assertEqual(self.api_constructed, 1)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("new.mpk", b"payload")
         self.assertEqual(self.fs_constructed, 0)
         self.assertNotIn("owner/bucket/foo/new.mpk", self.remote)
 
@@ -373,25 +423,29 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(caught, [])
         self.assertFalse(store.local_candidate("object.mpk").exists())
 
-    def test_failed_write_returns_false_cleans_exact_candidate_and_disables_remote(self) -> None:
+    def test_a_failed_write_raises_and_cleans_its_exact_candidate(self) -> None:
         store = self.make_store(upload_error=RuntimeError("token=secret-token"))
         other = store.local_candidate("other.mpk")
         other.write_bytes(b"keep")
         os.chmod(other, 0o600)
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertFalse(store.write("object.mpk", b"payload"))
-            self.assertFalse(store.write("second.mpk", b"payload"))
-        self.assert_one_sanitized_warning(caught)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("object.mpk", b"payload")
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("second.mpk", b"payload")
         self.assertFalse(store.local_candidate("object.mpk").exists())
         self.assertFalse(store.local_candidate("second.mpk").exists())
         self.assertEqual(other.read_bytes(), b"keep")
         self.assertEqual(self.fs_constructed, 1)
         assert self.fs is not None
+        # Both writes are attempted: a failed upload no longer latches the
+        # store, so the second call is not silently skipped.
         self.assertEqual(
             self.fs.open_calls,
-            [("hf://buckets/owner/bucket/foo/object.mpk", "wb")],
+            [
+                ("hf://buckets/owner/bucket/foo/object.mpk", "wb"),
+                ("hf://buckets/owner/bucket/foo/second.mpk", "wb"),
+            ],
         )
 
     def test_failed_write_before_filesystem_open_preserves_existing_l1(self) -> None:
@@ -399,10 +453,8 @@ class ArtifactStoreTestCase(unittest.TestCase):
         candidate = store.local_candidate("object.mpk")
         candidate.write_bytes(b"keep")
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertFalse(store.write("object.mpk", b"replacement"))
-        self.assert_one_sanitized_warning(caught)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("object.mpk", b"replacement")
         self.assertEqual(candidate.read_bytes(), b"keep")
         self.assertEqual(self.fs_constructed, 0)
 
@@ -414,10 +466,8 @@ class ArtifactStoreTestCase(unittest.TestCase):
         candidate = store.local_candidate("object.mpk")
         candidate.write_bytes(b"keep")
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertFalse(store.write("object.mpk", b"replacement"))
-        self.assert_one_sanitized_warning(caught)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("object.mpk", b"replacement")
         self.assertEqual(candidate.read_bytes(), b"keep")
 
     def test_successful_write_returns_true_and_retains_complete_l1_candidate(self) -> None:
@@ -438,10 +488,8 @@ class ArtifactStoreTestCase(unittest.TestCase):
             return tampering_fs
 
         store = self.make_store(filesystem_factory_override=factory)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertFalse(store.write("object.mpk", b"payload"))
-        self.assert_one_sanitized_warning(caught)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("object.mpk", b"payload")
         self.assertFalse(store.local_candidate("object.mpk").exists())
         assert tampering_fs is not None
         self.assertEqual(
@@ -458,10 +506,8 @@ class ArtifactStoreTestCase(unittest.TestCase):
             return partial_fs
 
         store = self.make_store(filesystem_factory_override=factory)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertFalse(store.write("object.mpk", b"payload"))
-        self.assert_one_sanitized_warning(caught)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("object.mpk", b"payload")
         self.assertFalse(store.local_candidate("object.mpk").exists())
 
     def test_evict_local_removes_only_exact_candidate(self) -> None:
@@ -532,7 +578,8 @@ class ArtifactStoreTestCase(unittest.TestCase):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 self.assertIsNone(store.read("object.mpk"))
-                self.assertFalse(store.write("other.mpk", b"payload"))
+                with self.assertRaises(ArtifactStoreRemoteError):
+                    store.write("other.mpk", b"payload")
         self.assert_one_sanitized_warning(caught)
         self.assertEqual(self.api_constructed, 0)
         self.assertEqual(self.fs_constructed, 0)
@@ -559,40 +606,32 @@ class ArtifactStoreTestCase(unittest.TestCase):
             [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
         )
 
-    def test_local_l1_read_failure_then_l2_failure_warns_once_and_disables_remote(
+    def test_an_unreadable_l1_and_an_unreachable_l2_raise_rather_than_miss(
         self,
     ) -> None:
+        """Neither layer could answer, so neither may claim the object is absent."""
+
         store = self.make_store(download_error=OSError("server unavailable"))
         candidate = store.local_candidate("object.mpk")
         candidate.write_bytes(b"local")
 
         with patch.object(Path, "read_bytes", side_effect=OSError("permission denied")):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                self.assertIsNone(store.read("object.mpk"))
-                self.assertIsNone(store.read("object.mpk"))
-        self.assert_one_sanitized_warning(caught)
+            for _ in range(2):
+                with self.assertRaises(ArtifactStoreRemoteError):
+                    store.read("object.mpk")
         self.assertEqual(self.api_constructed, 1)
-        self.assertEqual(self.fs_constructed, 1)
 
-    def test_local_l1_validated_read_failure_then_l2_failure_warns_once_and_disables_remote(
+    def test_an_unreadable_l1_and_an_unreachable_l2_raise_on_validated_reads_too(
         self,
     ) -> None:
         store = self.make_store(download_error=OSError("server unavailable"))
         store.local_candidate("object.mpk").write_bytes(b"local")
 
         with patch.object(Path, "read_bytes", side_effect=OSError("permission denied")):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                self.assertIsNone(
+            for _ in range(2):
+                with self.assertRaises(ArtifactStoreRemoteError):
                     store.read_validated("object.mpk", self.decoder)
-                )
-                self.assertIsNone(
-                    store.read_validated("object.mpk", self.decoder)
-                )
-        self.assert_one_sanitized_warning(caught)
         self.assertEqual(self.api_constructed, 1)
-        self.assertEqual(self.fs_constructed, 1)
 
     def test_bucket_directory_is_private_and_symlink_is_rejected(self) -> None:
         store = self.make_store()
@@ -677,11 +716,91 @@ class ArtifactStoreTestCase(unittest.TestCase):
             return real_exists(store.local_candidate("object.mpk"))
 
         with patch.object(Path, "exists", side_effect=exists):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                self.assertFalse(store.write("object.mpk", b"payload"))
-        self.assert_one_sanitized_warning(caught)
+            with self.assertRaises(ArtifactStoreRemoteError):
+                store.write("object.mpk", b"payload")
         self.assertFalse(store.local_candidate("object.mpk").exists())
+
+
+    # --- storage contract: one case per way the remote can answer, or fail to.
+    # The rule is narrow: read() may return None only for a confirmed 404.
+    # Every other outcome is "unknown", and reporting unknown as absent is what
+    # let a throttled run log 1596 unscored queries as MISSING and exit 0.
+
+    @staticmethod
+    def _throttled() -> BaseException:
+        response = httpx.Response(
+            429, request=httpx.Request("GET", "https://example.invalid/x")
+        )
+        return HfHubHTTPError("rate limited", response=response)
+
+    def _store_where_info_raises(self, error: BaseException) -> ArtifactStore:
+        store = self.make_store()
+
+        class Classifying(FakeSimpleCache):
+            def info(self, path: str) -> dict[str, object]:
+                raise error
+
+        def factory(protocol: str, **kwargs):
+            self.fs_constructed += 1
+            self.fs = Classifying(self.local_dir, self.remote)
+            return self.fs
+
+        store._filesystem_factory = factory
+        store._filesystem = None
+        return store
+
+    def test_a_confirmed_404_is_the_only_miss(self) -> None:
+        store = self._store_where_info_raises(FileNotFoundError("absent"))
+        self.assertIsNone(store.read("object.mpk"))
+
+    def test_a_429_wearing_a_file_not_found_is_not_a_miss(self) -> None:
+        """The exact shape that caused the incident.
+
+        fsspec's simplecache decides absence with exists(), HfFileSystem.exists
+        swallows OSError, and HfHubHTTPError is an OSError — so a rate limit
+        arrives looking like a missing object.
+        """
+
+        disguised = FileNotFoundError("absent")
+        disguised.__cause__ = self._throttled()
+        store = self._store_where_info_raises(disguised)
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
+
+    def test_a_bare_429_is_not_a_miss(self) -> None:
+        store = self._store_where_info_raises(self._throttled())
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
+
+    def test_a_timeout_is_not_a_miss(self) -> None:
+        store = self._store_where_info_raises(
+            httpx.ConnectTimeout("connect timed out")
+        )
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
+
+    def test_a_disabled_remote_reports_itself_rather_than_a_miss(self) -> None:
+        store = self.make_store()
+        store._remote_disabled = True
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.read("object.mpk")
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("object.mpk", b"payload")
+
+    def test_a_write_that_cannot_be_confirmed_never_reports_success(self) -> None:
+        store = self.make_store(upload_error=OSError("server unavailable"))
+        with self.assertRaises(ArtifactStoreRemoteError):
+            store.write("fresh.mpk", b"payload")
+        self.assertNotIn("owner/bucket/foo/fresh.mpk", self.remote)
+
+    def test_a_written_object_survives_eviction_and_rereads(self) -> None:
+        """The independent verification the runner performs after every write."""
+
+        store = self.make_store()
+        self.assertTrue(store.write("fresh.mpk", b"payload"))
+        store.evict_local("fresh.mpk")
+        self.assertFalse(store.local_candidate("fresh.mpk").exists())
+        self.assertEqual(store.read("fresh.mpk"), b"payload")
 
 
 if __name__ == "__main__":

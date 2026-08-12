@@ -8,3 +8,8 @@ __pycache__/
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
 .flash/
+scoring-plan.json
+remaining_plan.json
+done_topics.txt
+plan_2066.json
+plan_all.json

@@ -663,6 +663,77 @@ read-only and the owner-only manifest contains only file hashes, sanitized
 counts, corpus provenance, and retrieval object keys—not queries, document
 bodies, credentials, or local cache secrets.
 
+### Source-Linked Nuggets
+
+`trec_ragtime.nuggets` compresses one topic's ranked passages into atomic
+English claims where every claim resolves to a document and an exact character
+span. It is an internal evidence-compression stage, not a Nuggetizer-track
+submission, and the package's `vital`/`okay` scores are signals rather than
+human ground truth.
+
+Upstream [`nuggetizer`](https://github.com/castorini/nuggetizer) returns claim
+text with no document identity, so linkage comes from its assigner: every claim
+is judged against every evidence passage, and that support matrix is the
+lineage. A claim no passage supports is quarantined, and a topic where nothing
+survives fails without writing anything.
+
+```text
+create(query, all passages)  ->  claims + vital/okay
+assign(query, ONE passage, claims) x N  ->  support / partial_support / not_support
+```
+
+The pinned version is `nuggetizer==0.0.5`. Later upstream commits move the
+prompts into `src/nuggetizer/prompts/` without adding that package to the
+setuptools `include` list, so a Git-pinned build installs and then fails on
+`from ..prompts import ...`. Revisit the pin when upstream publishes a fixed
+release; the installed version and revision are part of every artifact
+fingerprint, so a change retires the previous objects.
+
+The provider credential is resolved by `trec_ragtime.providers.provider_settings`
+from the decrypted `.env`, so `OPENROUTER_API_KEY` is picked up automatically and
+implies the OpenRouter base URL. Pinned 0.0.5 reads only `OPEN_AI_API_KEY` or
+`OPENAI_API_KEY` and always points at OpenAI, so the resolved base URL and key
+are handed to it explicitly rather than left to its own lookup. Upstream exposes
+no seed, so identical inputs may still produce different claims on a cold run:
+determinism comes from the artifact cache, not from the provider. Upstream also
+retries a failed provider call forever, so this stage caps each topic's provider
+calls and turns exhaustion into a failed topic rather than a hung batch.
+
+Bundles are cached per topic, keyed by a slow-moving behaviour fingerprint and
+the topic's exact inputs:
+
+```text
+nuggets/v1/<nuggetizer-fingerprint>/<request-prefix>/<request-digest>.mpk
+```
+
+The request identity covers the topic, the exact question asked, the source
+representation, the input retrieval artifacts, the passage-source fingerprint,
+and a digest of the ordered alias table. Rewording the question, or altering an
+alias, document, or offset, therefore yields a different key rather than a stale
+hit.
+
+The bundle carries the complete evidence-alias table, ordered nuggets with
+their attesting passages, facet coverage, and sanitized rejection counts. It
+deliberately stores no passage text: the offsets and `content_hash` prove which
+text was used, and the text itself is recoverable from the retrieval artifact,
+so the bundle cannot drift from the corpus. Paraphrases are merged with a
+pinned `sentence-transformers/all-MiniLM-L6-v2` cosine threshold guarded by a
+numeric and negation check, so `fell 30%` never collapses into `fell 13%`, and
+a merge keeps every attesting source.
+
+Run it over the planned topics after decrypting `.env`:
+
+```bash
+uv run ragtime-nuggets --model <model-id> --topic-id 2000 --evidence-budget 24
+```
+
+Retrieval is read from the artifact cache only; a topic whose facets have not
+been retrieved is reported rather than turned into an organizer request. The
+query plan's own facet numbering is carried through to both the projected
+evidence and the recorded inputs, so a facet with no cached retrieval is skipped
+without renumbering the ones around it. `trec_ragtime.nuggets_runner` remains
+the supported Python API for callers that want the stage without the command.
+
 ## Repository Map
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the

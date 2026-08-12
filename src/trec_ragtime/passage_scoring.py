@@ -22,8 +22,18 @@ DEFAULT_MODEL_REVISION = "3ea9d4dffa7d12a4f366be8e275c349de9fc9865"
 DEFAULT_TOKENIZER_NAME = DEFAULT_MODEL_NAME
 DEFAULT_TOKENIZER_REVISION = DEFAULT_MODEL_REVISION
 DEFAULT_SCHEMA_VERSION = 1
-DEFAULT_MAX_LENGTH = 512
-DEFAULT_BATCH_SIZE = 32
+# mxbai-rerank-base-v2 is Qwen2-based with max_position_embeddings=32768, so
+# 512 was an arbitrary floor, not the model's limit. Measured over 1200 corpus
+# documents: p50 580 tokens, p99 2569, max 6386. At 512 only 39.5% of documents
+# fit whole, so 60% were split and the tail of every long one was silently
+# truncated at scoring time while the nugget stage still read it in full. At
+# 8192 nothing in the corpus is split or truncated, and scoring makes fewer
+# forward passes because a short document is one passage instead of two.
+DEFAULT_MAX_LENGTH = 8192
+# Passages are now up to 16x longer, so a batch holds 16x the tokens. Attention
+# is quadratic in sequence length; 8 keeps a rare 6000-token document from
+# spiking a 48GB card.
+DEFAULT_BATCH_SIZE = 8
 DEFAULT_QUERY_FORMAT = "{query}"
 DEFAULT_QUERY_POLICY = "literal-v1"
 _HASH_LENGTH = 32

@@ -15,6 +15,11 @@ dependencies = [
   "msgspec>=0.19,<1",
   "nbconvert>=7.16.0",
   "nbformat>=5.10.0",
+  # 0.0.5 (2025-02-04) is the newest installable Nuggetizer. Every later commit
+  # moved the prompts into `src/nuggetizer/prompts/` without adding it to the
+  # setuptools `include` list, so a Git-pinned build imports and then fails on
+  # `from ..prompts import ...`. Revisit once upstream publishes a fixed release.
+  "nuggetizer==0.0.5",
   "openai>=2.47.0,<3",
   "pandas>=2.3.0",
   "python-dotenv>=1.2.2",
@@ -40,6 +45,7 @@ ragtime-corpus = "trec_ragtime.corpus_cli:main"
 ragtime-query-baseline = "trec_ragtime.query_baselines:main"
 ragtime-cache-import = "trec_ragtime.cache_import:main"
 ragtime-retrieval-import = "trec_ragtime.retrieval_import:main"
+ragtime-nuggets = "trec_ragtime.nuggets_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12"]
