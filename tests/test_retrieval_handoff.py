@@ -8,6 +8,7 @@ import msgspec
 
 from trec_ragtime.models import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
 from trec_ragtime.nuggets import NuggetSupport
+from trec_ragtime.nugget_cache import nugget_object_key
 from trec_ragtime.retrieval_handoff import (
     HandoffError,
     HandoffNuggetSource,
@@ -44,9 +45,10 @@ class RetrievalHandoffTests(unittest.TestCase):
             ),
         )
         self.retrievals = {0: result}
+        source_fingerprint = fingerprint().digest
         self.source = HandoffNuggetSource(
-            object_key="nuggets/v1/example.mpk",
-            fingerprint_digest=fingerprint().digest,
+            object_key=nugget_object_key(source_fingerprint, self.request.digest),
+            fingerprint_digest=source_fingerprint,
             request_digest=self.request.digest,
             bundle_digest=hashlib.sha256(msgspec.msgpack.encode(self.nuggets)).digest(),
         )

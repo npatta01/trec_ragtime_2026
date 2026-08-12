@@ -734,6 +734,40 @@ evidence and the recorded inputs, so a facet with no cached retrieval is skipped
 without renumbering the ones around it. `trec_ragtime.nuggets_runner` remains
 the supported Python API for callers that want the stage without the command.
 
+### Retrieval bundle for report generation
+
+After the nugget cache is complete, materialize the retrieval pipeline's final
+consumer artifact with the same model and scorer identity used above:
+
+```bash
+uv run ragtime-retrieval-handoff \
+  --model <model-id> \
+  --manifest /absolute/path/to/retrieval-handoff-manifest.json
+```
+
+This command is cache-only. It reconstructs the exact retrieval, passage-score,
+and nugget identities and fails a topic when any required artifact is absent;
+it never starts retrieval, hydration, GPU scoring, or provider work. Each
+successful topic produces one self-contained MessagePack bundle under
+`retrieval-handoff/v1/`. The bundle includes the official topic record, retained
+deduplicated nuggets, and only the exact English passage slices linked by those
+nuggets. Full `support` links are citation-ready. `partial_support` is retained
+as labeled context but is not citation-ready.
+
+Report generation consumes the typed bundle directly:
+
+```python
+bundle = handoff_cache.get(fingerprint, request)
+if bundle is None:
+    raise RuntimeError("retrieval handoff is incomplete")
+for nugget in bundle.nuggets:
+    citations = tuple(link.alias for link in nugget.support if link.citation_ready)
+```
+
+Generation does not reopen raw retrieval or nugget artifacts and does not need
+to deduplicate evidence. The owner-only manifest records per-topic object keys
+and counts without topic or passage text.
+
 ## Repository Map
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the

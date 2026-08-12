@@ -10,7 +10,7 @@ from typing import Literal
 import msgspec
 
 from .models import RetrievalResult
-from .nugget_cache import NuggetRequest
+from .nugget_cache import NuggetRequest, nugget_object_key
 from .nuggets import NuggetBundle, check_bundle
 from .passages import sha256_bytes
 from .topic_candidates import Topic
@@ -155,6 +155,16 @@ def project_retrieval_handoff(
         raise HandoffError("nugget query disagrees with its request")
     if nugget_bundle.representation != REPRESENTATION or nugget_request.representation != REPRESENTATION:
         raise HandoffError("handoff requires report_text evidence")
+    if (
+        nugget_source.request_digest != nugget_request.digest
+        or nugget_source.bundle_digest
+        != hashlib.sha256(msgspec.msgpack.encode(nugget_bundle)).digest()
+        or nugget_source.object_key
+        != nugget_object_key(
+            nugget_source.fingerprint_digest, nugget_source.request_digest
+        )
+    ):
+        raise HandoffError("nugget source identity disagrees with its bundle")
     inputs = retrieval_input_records(nugget_request)
     input_by_facet = {row.facet_index: (index, row) for index, row in enumerate(inputs)}
     if len(input_by_facet) != len(inputs):

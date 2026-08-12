@@ -65,6 +65,9 @@ class TopicWork:
     facets: tuple[FacetEvidence, ...]
     inputs: tuple[NuggetInput, ...]
     passage_source_fingerprint: str
+    # Validated retrievals are retained for the downstream generation handoff.
+    # Nugget execution ignores them; the default preserves existing callers.
+    retrievals: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
