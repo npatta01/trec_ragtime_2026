@@ -117,7 +117,30 @@ def main() -> int:
 
     done = failed = skipped = 0
     chunk_seconds = score_seconds = 0.0
+    retry_seconds = 0.0
     started = time.perf_counter()
+
+    def read_required(object_key: str, attempts: int = 6) -> bytes | None:
+        """Read an artifact the plan guarantees exists, riding out rate limits.
+
+        The bucket allows 1000 API requests per 5 minutes account-wide. Over
+        that, HF answers 429 and fsspec surfaces it as FileNotFoundError, which
+        the store reports as a quiet miss indistinguishable from a real absence.
+        Every key here comes from the plan, so None means throttled, not absent;
+        backing off also applies the backpressure the limit is asking for.
+        """
+
+        nonlocal retry_seconds
+        for attempt in range(attempts):
+            payload = store.read(object_key)
+            if payload is not None:
+                return payload
+            if attempt + 1 == attempts:
+                break
+            delay = min(60.0, 5.0 * 2**attempt)
+            retry_seconds += delay
+            time.sleep(delay)
+        return None
 
     def run_one(index: int, row: dict) -> None:
         nonlocal done, failed, skipped, chunk_seconds, score_seconds
@@ -137,7 +160,7 @@ def main() -> int:
             if store.read(cache.object_key(row["query"])) is not None:
                 skipped += 1
                 return
-            payload = store.read(row["object_key"])
+            payload = read_required(row["object_key"])
             if payload is None:
                 failed += 1
                 print(f"[{index}/{len(queries)}] MISSING {row['object_key']}", flush=True)
@@ -156,9 +179,13 @@ def main() -> int:
                   f"facet {row['facet_index']} ({rate:.1f}s/query avg)", flush=True)
         except Exception as error:  # noqa: BLE001 - one query must not stop the run
             failed += 1
+            # Print the chained cause too: "invalid passage scores" alone does not
+            # say whether keys are missing, extra, non-finite, or the map is stale.
+            cause = error.__cause__ or error.__context__
+            detail = f" <- {type(cause).__name__}: {' '.join(str(cause).split())[:120]}" if cause else ""
             print(f"[{index}/{len(queries)}] FAILED {row['topic_id']}/"
                   f"{row['facet_index']}: {type(error).__name__}: "
-                  f"{' '.join(str(error).split())[:160]}", flush=True)
+                  f"{' '.join(str(error).split())[:160]}{detail}", flush=True)
 
     # Deliberately sequential. Running queries in threads shares one ArtifactStore,
     # whose fsspec cache raised spurious FileNotFoundError under load; read() maps
@@ -171,7 +198,7 @@ def main() -> int:
 
     elapsed = time.perf_counter() - started
     print(f"scored={done} skipped={skipped} failed={failed} "
-          f"elapsed={elapsed/60:.1f}min", flush=True)
+          f"elapsed={elapsed/60:.1f}min throttled={retry_seconds/60:.1f}min", flush=True)
     if done:
         other = elapsed - chunk_seconds - score_seconds
         print(
