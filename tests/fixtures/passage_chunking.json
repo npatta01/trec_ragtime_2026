@@ -1,0 +1,308 @@
+{
+  "cases": [
+    {
+      "name": "english",
+      "document_id": "doc-eng-001",
+      "canonical_text": "One. Two.",
+      "selected_text": "One. Two.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 8,
+      "max_passage_length": 6,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 9]
+      ],
+      "expected_boundaries": [
+        "sentence"
+      ]
+    },
+    {
+      "name": "spanish",
+      "document_id": "doc-spa-001",
+      "canonical_text": "Primera oración. Segunda oración.",
+      "selected_text": "Primera oración. Segunda oración.",
+      "representation": "canonical",
+      "language": "spa",
+      "pipeline_name": "es_core_news_sm",
+      "max_length": 8,
+      "max_passage_length": 6,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 33]
+      ],
+      "expected_boundaries": [
+        "sentence"
+      ]
+    },
+    {
+      "name": "russian",
+      "document_id": "doc-rus-001",
+      "canonical_text": "Первое предложение. Второе предложение.",
+      "selected_text": "Первое предложение. Второе предложение.",
+      "representation": "canonical",
+      "language": "rus",
+      "pipeline_name": "ru_core_news_sm",
+      "max_length": 8,
+      "max_passage_length": 6,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 39]
+      ],
+      "expected_boundaries": [
+        "sentence"
+      ]
+    },
+    {
+      "name": "chinese",
+      "document_id": "doc-zho-001",
+      "canonical_text": "第一句话。第二句话。",
+      "selected_text": "第一句话。第二句话。",
+      "representation": "canonical",
+      "language": "zho",
+      "pipeline_name": "zh_core_web_sm",
+      "max_length": 8,
+      "max_passage_length": 6,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 10]
+      ],
+      "expected_boundaries": [
+        "sentence"
+      ]
+    },
+    {
+      "name": "english_machine_translation",
+      "document_id": "doc-spa-translation-001",
+      "canonical_text": "Texto fuente en español.",
+      "selected_text": "English machine translation of the source.",
+      "representation": "report_text",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 8,
+      "max_passage_length": 6,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 42]
+      ],
+      "expected_boundaries": [
+        "sentence"
+      ]
+    },
+    {
+      "name": "crlf_paragraphs",
+      "document_id": "doc-crlf-001",
+      "canonical_text": "First.\r\n\r\nSecond.",
+      "selected_text": "First.\r\n\r\nSecond.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 3,
+      "max_passage_length": 1,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 10],
+        [10, 17]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "repeated_identical_sentences",
+      "document_id": "doc-repeat-001",
+      "canonical_text": "Repeat. Repeat. Repeat. ",
+      "selected_text": "Repeat. Repeat. Repeat. ",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 3,
+      "max_passage_length": 1,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 8],
+        [8, 16],
+        [16, 24]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "repeated_identical_sentences_overlap",
+      "document_id": "doc-repeat-overlap-001",
+      "canonical_text": "Repeat. Repeat. Repeat. Repeat. ",
+      "selected_text": "Repeat. Repeat. Repeat. Repeat. ",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 4,
+      "max_passage_length": 2,
+      "overlap_tokens": 1,
+      "expected_spans": [
+        [0, 16],
+        [8, 24],
+        [16, 32]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "leading_trailing_whitespace",
+      "document_id": "doc-whitespace-001",
+      "canonical_text": "  One. Two.  ",
+      "selected_text": "  One. Two.  ",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 3,
+      "max_passage_length": 1,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 7],
+        [7, 13]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "paragraph",
+      "document_id": "doc-paragraph-001",
+      "canonical_text": "First paragraph.\n\nSecond paragraph.",
+      "selected_text": "First paragraph.\n\nSecond paragraph.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 4,
+      "max_passage_length": 2,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 18],
+        [18, 35]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "heading_and_list",
+      "document_id": "doc-heading-list-001",
+      "canonical_text": "# Findings\n- Alpha item.\n- Beta item.\nConclusion follows.",
+      "selected_text": "# Findings\n- Alpha item.\n- Beta item.\nConclusion follows.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 8,
+      "max_passage_length": 5,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 25],
+        [25, 57]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "abbreviation_and_punctuation",
+      "document_id": "doc-abbreviation-punctuation-001",
+      "canonical_text": "Dr. Smith reviewed the U.S. report, e.g. the Jan. 5 release. Did it pass? It did!",
+      "selected_text": "Dr. Smith reviewed the U.S. report, e.g. the Jan. 5 release. Did it pass? It did!",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 13,
+      "max_passage_length": 11,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 61],
+        [61, 81]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "normal_sentence_packing",
+      "document_id": "doc-packed-001",
+      "canonical_text": "One. Two. Three.",
+      "selected_text": "One. Two. Three.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 4,
+      "max_passage_length": 2,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 10],
+        [10, 16]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence"
+      ]
+    },
+    {
+      "name": "overlap",
+      "document_id": "doc-overlap-001",
+      "canonical_text": "One. Two. Three. Four.",
+      "selected_text": "One. Two. Three. Four.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 4,
+      "max_passage_length": 2,
+      "overlap_tokens": 1,
+      "expected_spans": [
+        [0, 10],
+        [5, 17],
+        [10, 22]
+      ],
+      "expected_boundaries": [
+        "sentence",
+        "sentence",
+        "sentence"
+      ],
+      "sentence_spans": [
+        [5, 10],
+        [10, 17]
+      ],
+      "sentences": [
+        "Two. ",
+        "Three. "
+      ]
+    },
+    {
+      "name": "oversized_sentence",
+      "document_id": "doc-long-001",
+      "canonical_text": "One two three four five.",
+      "selected_text": "One two three four five.",
+      "representation": "canonical",
+      "language": "eng",
+      "pipeline_name": "en_core_web_sm",
+      "max_length": 5,
+      "max_passage_length": 3,
+      "overlap_tokens": 0,
+      "expected_spans": [
+        [0, 13],
+        [13, 24]
+      ],
+      "expected_boundaries": [
+        "oversized_sentence",
+        "oversized_sentence"
+      ]
+    }
+  ]
+}

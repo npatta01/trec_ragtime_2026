@@ -1,0 +1,75 @@
+type: task
+name: ragtime-score-passages
+
+# Cross-encoder passage scoring for the nugget stage. Retrieval artifacts carry
+# their own document text, so the 24 GB local corpus never travels here: the
+# plan file lists object keys and the worker reads them from the shared bucket.
+# Scores are written back through PassageScoreCache, which a later local nugget
+# run reads as a warm cache, so this job's output is durable on its own.
+
+python: "3.12"
+
+# This checkout is a git worktree, so dstack's repo upload finds no tree to
+# send. Mount the sources explicitly instead.
+files:
+  # Paths resolve against this file's directory, and the repo's .venv is ~8 GB,
+  # so mount only what the job runs.
+  - ../src:src
+  - ../scripts:scripts
+  - ../pyproject.toml:pyproject.toml
+  - ../uv.lock:uv.lock
+  # pyproject declares readme = "README.md"; the build fails without it.
+  - ../README.md:README.md
+  # Derived worklist of unscored queries, shipped directly so workers never
+  # scan the bucket for completed work (that scan exhausted the API rate limit).
+  - ../remaining_plan.json:remaining_plan.json
+  - ../plan_2066.json:plan_2066.json
+  - ../plan_all.json:plan_all.json
+
+env:
+  - HF_TOKEN
+  - RAGTIME_HF_BUCKET_ID
+  - RAGTIME_ARTIFACT_PREFIX
+  - RAGTIME_CACHE_NAMESPACE
+  # i/n: several sharded runs split the plan across GPUs. No default value:
+  # `NAME=value` here pins the value and ignores the caller's export, which
+  # silently ran every worker over the whole plan.
+  - SCORING_SHARD
+
+commands:
+  - |
+    set -euo pipefail
+    py="$(command -v python3)"
+    case "$py" in /*) ;; *) echo "python3 path is not absolute" >&2; exit 127 ;; esac
+    "$py" -c 'import sys; print("interpreter:", sys.executable)'
+
+    # Bind uv to the image interpreter so it cannot select or download another.
+    uv sync --no-managed-python --no-python-downloads --python "$py" --frozen
+
+    # Cheap wiring check with the real argv before paying for the full run.
+    uv run --no-managed-python --no-python-downloads --python "$py" \
+      python scripts/score_remote.py --plan plan_all.json --preflight
+
+    uv run --no-managed-python --no-python-downloads --python "$py" \
+      python scripts/score_remote.py --plan plan_all.json --device cuda --shard $SCORING_SHARD
+
+# A pool of interchangeable small-to-mid GPUs: the reranker is a 0.5B
+# cross-encoder, so VRAM is not the constraint and pinning one model would
+# just lose to capacity races.
+resources:
+  gpu: T4,L4,A10,A10G,A40,L40,L40S,RTXA5000,RTXA4000,A100,H100:1:16GB..
+  # The reranker is ~1 GB of weights; most T4 offers ship 7-13 GB of RAM, and
+  # requiring more silently excluded every one of them.
+  memory: 6GB..
+  disk: 40GB..
+
+# Only these two are on offer inside the price cap, and both are interchangeable
+# for a 0.5B cross-encoder, so the pool stays capacity-resilient without
+# widening to hardware the workload has not been checked against.
+backends: [gcp, runpod, vastai]
+spot_policy: on-demand
+max_price: 5.00
+
+retry:
+  on_events: [no-capacity]
+  duration: 30m

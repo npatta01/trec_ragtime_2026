@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar, cast
 
 import fsspec
 from huggingface_hub import HfApi
+from huggingface_hub.errors import BucketNotFoundError, HfHubHTTPError
 
 from .paths import default_project_cache_dir, ensure_private_cache_dir
 
@@ -25,6 +28,30 @@ T = TypeVar("T")
 
 DEFAULT_ARTIFACT_CACHE_SUBDIRECTORY = "artifacts-v1"
 DEFAULT_CACHE_NAMESPACE = "ragtime2-2026-v1"
+# Base for the retry backoff, in seconds. Module level so the offline suite can
+# drop it to zero instead of sleeping through every simulated failure.
+RETRY_BASE_SECONDS = 2.0
+
+
+def _http_status(error: BaseException) -> int | None:
+    """Return the first HTTP status in an exception chain, if any.
+
+    Walks ``__context__`` as well as ``__cause__``: the hub raises some
+    not-found errors with ``from None``, which suppresses the cause but leaves
+    the context in place.
+    """
+
+    seen = 0
+    current: BaseException | None = error
+    while current is not None and seen < 8:
+        response = getattr(current, "response", None)
+        if isinstance(current, HfHubHTTPError) and response is not None:
+            status = getattr(response, "status_code", None)
+            if isinstance(status, int):
+                return status
+        current = current.__cause__ or current.__context__
+        seen += 1
+    return None
 
 
 class ArtifactStoreError(Exception):
@@ -297,12 +324,25 @@ class ArtifactStore:
     def _verify_private_bucket(self) -> None:
         if self._private_verified:
             return
-        try:
-            info = self._get_api().bucket_info(self.bucket_id)
-        except Exception:
-            raise ArtifactStoreRemoteError(
-                "failed to inspect the configured Hugging Face bucket"
-            ) from None
+        # Every process calls this before its first read, and the hub does not
+        # retry bucket_info, so starting a wave of workers together reliably
+        # rate-limits some of them. A throttle here says nothing about whether
+        # the bucket is private, so ride it out rather than fail the caller.
+        info = None
+        for attempt in range(4):
+            try:
+                info = self._get_api().bucket_info(self.bucket_id)
+                break
+            except Exception:
+                if _http_status(sys.exc_info()[1] or Exception()) == 404:
+                    raise ArtifactStoreRemoteError(
+                        "configured Hugging Face bucket does not exist"
+                    ) from None
+                if attempt == 3:
+                    raise ArtifactStoreRemoteError(
+                        "failed to inspect the configured Hugging Face bucket"
+                    ) from None
+                time.sleep(RETRY_BASE_SECONDS * 2**attempt)
         if getattr(info, "private", None) is not True:
             raise ArtifactStoreRemoteError(
                 "configured Hugging Face bucket is not private"
@@ -336,32 +376,80 @@ class ArtifactStore:
             return False
         return True
 
+    def _remote_object_exists(self, remote_path: str) -> bool:
+        """Answer presence, or refuse to answer.
+
+        The question cannot be asked at ``open()``. SimpleCacheFileSystem
+        decides absence with ``self.fs.exists(path)`` and then raises a bare
+        ``FileNotFoundError`` outside any ``except``, while ``HfFileSystem
+        .exists`` swallows ``OSError`` — and ``HfHubHTTPError`` is an
+        ``OSError``. So a 429 and a real 404 arrive at ``open()`` byte
+        identical, both with ``__cause__`` and ``__context__`` set to None.
+        ``info()`` still distinguishes them, and costs no extra request
+        because the filesystem memoises the listing ``open()`` would repeat.
+        """
+
+        # A throttle is not an answer, so retry it rather than handing the
+        # caller an error it can only treat as fatal. Several workers starting
+        # together reliably trip the bucket's rate limit, and every one of those
+        # calls would otherwise kill a topic.
+        for attempt in range(4):
+            try:
+                self._get_filesystem().info(remote_path)
+            except FileNotFoundError as error:
+                # FileNotFoundError is itself an OSError, so it has to be caught
+                # ahead of the HfHubHTTPError branch below.
+                status = _http_status(error)
+                if status is None or status == 404:
+                    if isinstance(error.__cause__, BucketNotFoundError):
+                        # The bucket, not the object, is missing: configuration.
+                        raise ArtifactStoreRemoteError(
+                            "configured Hugging Face bucket is unavailable"
+                        ) from None
+                    return False
+            except Exception:
+                pass
+            else:
+                return True
+            if attempt == 3:
+                raise ArtifactStoreRemoteError(
+                    "artifact store could not determine whether the object exists"
+                ) from None
+            time.sleep(RETRY_BASE_SECONDS * 2**attempt)
+        return False
+
     def _read_remote(self, object_key: str) -> bytes | None:
+        """Return bytes, or None only when the object is confirmed absent."""
+
         if self._remote_disabled:
-            return None
-        try:
-            self._verify_private_bucket()
-        except Exception:
-            self._disable_remote()
-            return None
+            # Fail closed and say so. Reporting a miss here is what let a
+            # throttled run record work as "missing" and move on.
+            raise ArtifactStoreRemoteError(
+                "remote artifact access is disabled after an earlier failure"
+            )
+        self._verify_private_bucket()
 
         candidate = self.local_candidate(object_key)
+        remote_path = self._remote_path(object_key)
+        if not self._remote_object_exists(remote_path):
+            self._best_effort_remove_candidate(candidate)
+            return None
         try:
-            with self._get_filesystem().open(self._remote_path(object_key), "rb") as handle:
+            with self._get_filesystem().open(remote_path, "rb") as handle:
                 payload = handle.read()
-        except FileNotFoundError:
-            # Ordinary simplecache absence is a quiet miss.  In particular,
-            # do not trip the breaker on the target's normal not-found path.
-            self._best_effort_remove_candidate(candidate)
-            return None
         except Exception:
+            # Including FileNotFoundError: the object existed a moment ago, so
+            # this is a race or a transport failure, never a confirmed absence.
             self._best_effort_remove_candidate(candidate)
-            self._disable_remote()
-            return None
+            raise ArtifactStoreRemoteError(
+                "artifact store failed to read an object it had located"
+            ) from None
         if not isinstance(payload, (bytes, bytearray)):
             self._best_effort_remove_candidate(candidate)
             self._disable_remote()
-            return None
+            raise ArtifactStoreRemoteError(
+                "artifact store returned a non-bytes payload"
+            )
         return bytes(payload)
 
     def read(self, object_key: str) -> bytes | None:
@@ -426,14 +514,21 @@ class ArtifactStore:
             return None
 
     def write(self, object_key: str, payload: bytes) -> bool:
-        """Upload bytes when remote access is healthy, returning success."""
+        """Store bytes durably, or raise.
+
+        Never returns False. A write that reported failure by return value was
+        ignorable, and one silently was: after the breaker latched, publishing a
+        worklist no-opped and the workers read a stale plan instead.
+        """
 
         object_key = self._validate_object_key(object_key)
         if not isinstance(payload, bytes):
             raise _configuration_error("artifact payload must be bytes")
         candidate = self.local_candidate(object_key)
         if self._remote_disabled:
-            return False
+            raise ArtifactStoreRemoteError(
+                "remote artifact access is disabled after an earlier failure"
+            )
         remote_open_attempted = False
         candidate_existed_before = False
         try:
@@ -448,11 +543,16 @@ class ArtifactStore:
                 raise ArtifactStoreRemoteError(
                     "local artifact candidate did not retain the written bytes"
                 )
+        except ArtifactStoreError:
+            if remote_open_attempted or not candidate_existed_before:
+                self._best_effort_remove_candidate(candidate)
+            raise
         except Exception:
             if remote_open_attempted or not candidate_existed_before:
                 self._best_effort_remove_candidate(candidate)
-            self._disable_remote()
-            return False
+            raise ArtifactStoreRemoteError(
+                "artifact store failed to store the object durably"
+            ) from None
         return True
 
     def configuration(self) -> Mapping[str, object]:

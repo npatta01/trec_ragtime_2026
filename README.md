@@ -2,7 +2,9 @@
 
 This repository is a small working companion for TREC RAGTIME 2026. It combines
 an at-a-glance track reference with a runnable notebook that previews the
-RAGTIME2 data without downloading the full collection.
+RAGTIME2 data without downloading the full collection. Passage reranking starts
+with the local scorer; the optional Flash path is only an explicit transport
+seam.
 
 ## Start Here
 
@@ -78,6 +80,180 @@ sops decrypt --output .env config/secrets.sops.env
 For an unshared local configuration, copy `.env.example` to `.env` and fill in
 the token. The plaintext `.env` file is ignored by Git.
 
+## Passage Reranking
+
+Passage reranking is a local-first layer over an existing `RetrievalResult`.
+The normal English report path selects each document's `report_text`: verified
+English translation for Spanish, Russian, and Chinese source documents, or the
+canonical text for an English source. `representation="canonical"` selects the
+original-language source instead. Missing report translations and unresolved
+documents remain in the result with explicit statuses.
+
+The pinned local model is `mixedbread-ai/mxbai-rerank-base-v2` at revision
+`3ea9d4dffa7d12a4f366be8e275c349de9fc9865`, loaded through the supported direct
+`sentence_transformers.CrossEncoder` path. The model-owned tokenizer name and
+revision must match the model name and revision. The tokenizer-only
+`CrossEncoderPairLengthFunction` captures the retrieval query and loads no
+model weights. `LocalCrossEncoderScorer` loads model weights lazily, on the
+first score call, and returns raw cross-encoder logits.
+The supported local flow is below. `retrieval` is an existing hydrated
+`RetrievalResult`, such as the value returned by
+[Reusable Retrieval And Hydration](#reusable-retrieval-and-hydration).
+
+```python
+from trec_ragtime import (
+    CachedPassageScorer,
+    CrossEncoderPairLengthFunction,
+    LocalCrossEncoderConfig,
+    LocalCrossEncoderScorer,
+    PassageChunker,
+    PassageScoreCache,
+    rerank_retrieval,
+)
+
+policy = LocalCrossEncoderConfig(device="cpu")
+pair_length = CrossEncoderPairLengthFunction(policy, retrieval.query)
+chunker = PassageChunker(pair_length, overlap_tokens=64)
+scorer = LocalCrossEncoderScorer(policy)
+
+# Optional complete per-query cache. `store` may be the landed `ArtifactStore`
+# or an `ArtifactStoreLike` fake supplied by the caller.
+cache = PassageScoreCache(
+    store,
+    scorer,
+    chunker_fingerprint=chunker.fingerprint,
+    representation="report_text",
+)
+scorer = CachedPassageScorer(cache)
+
+report_result = rerank_retrieval(
+    retrieval,
+    chunker=chunker,
+    scorer=scorer,
+    representation="report_text",
+)
+```
+
+`PassageChunker` uses the pinned language-specific spaCy pipelines through
+LangChain's sentence splitter. It preserves exact Python-character offsets,
+exact UTF-8 SHA-256 content hashes, and complete selected-text coverage. Normal
+overlap contains complete sentence units only; it never splits a sentence to
+manufacture overlap. If one sentence exceeds the full pair budget, only that
+sentence is passed to `RecursiveCharacterTextSplitter` (RCTS), and every
+fragment is rechecked against the exact pair ceiling. Keep the pair-length
+callable aligned with the scorer: a character count can admit a passage that
+overflows after query and special tokens are included.
+
+Use `device="cuda"` for CUDA PyTorch, or the user-facing `device="rocm"`
+alias on ROCm builds; `rocm` is normalized to PyTorch's `cuda` device. The
+scorer and chunker fingerprints include result-affecting model, tokenizer,
+device, precision, batching, query format, query policy, and pair-length
+settings. Changing one of these settings isolates its score cache.
+
+`PassageScoreCache` stores one complete validated `dict[bytes, float]` per
+query. It accepts the concrete `ArtifactStore` or an `ArtifactStoreLike` fake.
+The small protocol includes `read`, `read_validated`, `write`, and `evict_local`.
+Cache reads return the requested hashes from a complete union, and a successful
+miss merges new scores into that union. Partial or failed scoring is never
+written.
+
+Reranking aggregates each document by its maximum passage score. Evidence is
+deduplicated by positional `(document_id, start_char, end_char)` identity, so
+identical text at distinct offsets remains distinct evidence while sharing a
+safe content-hash score. Ordering is deterministic by descending score,
+organizer rank, and document ID; evidence is ordered by source offsets.
+
+Flash remains an optional transport for the same `PassageScorer` contract; the
+local path above is the primary complete execution path. Install Flash
+separately with `uv sync --extra runpod`. Bounded payload size, batch size,
+concurrency, request timeout, worker count, and idle timeout remain explicit.
+The adapter accepts the same complete score map, and the static worker accepts
+mapping-compatible Transformers `BatchEncoding` values. An existing endpoint
+caller and a later worker definition use the same pinned model policy:
+
+> **Flash scaling rule:** always configure workers as `(0, N)`: `0` is the
+> minimum and `N` is the desired maximum. The integer shorthand `workers=N`
+> also means `(0, N)`. Never use `(1, N)`, because it keeps a worker running
+> and billing while idle.
+
+```python
+from trec_ragtime import (
+    CrossEncoderPairLengthFunction,
+    FlashEndpointBatchRunner,
+    PassageChunker,
+    RunpodFlashPassageScorer,
+    RunpodFlashConfig,
+    build_flash_worker,
+    rerank_retrieval,
+)
+
+flash_policy = RunpodFlashConfig(
+    endpoint_id="existing-endpoint-id",
+    model_config=policy,
+    device="cuda",
+    batch_size=32,
+    max_payload_bytes=9_000_000,
+    concurrency=4,
+    request_timeout=60.0,
+    workers=1,  # Flash shorthand for (0, 1): scale to zero when idle.
+    idle_timeout=300,
+)
+
+remote_policy = flash_policy.effective_model_config
+remote_pair_length = CrossEncoderPairLengthFunction(remote_policy, retrieval.query)
+remote_chunker = PassageChunker(remote_pair_length, overlap_tokens=64)
+
+# Caller and scorer for an endpoint that already exists.
+with FlashEndpointBatchRunner(flash_policy) as endpoint_runner:
+    with RunpodFlashPassageScorer(flash_policy, endpoint_runner) as flash_scorer:
+        flash_result = rerank_retrieval(
+            retrieval,
+            chunker=remote_chunker,
+            scorer=flash_scorer,
+            representation="report_text",
+        )
+
+# Definition seam for a later, explicit worker-definition workflow.
+from runpod_flash import Endpoint
+
+worker_definition = build_flash_worker(
+    flash_policy,
+    endpoint_factory=Endpoint,
+)
+```
+
+`FlashEndpointBatchRunner` constructs an `Endpoint(id=...)`, submits with
+`run()`, and waits with `job.wait()`. `build_flash_worker` only returns the
+static worker or applies the explicit endpoint decorator with pinned
+dependencies. Building a worker definition does not deploy, provision, or
+make a paid request. No paid or deployment action is authorized by this
+refactor.
+
+Offline reranking verification starts after decrypting `.env` and makes no
+organizer, Hugging Face, Runpod, or model-download calls:
+
+```bash
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest tests.test_passage_reranking_integration -v
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest \
+  tests.test_passages \
+  tests.test_passage_scoring \
+  tests.test_passage_score_cache \
+  tests.test_reranking \
+  tests.test_flash_passage_scorer \
+  tests.test_passage_reranking_integration -v
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python scripts/benchmark_passage_chunking.py
+sops decrypt --output .env config/secrets.sops.env && git check-ignore .env && \
+  uv run python -m unittest discover -s tests -v
+```
+
+Offline fakes and an in-memory Flash wire runner intentionally replace all
+organizer, Dataset Viewer, endpoint, deployment, and model-weight calls in
+these checks. A real local model batch and live endpoint behavior remain
+explicit external acceptance gates.
+
 ## Hosted Retrieval Model
 
 The official participant endpoint currently uses
@@ -131,13 +307,13 @@ public [Hugging Face corpus](https://huggingface.co/datasets/trec-ragtime/ragtim
 from trec_ragtime import RagtimeRetriever
 
 with RagtimeRetriever.from_env() as retriever:
-    result = retriever.retrieve(
+    retrieval = retriever.retrieve(
         "health benefits of Nordic walking",
         pipeline="ragtime2%100",
         top_k=None,
     )
 
-for document in result.documents:
+for document in retrieval.documents:
     print(
         document.rank,
         document.document_id,
@@ -301,9 +477,10 @@ The shared setup is:
 ```python
 from openai import OpenAI
 
-from trec_ragtime import CachedChatCompletions
+from trec_ragtime import CachedChatCompletions, provider_settings
 from trec_ragtime.artifact_store import ArtifactStore
 
+provider_url, provider_key = provider_settings()
 client = OpenAI(api_key=provider_key, base_url=provider_url, max_retries=0)
 cached = CachedChatCompletions(client, ArtifactStore.from_env())
 response = cached.create(model=model, messages=messages)
@@ -313,28 +490,33 @@ When `namespace` is omitted, the wrapper inherits a store's validated
 `namespace` metadata; stores without namespace metadata use the default
 `ragtime2-2026-v1`. Pass `namespace=` explicitly to override the store.
 
-For OpenRouter, use `provider_url = "https://openrouter.ai/api/v1"` and keep
-the provider key in the environment or another private configuration source.
-For a LiteLLM deployment, set `provider_url` to that deployment's configured
-OpenAI-compatible `/v1` proxy URL; the proxy address is deployment-specific and
-the wrapper does not assume one.
+The LLM provider credential is not a special case: `OPENROUTER_API_KEY` lives
+in the committed `config/secrets.sops.env` ciphertext and reaches the process
+through the same decrypt-first workflow as every other secret. Decrypt into the
+ignored root `.env`, and the notebooks and entry points that load `.env` pick it
+up from there. The variable is listed with an empty value in the tracked
+`.env.example` for an unshared local configuration. OpenRouter's base URL is
+`https://openrouter.ai/api/v1`.
 
-The decrypt-first workflow replaces the project `.env`, so provider-specific
-values are intentionally not listed in `.env.example`. Export them in the shell
-after decrypting `.env`, or inject them through another private runtime secret
-source.
-
-```python
-import os
-
-# OpenRouter
-provider_url = "https://openrouter.ai/api/v1"
-provider_key = os.environ["OPENROUTER_API_KEY"]
-
-# LiteLLM proxy (the configured value must be its OpenAI-compatible /v1 URL)
-provider_url = os.environ["LITELLM_PROXY_BASE_URL"]
-provider_key = os.environ["LITELLM_PROXY_API_KEY"]
+```bash
+sops decrypt --output .env config/secrets.sops.env
 ```
+
+For a direct OpenAI account or a LiteLLM deployment, use `OPENAI_API_KEY`
+instead and set `OPENAI_BASE_URL` to that deployment's OpenAI-compatible `/v1`
+URL. The proxy address is deployment-specific, so nothing here assumes one;
+omitting `OPENAI_BASE_URL` reaches OpenAI itself at `https://api.openai.com/v1`.
+
+`trec_ragtime.provider_settings()` owns that resolution so callers do not
+re-derive it from the environment: `OPENROUTER_API_KEY` wins and implies the
+OpenRouter base URL, `OPENAI_API_KEY` (or the `OPEN_AI_API_KEY` spelling some
+upstream packages read) with an optional `OPENAI_BASE_URL` is the fallback,
+and an explicit `OPENAI_BASE_URL` overrides the default in either case. A
+blank value is an unfilled `.env` placeholder rather than a credential, and no
+credential at all raises `ProviderConfigurationError` instead of reaching a
+provider anonymously. Pass an explicit mapping to resolve without reading the
+process environment. The returned key is for the SDK to use: it is never
+logged, stored, or part of a cache key or fingerprint.
 
 The cache identity includes the base URL, operation, namespace, and the exact
 JSON request. Mapping key order is canonicalized recursively, while list order
@@ -481,6 +663,77 @@ read-only and the owner-only manifest contains only file hashes, sanitized
 counts, corpus provenance, and retrieval object keys—not queries, document
 bodies, credentials, or local cache secrets.
 
+### Source-Linked Nuggets
+
+`trec_ragtime.nuggets` compresses one topic's ranked passages into atomic
+English claims where every claim resolves to a document and an exact character
+span. It is an internal evidence-compression stage, not a Nuggetizer-track
+submission, and the package's `vital`/`okay` scores are signals rather than
+human ground truth.
+
+Upstream [`nuggetizer`](https://github.com/castorini/nuggetizer) returns claim
+text with no document identity, so linkage comes from its assigner: every claim
+is judged against every evidence passage, and that support matrix is the
+lineage. A claim no passage supports is quarantined, and a topic where nothing
+survives fails without writing anything.
+
+```text
+create(query, all passages)  ->  claims + vital/okay
+assign(query, ONE passage, claims) x N  ->  support / partial_support / not_support
+```
+
+The pinned version is `nuggetizer==0.0.5`. Later upstream commits move the
+prompts into `src/nuggetizer/prompts/` without adding that package to the
+setuptools `include` list, so a Git-pinned build installs and then fails on
+`from ..prompts import ...`. Revisit the pin when upstream publishes a fixed
+release; the installed version and revision are part of every artifact
+fingerprint, so a change retires the previous objects.
+
+The provider credential is resolved by `trec_ragtime.providers.provider_settings`
+from the decrypted `.env`, so `OPENROUTER_API_KEY` is picked up automatically and
+implies the OpenRouter base URL. Pinned 0.0.5 reads only `OPEN_AI_API_KEY` or
+`OPENAI_API_KEY` and always points at OpenAI, so the resolved base URL and key
+are handed to it explicitly rather than left to its own lookup. Upstream exposes
+no seed, so identical inputs may still produce different claims on a cold run:
+determinism comes from the artifact cache, not from the provider. Upstream also
+retries a failed provider call forever, so this stage caps each topic's provider
+calls and turns exhaustion into a failed topic rather than a hung batch.
+
+Bundles are cached per topic, keyed by a slow-moving behaviour fingerprint and
+the topic's exact inputs:
+
+```text
+nuggets/v1/<nuggetizer-fingerprint>/<request-prefix>/<request-digest>.mpk
+```
+
+The request identity covers the topic, the exact question asked, the source
+representation, the input retrieval artifacts, the passage-source fingerprint,
+and a digest of the ordered alias table. Rewording the question, or altering an
+alias, document, or offset, therefore yields a different key rather than a stale
+hit.
+
+The bundle carries the complete evidence-alias table, ordered nuggets with
+their attesting passages, facet coverage, and sanitized rejection counts. It
+deliberately stores no passage text: the offsets and `content_hash` prove which
+text was used, and the text itself is recoverable from the retrieval artifact,
+so the bundle cannot drift from the corpus. Paraphrases are merged with a
+pinned `sentence-transformers/all-MiniLM-L6-v2` cosine threshold guarded by a
+numeric and negation check, so `fell 30%` never collapses into `fell 13%`, and
+a merge keeps every attesting source.
+
+Run it over the planned topics after decrypting `.env`:
+
+```bash
+uv run ragtime-nuggets --model <model-id> --topic-id 2000 --evidence-budget 24
+```
+
+Retrieval is read from the artifact cache only; a topic whose facets have not
+been retrieved is reported rather than turned into an organizer request. The
+query plan's own facet numbering is carried through to both the projected
+evidence and the recorded inputs, so a facet with no cached retrieval is skipped
+without renumbering the ones around it. `trec_ragtime.nuggets_runner` remains
+the supported Python API for callers that want the stage without the command.
+
 ## Generate RAGTIME Reports
 
 `ragtime-report` turns a completed retrieval run into a validated official
@@ -538,6 +791,7 @@ Re-running the same command warm makes zero provider calls and reproduces the
 submission byte for byte. Only complete reports that pass every domain and
 submission check are cached: refusals, truncated completions, malformed output,
 unknown handles, uncited sentences, and over-limit reports are never stored.
+
 
 ## Repository Map
 

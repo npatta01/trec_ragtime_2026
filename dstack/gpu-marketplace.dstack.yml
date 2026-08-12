@@ -1,0 +1,18 @@
+type: fleet
+name: gpu-marketplace
+
+# Reproduces the existing fleet exactly, with one change: nodes.max 6 -> 24.
+# The 6-node ceiling, not provider supply, was what made every seventh shard
+# report "no offers" while `dstack offer` still listed 63 vastai offers —
+# `dstack offer` ignores fleets, `dstack apply` places into them.
+nodes: 0..24
+
+resources:
+  cpu: 2..
+  memory: 8GB..
+  gpu: A40,A6000,L40,L40S,RTX6000Ada,A100,H100,H200:24GB..:1
+  disk: 100GB..
+
+backends: [runpod, vastai]
+spot_policy: on-demand
+idle_duration: 300
