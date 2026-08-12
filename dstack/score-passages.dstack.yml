@@ -24,6 +24,7 @@ files:
   # scan the bucket for completed work (that scan exhausted the API rate limit).
   - ../remaining_plan.json:remaining_plan.json
   - ../plan_2066.json:plan_2066.json
+  - ../plan_all.json:plan_all.json
 
 env:
   - HF_TOKEN
@@ -47,16 +48,16 @@ commands:
 
     # Cheap wiring check with the real argv before paying for the full run.
     uv run --no-managed-python --no-python-downloads --python "$py" \
-      python scripts/score_remote.py --plan remaining_plan.json --preflight
+      python scripts/score_remote.py --plan plan_all.json --preflight
 
     uv run --no-managed-python --no-python-downloads --python "$py" \
-      python scripts/score_remote.py --plan remaining_plan.json --device cuda --shard $SCORING_SHARD
+      python scripts/score_remote.py --plan plan_all.json --device cuda --shard $SCORING_SHARD
 
 # A pool of interchangeable small-to-mid GPUs: the reranker is a 0.5B
 # cross-encoder, so VRAM is not the constraint and pinning one model would
 # just lose to capacity races.
 resources:
-  gpu: T4,L4,A10,A10G,A40,L40,L40S,RTXA5000,RTXA4000,A100:1:16GB..
+  gpu: T4,L4,A10,A10G,A40,L40,L40S,RTXA5000,RTXA4000,A100,H100:1:16GB..
   # The reranker is ~1 GB of weights; most T4 offers ship 7-13 GB of RAM, and
   # requiring more silently excluded every one of them.
   memory: 6GB..
@@ -65,9 +66,9 @@ resources:
 # Only these two are on offer inside the price cap, and both are interchangeable
 # for a 0.5B cross-encoder, so the pool stays capacity-resilient without
 # widening to hardware the workload has not been checked against.
-backends: [gcp, runpod]
+backends: [gcp, runpod, vastai]
 spot_policy: on-demand
-max_price: 1.20
+max_price: 5.00
 
 retry:
   on_events: [no-capacity]
