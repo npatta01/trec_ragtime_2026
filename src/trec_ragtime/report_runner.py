@@ -303,22 +303,30 @@ def _bundles_from_handoff(
     bundles: list[EvidenceBundle] = []
     available: list[Topic] = []
     missing: list[str] = []
+    unusable: dict[str, str] = {}
     for topic in topics:
         entry = manifest.entry(topic.topic_id)
         if entry is None or not entry.available:
             missing.append(topic.topic_id)
             continue
-        handoff = require_handoff_bundle(store, entry)
-        if not _handoff_topic_matches(handoff, topic):
-            raise ReportRunError(
-                f"handoff topic record for {topic.topic_id} does not match the"
-                " official topic catalog"
-            )
-        bundles.append(
-            build_evidence_bundle_from_handoff(
+        try:
+            handoff = require_handoff_bundle(store, entry)
+            if not _handoff_topic_matches(handoff, topic):
+                raise ReportRunError(
+                    f"handoff topic record for {topic.topic_id} does not match the"
+                    " official topic catalog"
+                )
+            bundle = build_evidence_bundle_from_handoff(
                 handoff, topics_sha256=topics_sha256, evidence_chars=evidence_chars
             )
-        )
+        except Exception as error:
+            # One unusable handoff must not abort the other 102. A topic whose
+            # evidence is entirely partial-support, for instance, has nothing
+            # citable and is recorded rather than raised.
+            missing.append(topic.topic_id)
+            unusable[topic.topic_id] = f"{type(error).__name__}: {error}"
+            continue
+        bundles.append(bundle)
         available.append(topic)
     record = {
         "run_schema": "retrieval_handoff_v1",
@@ -326,6 +334,7 @@ def _bundles_from_handoff(
         "handoff_fingerprint": manifest.fingerprint,
         "topic_catalog_digest": manifest.topic_catalog_digest,
         "handoff_complete": manifest.complete,
+        "unusable_topics": unusable,
     }
     return tuple(bundles), tuple(available), tuple(missing), record
 
@@ -595,6 +604,7 @@ def run_report_generation(
             {
                 "failed_topics": sorted(failures),
                 "missing_evidence_topics": list(missing),
+                "unusable_evidence": dict(input_record.get("unusable_topics", {})),
                 "details": failures,
             },
         )
@@ -715,6 +725,11 @@ def _api_key(name: str | None) -> tuple[str, str]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Match the other runners: the decrypt-first workflow in AGENTS.md writes
+    # .env, and the CLI is expected to pick it up without a manual export.
+    from dotenv import load_dotenv
+
+    load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
 
