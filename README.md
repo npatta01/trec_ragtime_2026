@@ -857,6 +857,35 @@ Generation does not reopen raw retrieval or nugget artifacts and does not need
 to deduplicate evidence. The owner-only manifest records per-topic object keys
 and counts without topic or passage text.
 
+### Validate A Submission Before Sending It
+
+Gate every candidate run through the organizers' AutoJudge checker:
+
+```bash
+uv run ragtime-validate-submission path/to/ragtime26.submission.jsonl
+```
+
+The command defaults to `--spec ragtime26` and to the official topics file, and
+exits `255` when the checker reports any hard problem, so it works directly as a
+submission gate. Add `--strict` to fail on warnings too, `--no-topics` to skip
+the coverage and per-topic length cross-check, or `--suppress-warnings` to see
+only hard failures. The exact underlying `report_tool` invocation is echoed
+before it runs.
+
+`autojudge-base` is a submission-time checker rather than a pipeline dependency,
+so it is intentionally absent from `pyproject.toml`. The command uses it when it
+is importable and otherwise fetches it through
+`uv run --isolated --no-project --with 'autojudge-base>=0.4.3'`, leaving the
+project environment and lock file untouched.
+
+The checker parses `--topics` into its own `Request` model, which requires
+`request_id` and `collection_ids`; the official topics file carries `topic_id`
+and `collection_id`. Passing the official file to `report_tool` directly fails
+to load and silently costs the coverage and length checks, so
+`ragtime-validate-submission` translates validated topics into a throwaway
+requests file instead of forking the pinned official topics. Use
+`--requests-out` to keep that translation for a manual `report_tool` run.
+
 ## Repository Map
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the
@@ -867,6 +896,9 @@ and counts without topic or passage text.
 - [`topics/topics.all.2026.v0625-fix.jsonl`](topics/topics.all.2026.v0625-fix.jsonl):
   [official corrected June 25 test topics](https://trec.nist.gov/act_part/tracks/ragtime/topics.all.2026.v0625-fix.jsonl),
   normalized to one JSON object per line.
+- [`.claude/skills/validate-submission`](.claude/skills/validate-submission/SKILL.md):
+  agent skill that runs the AutoJudge submission checker and explains what the
+  `ragtime26` spec enforces.
 - [`index.html`](index.html): compact GitHub Pages landing page for the project.
 - [`reports/2026-quick-reference-and-2025-reproduction-playbook/index.html`](reports/2026-quick-reference-and-2025-reproduction-playbook/index.html):
   static 2026 quick reference and 2025 reproduction playbook.

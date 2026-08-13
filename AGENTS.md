@@ -3,6 +3,22 @@
 ## TREC RAGTIME 2026 Competition Rules
 
 - Treat the [TREC 2026 RAGTIME Track Guidelines](https://docs.google.com/document/d/1XqypNTHxIdazxfnUebrp-EsUuGNhodhQGrJIDnYGaB4/edit) as the source of truth for competition rules, submission formats, scoring, deadlines, and other track requirements. Consult the document whenever the repository instructions or task context leave a competition rule unclear.
+- Gate every candidate submission JSONL through the organizers' AutoJudge
+  checker before sending it, and never report a run as submission-ready without
+  a passing check:
+
+  ```bash
+  uv run ragtime-validate-submission path/to/ragtime26.submission.jsonl
+  ```
+
+  Exit `255` means at least one hard problem; `--strict` also fails on
+  warnings. `trec_ragtime.submission_validation` owns the wrapper and the
+  `.claude/skills/validate-submission` skill documents what `ragtime26`
+  enforces. Never edit `topics/topics.all.2026.v0625-fix.jsonl` to satisfy the
+  checker's `Request` schema: the official topics stay pinned and the command
+  writes a throwaway translated requests file instead. `autojudge-base` stays
+  out of `pyproject.toml`; it is a submission-time checker, not a pipeline
+  dependency.
 
 ## Secrets And Environment
 
