@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import fsspec
@@ -178,16 +179,30 @@ class FakeHfApi:
         *,
         private: bool = True,
         bucket_error: BaseException | None = None,
+        bucket_paths: tuple[object, ...] = (),
     ) -> None:
         self.private = private
         self.bucket_error = bucket_error
+        self.bucket_paths = bucket_paths
         self.bucket_calls: list[str] = []
+        self.tree_calls: list[tuple[str, str | None, bool | None, object]] = []
 
     def bucket_info(self, bucket_id: str):
         self.bucket_calls.append(bucket_id)
         if self.bucket_error is not None:
             raise self.bucket_error
         return type("BucketInfo", (), {"private": self.private})()
+
+    def list_bucket_tree(
+        self,
+        bucket_id: str,
+        prefix: str | None = None,
+        *,
+        recursive: bool | None = None,
+        token: object = None,
+    ):
+        self.tree_calls.append((bucket_id, prefix, recursive, token))
+        return iter(self.bucket_paths)
 
 
 class ArtifactStoreTestCase(unittest.TestCase):
@@ -204,6 +219,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.fs: FakeSimpleCache | None = None
         self.api_constructed = 0
         self.fs_constructed = 0
+        self.bucket_paths: tuple[object, ...] = ()
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -221,7 +237,11 @@ class ArtifactStoreTestCase(unittest.TestCase):
     ) -> ArtifactStore:
         def api_factory(**kwargs):
             self.api_constructed += 1
-            self.api = FakeHfApi(private=private, bucket_error=api_error)
+            self.api = FakeHfApi(
+                private=private,
+                bucket_error=api_error,
+                bucket_paths=self.bucket_paths,
+            )
             return self.api
 
         def fs_factory(protocol: str, **kwargs):
@@ -265,6 +285,29 @@ class ArtifactStoreTestCase(unittest.TestCase):
 
         self.assertEqual(store.read("object.mpk"), b"local")
         self.assertEqual(self.api_constructed, 0)
+        self.assertEqual(self.fs_constructed, 0)
+
+    def test_lists_only_file_keys_beneath_a_validated_durable_prefix(self) -> None:
+        self.bucket_paths = (
+            SimpleNamespace(type="file", path="foo/retrieval-handoff/v1/fp/b.mpk"),
+            SimpleNamespace(type="directory", path="foo/retrieval-handoff/v1/fp/sub"),
+            SimpleNamespace(type="file", path="foo/retrieval-handoff/v1/fp/a.mpk"),
+            SimpleNamespace(type="file", path="other/unrelated.mpk"),
+        )
+        store = self.make_store()
+
+        self.assertEqual(
+            store.list_keys("retrieval-handoff/v1/fp"),
+            (
+                "retrieval-handoff/v1/fp/a.mpk",
+                "retrieval-handoff/v1/fp/b.mpk",
+            ),
+        )
+        assert self.api is not None
+        self.assertEqual(
+            self.api.tree_calls,
+            [("owner/bucket", "foo/retrieval-handoff/v1/fp", True, "secret-token")],
+        )
         self.assertEqual(self.fs_constructed, 0)
 
     def test_local_candidate_matches_real_simplecache_mapper_without_hf_io(self) -> None:
@@ -421,6 +464,14 @@ class ArtifactStoreTestCase(unittest.TestCase):
             warnings.simplefilter("always")
             self.assertIsNone(store.read_validated("object.mpk", self.decoder))
         self.assertEqual(caught, [])
+        self.assertFalse(store.local_candidate("object.mpk").exists())
+
+    def test_corrupt_l2_strict_read_raises_validation_error(self) -> None:
+        store = self.make_store()
+        self.remote["owner/bucket/foo/object.mpk"] = b"bad"
+
+        with self.assertRaises(ArtifactValidationError):
+            store.read_validated_strict("object.mpk", self.decoder)
         self.assertFalse(store.local_candidate("object.mpk").exists())
 
     def test_a_failed_write_raises_and_cleans_its_exact_candidate(self) -> None:

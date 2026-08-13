@@ -746,18 +746,30 @@ uv run ragtime-retrieval-handoff \
 ```
 
 This command is cache-only. It reconstructs the exact retrieval, passage-score,
-and nugget identities and fails a topic when any required artifact is absent;
-it never starts retrieval, hydration, GPU scoring, or provider work. Each
-successful topic produces one self-contained MessagePack bundle under
+and nugget identities only for a missing handoff. A warm run discovers and
+strictly validates the self-contained handoff objects directly, without opening
+the retriever, scorer, retrieval artifacts, or nugget artifacts. It never starts
+retrieval, hydration, GPU scoring, or provider work. Each successful topic
+produces one self-contained MessagePack bundle under
 `retrieval-handoff/v1/`. The bundle includes the official topic record, retained
 deduplicated nuggets, and only the exact English passage slices linked by those
 nuggets. Full `support` links are citation-ready. `partial_support` is retained
 as labeled context but is not citation-ready.
 
-Report generation consumes the typed bundle directly:
+The manifest contains each complete bundle's object key. Report generation can
+therefore consume it directly, without reconstructing the upstream request:
 
 ```python
-bundle = handoff_cache.get(fingerprint, request)
+import json
+from pathlib import Path
+
+manifest = json.loads(Path(manifest_path).read_text())
+topic = next(row for row in manifest["topics"] if row["topic_id"] == topic_id)
+bundle = handoff_cache.get_by_object_key(
+    fingerprint,
+    topic["object_key"],
+    topic_catalog_digest=bytes.fromhex(manifest["topic_catalog_digest"]),
+)
 if bundle is None:
     raise RuntimeError("retrieval handoff is incomplete")
 for nugget in bundle.nuggets:

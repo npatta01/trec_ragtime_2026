@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
@@ -11,15 +12,17 @@ from pathlib import Path
 
 import msgspec
 
-from .artifact_store import ArtifactStore
+from .artifact_store import ArtifactStore, ArtifactValidationError
 from .nugget_cache import (
+    NUGGET_OBJECT_KEY_PREFIX,
+    NUGGET_SCHEMA_VERSION,
     NuggetArtifactCache,
     NuggetEnvelope,
     NuggetInput,
     NuggetRequest,
     evidence_digest,
 )
-from .nuggets import NuggetBundle, NuggetClusterer
+from .nuggets import NuggetBundle, NuggetClusterer, check_bundle
 from .nuggets_cli import build_parser as build_nugget_parser
 from .nuggets_cli import _head, plan_queries, select_plans
 from .nuggets_runner import build_fingerprint
@@ -27,8 +30,16 @@ from .nuggetizer_adapter import NuggetizerConfig, backend_fingerprint
 from .passage_score_cache import CacheOnlyPassageScorer
 from .providers import provider_settings
 from .query_baselines import default_query_plan_path, load_query_plans
-from .retrieval_handoff import HandoffNuggetSource, project_retrieval_handoff
-from .retrieval_handoff_cache import HandoffFingerprint, RetrievalHandoffArtifactCache
+from .retrieval_handoff import (
+    HandoffNuggetSource,
+    RetrievalHandoffBundle,
+    project_retrieval_handoff,
+)
+from .retrieval_handoff_cache import (
+    OBJECT_ROOT,
+    HandoffFingerprint,
+    RetrievalHandoffArtifactCache,
+)
 from .retrieval_handoff_runner import (
     HandoffOutcome,
     HandoffWork,
@@ -96,27 +107,132 @@ def _cache_only_scorer(arguments):
     return flash.effective_model_config, CacheOnlyPassageScorer(flash.fingerprint)
 
 
-def _l1_nugget_candidates(
+def _nugget_candidates(
     store: ArtifactStore, fingerprint: bytes
 ) -> dict[str, tuple[NuggetBundle, ...]]:
-    """Index validated candidate envelopes from the disposable local cache once."""
+    """Index newest-first sealed candidates from the durable nugget prefix."""
 
-    found: dict[str, list[NuggetBundle]] = {}
-    for path in Path(store.local_dir).iterdir():
-        if not path.is_file():
-            continue
+    fingerprint_hex = fingerprint.hex()
+    prefix = f"{NUGGET_OBJECT_KEY_PREFIX}/{fingerprint_hex}"
+    found: dict[str, list[NuggetEnvelope]] = {}
+    for object_key in store.list_keys(prefix):
+        parts = object_key.split("/")
         try:
-            payload = path.read_bytes()
-            envelope = msgspec.msgpack.decode(payload, type=NuggetEnvelope)
+            request_hex = parts[-1].removesuffix(".mpk")
             if (
-                envelope.fingerprint != fingerprint
-                or msgspec.msgpack.encode(envelope) != payload
+                len(parts) != 5
+                or "/".join(parts[:2]) != NUGGET_OBJECT_KEY_PREFIX
+                or parts[2] != fingerprint_hex
+                or not parts[-1].endswith(".mpk")
+                or parts[3] != request_hex[:2]
+                or len(request_hex) != 64
+                or any(character not in "0123456789abcdef" for character in request_hex)
             ):
+                raise ValueError("invalid nugget key")
+            request_digest = bytes.fromhex(request_hex)
+
+            def decode(payload: bytes) -> NuggetEnvelope:
+                try:
+                    envelope = msgspec.msgpack.decode(payload, type=NuggetEnvelope)
+                    if (
+                        envelope.schema_version != NUGGET_SCHEMA_VERSION
+                        or envelope.fingerprint != fingerprint
+                        or envelope.request_digest != request_digest
+                        or not math.isfinite(envelope.stored_at)
+                        or msgspec.msgpack.encode(envelope) != payload
+                    ):
+                        raise ValueError("invalid nugget envelope")
+                    check_bundle(envelope.bundle)
+                    return envelope
+                except Exception:
+                    raise ArtifactValidationError(
+                        "cached nugget candidate is invalid"
+                    ) from None
+
+            envelope = store.read_validated_strict(object_key, decode)
+            if envelope is None:
                 continue
-        except (OSError, msgspec.DecodeError, msgspec.ValidationError):
+        except ArtifactValidationError:
+            raise
+        except Exception:
+            raise ArtifactValidationError("nugget object key is invalid") from None
+        found.setdefault(envelope.bundle.topic_id, []).append(envelope)
+    return {
+        topic_id: tuple(
+            envelope.bundle
+            for envelope in sorted(
+                rows,
+                key=lambda envelope: (envelope.stored_at, envelope.request_digest),
+                reverse=True,
+            )
+        )
+        for topic_id, rows in found.items()
+    }
+
+
+def _shared_tokenizer_loader():
+    """Return a lazy loader that reuses one immutable tokenizer across facets."""
+
+    tokenizer = None
+
+    def load(config):
+        nonlocal tokenizer
+        if tokenizer is None:
+            from .passage_scoring import _default_tokenizer_loader
+
+            tokenizer = _default_tokenizer_loader(config)
+        return tokenizer
+
+    return load
+
+
+def _discover_cached_handoffs(
+    store: ArtifactStore,
+    cache: RetrievalHandoffArtifactCache,
+    fingerprint: HandoffFingerprint,
+    *,
+    topic_catalog_digest: bytes,
+    topic_ids: Sequence[str],
+    nugget_fingerprint_digest: bytes | None = None,
+) -> dict[str, tuple[RetrievalHandoffBundle, str]]:
+    """Resolve complete handoffs directly, before opening any upstream stage."""
+
+    wanted = set(topic_ids)
+    found: dict[str, tuple[RetrievalHandoffBundle, str]] = {}
+    prefix = f"{OBJECT_ROOT}/{fingerprint.digest.hex()}"
+    for object_key in store.list_keys(prefix):
+        bundle = cache.get_by_object_key(
+            fingerprint,
+            object_key,
+            topic_catalog_digest=topic_catalog_digest,
+        )
+        if bundle is None or bundle.topic.topic_id not in wanted:
             continue
-        found.setdefault(envelope.bundle.topic_id, []).append(envelope.bundle)
-    return {topic_id: tuple(rows) for topic_id, rows in found.items()}
+        if (
+            nugget_fingerprint_digest is not None
+            and bundle.nugget_source.fingerprint_digest
+            != nugget_fingerprint_digest
+        ):
+            continue
+        if bundle.topic.topic_id in found:
+            raise ValueError("multiple current handoffs exist for one topic")
+        found[bundle.topic.topic_id] = (bundle, object_key)
+    return found
+
+
+def _cached_outcome(
+    bundle: RetrievalHandoffBundle, object_key: str
+) -> HandoffOutcome:
+    return HandoffOutcome(
+        topic_id=bundle.topic.topic_id,
+        status="cached",
+        object_key=object_key,
+        nugget_count=bundle.counts.nuggets,
+        evidence_count=bundle.counts.selected_evidence,
+        full_support_count=bundle.counts.full_support,
+        partial_support_count=bundle.counts.partial_support,
+        citation_ready_count=bundle.counts.citation_ready,
+    )
 
 
 def _prepare_source_identity(
@@ -129,6 +245,7 @@ def _prepare_source_identity(
     representation: str,
     top_k: int,
     rerank_documents: int | None,
+    tokenizer_loader=None,
 ) -> tuple[tuple[NuggetInput, ...], str, dict[int, object]]:
     """Rebuild request lineage without chunking, scoring, or passage projection."""
 
@@ -157,7 +274,11 @@ def _prepare_source_identity(
         if rerank_documents is not None:
             retrieval = _head(retrieval, rerank_documents)
         chunker = PassageChunker(
-            CrossEncoderPairLengthFunction(scorer_config, facet.query)
+            CrossEncoderPairLengthFunction(
+                scorer_config,
+                facet.query,
+                tokenizer_loader=tokenizer_loader,
+            )
         )
         reference = retrieval.retrieval_artifact
         inputs.append(
@@ -193,7 +314,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(f"topics file has no record for: {sorted(missing)}")
         if arguments.representation != "report_text":
             raise ValueError("retrieval handoff requires --representation report_text")
-        scorer_config, scorer = _cache_only_scorer(arguments)
         nugget_config = NuggetizerConfig(
             model=arguments.model, max_nuggets=arguments.max_nuggets
         )
@@ -206,19 +326,50 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_nuggets=arguments.max_nuggets,
         )
         store = ArtifactStore.from_env()
-        nugget_cache = NuggetArtifactCache(store)
         handoff_cache = RetrievalHandoffArtifactCache(store)
         topic_catalog_digest = hashlib.sha256(Path(arguments.topics).read_bytes()).digest()
-        candidates = _l1_nugget_candidates(store, nugget_fingerprint.digest)
+        handoff_fingerprint = HandoffFingerprint()
+        cached_handoffs = _discover_cached_handoffs(
+            store,
+            handoff_cache,
+            handoff_fingerprint,
+            topic_catalog_digest=topic_catalog_digest,
+            topic_ids=tuple(plan.topic_id for plan in plans),
+            nugget_fingerprint_digest=nugget_fingerprint.digest,
+        )
     except Exception as error:  # noqa: BLE001 - CLI reports bounded setup failures
         print(f"{type(error).__name__}: configuration is invalid", file=sys.stderr)
         return 2
 
     work: list[HandoffWork] = []
     failures: dict[str, HandoffOutcome] = {}
+    produced = {
+        topic_id: _cached_outcome(bundle, object_key)
+        for topic_id, (bundle, object_key) in cached_handoffs.items()
+    }
+    missing_plans = tuple(
+        plan for plan in plans if plan.topic_id not in cached_handoffs
+    )
+    if missing_plans:
+        try:
+            scorer_config, scorer = _cache_only_scorer(arguments)
+            nugget_cache = NuggetArtifactCache(store)
+            candidates = _nugget_candidates(store, nugget_fingerprint.digest)
+        except Exception as error:  # noqa: BLE001 - bounded cold-path setup
+            for plan in missing_plans:
+                failures[plan.topic_id] = HandoffOutcome(
+                    plan.topic_id, "failed", reason=type(error).__name__
+                )
+            missing_plans = ()
+
     with ExitStack() as stack:
-        retriever = stack.enter_context(RagtimeRetriever.from_env())
-        for plan in plans:
+        retriever = (
+            stack.enter_context(RagtimeRetriever.from_env())
+            if missing_plans
+            else None
+        )
+        tokenizer_loader = _shared_tokenizer_loader() if missing_plans else None
+        for plan in missing_plans:
             try:
                 inputs, passage_source_fingerprint, retrievals = _prepare_source_identity(
                     plan,
@@ -231,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     representation="report_text",
                     top_k=arguments.top_k,
                     rerank_documents=arguments.rerank_documents,
+                    tokenizer_loader=tokenizer_loader,
                 )
                 if not inputs:
                     raise ValueError("cached facet retrieval required")
@@ -275,15 +427,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     plan.topic_id, "failed", reason=type(error).__name__
                 )
 
-    produced = {
-        row.topic_id: row
-        for row in run_topics(
-            work,
-            fingerprint=HandoffFingerprint(),
-            cache=handoff_cache,
-            concurrency=arguments.concurrency,
-        )
-    }
+    produced.update(
+        {
+            row.topic_id: row
+            for row in run_topics(
+                work,
+                fingerprint=handoff_fingerprint,
+                cache=handoff_cache,
+                concurrency=arguments.concurrency,
+            )
+        }
+    )
     outcomes = tuple(
         failures.get(plan.topic_id) or produced[plan.topic_id] for plan in plans
     )
@@ -292,7 +446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.manifest,
             outcomes,
             topic_catalog_digest=topic_catalog_digest,
-            fingerprint=HandoffFingerprint(),
+            fingerprint=handoff_fingerprint,
         )
     print(json.dumps({status: sum(row.status == status for row in outcomes)
                       for status in ("written", "cached", "failed")}))

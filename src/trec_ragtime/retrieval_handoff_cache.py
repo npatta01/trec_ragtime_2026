@@ -81,7 +81,7 @@ class RetrievalHandoffArtifactCache:
     """Read and publish only validated, self-contained handoff bundles."""
 
     def __init__(self, store: ArtifactStoreLike) -> None:
-        for method in ("read_validated", "write", "evict_local"):
+        for method in ("read_validated_strict", "write", "evict_local"):
             if not callable(getattr(store, method, None)):
                 raise TypeError(f"store must implement {method}")
         self.store = store
@@ -92,8 +92,41 @@ class RetrievalHandoffArtifactCache:
     def get(
         self, fingerprint: HandoffFingerprint, request: HandoffRequest
     ) -> RetrievalHandoffBundle | None:
-        bundle = self.store.read_validated(
+        bundle = self.store.read_validated_strict(
             self.object_key(fingerprint, request), _decoder(fingerprint, request)
+        )
+        if bundle is not None and not isinstance(bundle, RetrievalHandoffBundle):
+            raise ArtifactValidationError("handoff decoder returned an invalid value")
+        return bundle
+
+    def get_by_object_key(
+        self,
+        fingerprint: HandoffFingerprint,
+        object_key: str,
+        *,
+        topic_catalog_digest: bytes,
+    ) -> RetrievalHandoffBundle | None:
+        """Read one listed handoff without rebuilding its upstream request.
+
+        The request digest is recoverable from the canonical object key, while
+        the rest of the request is recoverable from the envelope's bundle.  A
+        catalog digest supplied by the caller is therefore enough to validate
+        the complete request identity without loading topics, retrievals, or
+        nugget artifacts.
+        """
+
+        request_digest = _request_digest_from_object_key(fingerprint, object_key)
+        try:
+            catalog_digest = _digest(topic_catalog_digest, "topic catalog")
+        except (TypeError, ValueError):
+            raise ArtifactValidationError("topic catalog digest is invalid") from None
+        bundle = self.store.read_validated_strict(
+            object_key,
+            _object_key_decoder(
+                fingerprint,
+                request_digest,
+                topic_catalog_digest=catalog_digest,
+            ),
         )
         if bundle is not None and not isinstance(bundle, RetrievalHandoffBundle):
             raise ArtifactValidationError("handoff decoder returned an invalid value")
@@ -127,9 +160,7 @@ def _decoder(
 ) -> Callable[[bytes], RetrievalHandoffBundle]:
     def decode(payload: bytes) -> RetrievalHandoffBundle:
         try:
-            envelope = msgspec.msgpack.decode(payload, type=HandoffEnvelope)
-            if msgspec.msgpack.encode(envelope) != payload:
-                raise ValueError("noncanonical encoding")
+            envelope = _decode_envelope(payload)
             if (
                 envelope.fingerprint_digest != fingerprint.digest
                 or envelope.request_digest != request.digest
@@ -142,6 +173,77 @@ def _decoder(
         return envelope.bundle
 
     return decode
+
+
+def _object_key_decoder(
+    fingerprint: HandoffFingerprint,
+    request_digest: bytes,
+    *,
+    topic_catalog_digest: bytes,
+) -> Callable[[bytes], RetrievalHandoffBundle | None]:
+    def decode(payload: bytes) -> RetrievalHandoffBundle | None:
+        try:
+            envelope = _decode_envelope(payload)
+            if envelope.fingerprint_digest != fingerprint.digest:
+                raise ValueError("fingerprint identity mismatch")
+            if envelope.request_digest != request_digest:
+                raise ValueError("request identity does not match object key")
+            if envelope.bundle_digest != handoff_bundle_digest(envelope.bundle):
+                raise ValueError("bundle identity mismatch")
+            request = request_for_bundle(
+                envelope.bundle,
+                topic_catalog_digest=topic_catalog_digest,
+            )
+            if envelope.request_digest != request.digest:
+                # A valid object under this fingerprint can belong to another
+                # topic-catalog snapshot.  It is a confirmed identity miss,
+                # not malformed data, so callers may continue discovery.
+                return None
+            _validate(fingerprint, request, envelope.bundle)
+        except Exception:
+            raise ArtifactValidationError("cached handoff payload is invalid") from None
+        return envelope.bundle
+
+    return decode
+
+
+def _decode_envelope(payload: bytes) -> HandoffEnvelope:
+    try:
+        envelope = msgspec.msgpack.decode(payload, type=HandoffEnvelope)
+        if msgspec.msgpack.encode(envelope) != payload:
+            raise ValueError("noncanonical encoding")
+    except Exception:
+        raise ArtifactValidationError("cached handoff envelope is invalid") from None
+    return envelope
+
+
+def _request_digest_from_object_key(
+    fingerprint: HandoffFingerprint, object_key: str
+) -> bytes:
+    if not isinstance(fingerprint, HandoffFingerprint):
+        raise TypeError("fingerprint must be a HandoffFingerprint")
+    if not isinstance(object_key, str):
+        raise ArtifactValidationError("handoff object key is invalid")
+    parts = object_key.split("/")
+    root_parts = OBJECT_ROOT.split("/")
+    if len(parts) != len(root_parts) + 3 or tuple(parts[: len(root_parts)]) != tuple(root_parts):
+        raise ArtifactValidationError("handoff object key is invalid")
+    if parts[len(root_parts)] != fingerprint.digest.hex():
+        raise ArtifactValidationError("handoff object key is outside the fingerprint root")
+
+    shard = parts[-2]
+    request_name = parts[-1]
+    if not request_name.endswith(".mpk"):
+        raise ArtifactValidationError("handoff object key is invalid")
+    request_hex = request_name[: -len(".mpk")]
+    if (
+        len(request_hex) != hashlib.sha256().digest_size * 2
+        or request_hex.lower() != request_hex
+        or any(character not in "0123456789abcdef" for character in request_hex)
+        or shard != request_hex[:2]
+    ):
+        raise ArtifactValidationError("handoff object key is invalid")
+    return bytes.fromhex(request_hex)
 
 
 def _validate(

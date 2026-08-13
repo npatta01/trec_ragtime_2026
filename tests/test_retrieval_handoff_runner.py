@@ -10,6 +10,7 @@ from pathlib import Path
 import msgspec
 
 from trec_ragtime.retrieval_handoff_cache import HandoffFingerprint, RetrievalHandoffArtifactCache
+from trec_ragtime.retrieval_handoff import _expected_cluster_id, _expected_nugget_id
 from trec_ragtime.retrieval_handoff_runner import (
     HandoffWork,
     run_topic,
@@ -40,7 +41,19 @@ class RetrievalHandoffRunnerTests(unittest.TestCase):
 
     def test_parallel_results_preserve_input_order(self) -> None:
         second_topic = msgspec.structs.replace(self.bundle.topic, topic_id="2001")
-        second_bundle = msgspec.structs.replace(self.bundle, topic=second_topic)
+        second_nuggets = tuple(
+            msgspec.structs.replace(
+                nugget,
+                nugget_id=_expected_nugget_id(
+                    "2001", nugget.claim, tuple(link.alias for link in nugget.support)
+                ),
+                cluster_id=_expected_cluster_id("2001", nugget.variants),
+            )
+            for nugget in self.bundle.nuggets
+        )
+        second_bundle = msgspec.structs.replace(
+            self.bundle, topic=second_topic, nuggets=second_nuggets
+        )
         outcomes = run_topics(
             (HandoffWork("2001", self.digest, second_bundle), self.work),
             fingerprint=self.fingerprint,
