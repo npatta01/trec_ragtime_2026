@@ -754,8 +754,17 @@ uv run ragtime-report \
   --max-evidence 20 --evidence-chars 1200 --concurrency 4
 ```
 
-Check the produced file with the standalone validator, which works on any
-submission JSONL regardless of origin:
+Check the produced file with **both** validators. The official one is what NIST
+runs, and a run that fails it is rejected outright:
+
+```bash
+uv run --no-project --with git+https://github.com/hltcoe/rag-run-validator.git \
+  rag_run_validator <run>/submission.jsonl --topics topics/topics.all.2026.v0625-fix.jsonl
+```
+
+It exits non-zero and prints `[Error]` lines on failure. It checks the JSON
+schema and the required topic set, but it does **not** check that `references`
+equals the union of citation keys — the local validator below does, so run both:
 
 ```bash
 uv run ragtime-report-validate <run>/submission.jsonl \
