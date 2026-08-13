@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
@@ -34,7 +35,11 @@ from .report_sentences import (
 from .topic_candidates import load_topics
 
 SUBMISSION_FORMAT_VERSION = "ragtime-report-2026-v1"
-MAX_RUN_ID_LENGTH = 25
+# The ragtime26 AutoJudge spec caps run_id at 20 characters over
+# [A-Za-z0-9-_.] and rejects a leading period. Over-length is a hard failure
+# there, so accepting 25 here would have passed a run the organizers reject.
+MAX_RUN_ID_LENGTH = 20
+RUN_ID_PATTERN = re.compile(r"(?!\.)[A-Za-z0-9._-]+\Z")
 MAX_TEAM_ID_LENGTH = 64
 MAX_TOPIC_ID_LENGTH = 64
 MAX_RUN_DESC_LENGTH = 1000
@@ -108,9 +113,15 @@ def validate_team_id(team_id: Any) -> str:
 
 
 def validate_run_id(run_id: Any) -> str:
-    """Return a run identifier of at most 25 NFKC characters or raise."""
+    """Return a run identifier the ragtime26 spec accepts, or raise."""
 
-    return _validate_identifier(run_id, name="run_id", max_length=MAX_RUN_ID_LENGTH)
+    value = _validate_identifier(run_id, name="run_id", max_length=MAX_RUN_ID_LENGTH)
+    if not RUN_ID_PATTERN.fullmatch(value):
+        raise SubmissionValidationError(
+            "run_id must use only letters, digits, '-', '_', or '.' and must not"
+            " start with a period"
+        )
+    return value
 
 
 def validate_topic_id(topic_id: Any) -> str:

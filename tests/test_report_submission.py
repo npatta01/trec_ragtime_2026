@@ -73,7 +73,7 @@ def write_submission(directory: Path, records: list[dict[str, object]]) -> Path:
 class MetadataFieldTests(unittest.TestCase):
     def test_format_version_is_declared(self) -> None:
         self.assertTrue(SUBMISSION_FORMAT_VERSION.strip())
-        self.assertEqual(MAX_RUN_ID_LENGTH, 25)
+        self.assertEqual(MAX_RUN_ID_LENGTH, 20)
 
     def test_run_id_at_the_limit_is_accepted(self) -> None:
         run_id = "a" * MAX_RUN_ID_LENGTH
@@ -84,9 +84,9 @@ class MetadataFieldTests(unittest.TestCase):
             validate_run_id("a" * (MAX_RUN_ID_LENGTH + 1))
 
     def test_run_id_length_is_measured_after_nfkc(self) -> None:
-        # Each ligature expands to two characters, pushing 13 codepoints to 26.
+        # Each ligature expands to two characters, pushing 11 codepoints to 22.
         with self.assertRaises(SubmissionValidationError):
-            validate_run_id("ﬁ" * 13)
+            validate_run_id("ﬁ" * 11)
 
     def test_blank_and_whitespace_bearing_identifiers_are_rejected(self) -> None:
         for value in ("", "   ", "run id", "run\tid", "run\nid"):
@@ -182,7 +182,7 @@ class RecordValidationTests(unittest.TestCase):
 
     def test_over_length_run_id_is_reported(self) -> None:
         record = good_record()
-        record["metadata"]["run_id"] = "a" * 26  # type: ignore[index]
+        record["metadata"]["run_id"] = "a" * 21  # type: ignore[index]
         self.assertIn("run_id", self.validate(record))
 
     def test_empty_responses_are_rejected(self) -> None:
@@ -415,3 +415,27 @@ class ValidateCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RagtimeSpecRunIdTests(unittest.TestCase):
+    """run_id rules follow the ragtime26 AutoJudge spec, not a looser guess."""
+
+    def test_limit_is_twenty_characters(self) -> None:
+        self.assertEqual(MAX_RUN_ID_LENGTH, 20)
+        self.assertEqual(validate_run_id("a" * 20), "a" * 20)
+        with self.assertRaises(SubmissionValidationError):
+            validate_run_id("a" * 21)
+
+    def test_allowed_characters(self) -> None:
+        for value in ("np-handoff-1", "run_1.a", "ABC-123"):
+            with self.subTest(value=value):
+                self.assertEqual(validate_run_id(value), value)
+
+    def test_rejected_characters(self) -> None:
+        for value in (".leading", "has/slash", "has:colon", "has+plus"):
+            with self.subTest(value=value):
+                with self.assertRaises(SubmissionValidationError):
+                    validate_run_id(value)
+
+    def test_the_run_id_actually_used_is_within_spec(self) -> None:
+        self.assertEqual(validate_run_id("np-handoff-1"), "np-handoff-1")
