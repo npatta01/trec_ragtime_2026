@@ -8,6 +8,11 @@ __pycache__/
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
 .flash/
+# Keep .claude tracked for shared agent skills, minus machine-local state and
+# the checked-out worktrees that live under it.
+.claude/worktrees/
+.claude/.cc-writes/
+.claude/settings.local.json
 scoring-plan.json
 remaining_plan.json
 done_topics.txt
