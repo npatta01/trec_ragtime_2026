@@ -25,46 +25,68 @@ np-nugget-sol-v1
 
 ### Description
 
-Paste this into the form's description box. It is longer and multi-paragraph;
-the `run_desc` stored inside the JSONL is a compact single-line version of the
-same content, because that field forbids newlines and caps at 1000 characters.
+Paste this into the form's description box.
+
+The `run_desc` stored inside the JSONL is a deliberately concise 417-character
+summary of the same system — that field forbids newlines and caps at 1000
+characters, while this box is a free-text area. Exact version pins for every
+component are in §4.
 
 ```
 Faceted multilingual RAG with nugget-grounded, citation-strict generation.
 
-Retrieval: each topic request is decomposed into roughly seven facet queries and
-issued to the organizers' participant endpoint (ragtime2 pipeline:
-Qwen/Qwen3-Embedding-8B dense retrieval over a FAISS index served by RoutIR,
-fusing the Chinese, Spanish, Russian and English branches). Per-facet results are
-fused by reciprocal rank, then hydrated to English report_text from a
-revision-pinned local copy of the collection (revision c99bf3e2).
+RETRIEVAL. Each topic request is decomposed into roughly seven facet queries
+covering the distinct aspects the requester asked about. Each is issued to the
+organizers' participant endpoint via the ragtime2 pipeline alias, which performs
+dense retrieval with Qwen/Qwen3-Embedding-8B over a FAISS index served by RoutIR
+and fuses the Chinese, Spanish, Russian and English branches. Per-facet result
+lists are combined by reciprocal rank fusion (k=60, depth 100). Documents are
+hydrated to English report_text from a local copy of the collection pinned to
+revision c99bf3e2e8c18c5172498875d7522285f658e2c9 (4,000,380 documents and
+3,000,285 machine translations); the original-language text is preserved as the
+canonical record and only the English rendition is used for synthesis.
 
-Reranking: mixedbread-ai/mxbai-rerank-base-v2 (revision 3ea9d4df) scores
-candidate passages on GPU. Passages are kept at document scale, because splitting
-them stranded a claim's subject in a neighbouring passage.
+RERANKING. Candidate passages are scored on GPU with
+mixedbread-ai/mxbai-rerank-base-v2 pinned to revision
+3ea9d4dffa7d12a4f366be8e275c349de9fc9865. Passages are kept at document scale
+rather than chunked, because splitting them stranded a claim's subject in a
+neighbouring passage and cost grounding accuracy.
 
-Compression: nuggetizer 0.0.5 extracts atomic English claims and, per passage,
-judges support / partial_support / not_support. Paraphrases are merged on pinned
-MiniLM cosine similarity guarded by a numeric and negation signature. Only
-full-support links are treated as citation-ready. A self-contained handoff bundle
-per topic then carries only the evidence a retained nugget cites, with exact
-passage text, character offsets and content hashes verified before generation
-sees it. 1,814 deduplicated nuggets over 2,020 evidence passages.
+COMPRESSION TO NUGGETS. nuggetizer 0.0.5 extracts atomic English claims from the
+reranked evidence, then judges each claim against each passage individually as
+support, partial_support or not_support. That support matrix is the lineage.
+Paraphrases are merged using sentence-transformers/all-MiniLM-L6-v2 at cosine
+>= 0.92, guarded by a numeric and negation signature so that "fell 30%" can
+never collapse into "fell 13%". This run retained 1,814 deduplicated nuggets
+over 2,020 evidence passages across 103 topics.
 
-Generation: one openai/gpt-5.6-sol call per topic, temperature 0, seed 7, under a
-strict JSON schema whose evidence enum admits only citation-ready passage
-handles; canonical document IDs are never shown to the model, so an
-out-of-allowlist citation is unrepresentable rather than merely detected. The
-character budget is planned across the topic's nugget claims in proportion to how
-much citable evidence backs each. A bounded repair pass re-asks when candidates
-are rejected. Sentences that are not exactly one sentence, or whose cited source
-does not support the whole sentence, are dropped rather than repaired into place;
-partial-support evidence is available as context and is never promoted to a
-citation. Reports are packed to the topic character limit by whole sentences
-only, never truncated mid-sentence.
+SEALED HANDOFF. A self-contained bundle per topic carries only the evidence a
+retained nugget actually cites, with the exact passage text, character offsets
+and SHA-256 content hashes verified before generation is allowed to read it.
+Only links judged full support are marked citation-ready; partial_support is
+retained and labelled but is never promoted to a citation.
 
-Topic 2023 carries a single uncited abstention sentence: its evidence contains no
-citation-ready passage and no honest citation was available.
+GENERATION. One openai/gpt-5.6-sol call per topic at temperature 0 with seed 7,
+constrained by a strict JSON schema whose evidence enum contains only the
+citation-ready passage handles for that topic. Canonical document identifiers
+are never shown to the model, so a citation outside the allowlist is
+unrepresentable rather than merely detected afterwards. The topic's character
+budget is planned across its nugget claims in proportion to how much citable
+evidence backs each claim, computed deterministically from the sealed bundle
+rather than by a separate planning call. A bounded repair pass re-asks when
+candidates are rejected. A candidate that is not exactly one sentence, or whose
+cited source does not support the entire sentence, is dropped rather than
+repaired into place, and conflicting accounts are kept as separate attributed
+sentences rather than blended. Citations are ranked so the strongest fully
+supporting source is scored highest, since assessors check the first citation.
+Reports are packed to the topic's character limit by whole sentences only and
+are never truncated mid-sentence.
+
+ABSTENTION. Topic 2023 carries a single uncited sentence stating that no
+citation-ready evidence was available. Its evidence contains no fully supporting
+passage, and the collection contains no document on the topic's subject, so no
+honest citation exists. Fabricating one or promoting partial support was
+rejected in favour of an explicit abstention.
 ```
 
 ### Priority
@@ -97,7 +119,7 @@ Fill this line in and commit:
 | --- | --- |
 | In repo | [`NP.np-nugget-sol-v1.ragtime26.jsonl`](NP.np-nugget-sol-v1.ragtime26.jsonl) — beside this ledger |
 | Size | 804,810 bytes (786 KB) |
-| SHA-256 | `cbd3c25042c7093fc0c6f42150605371a62eabd094250a2a5182094fea24bf55` |
+| SHA-256 | `ffe055b4e5f506fbf127489dfa94bac76558b4bf10f7762c18b378425fa87242` |
 | Lines | 103 — one JSON object per topic |
 | Encoding | UTF-8 JSONL, plain text (gzip/bzip2/xz also accepted; unnecessary at this size) |
 
@@ -166,6 +188,49 @@ The generator fingerprint covers model, prompt version, output schema, sampling 
 | Nuggetization | `nuggetizer==0.0.5` — atomic claims plus a per-passage support matrix |
 | Paraphrase merging | `sentence-transformers/all-MiniLM-L6-v2`, cosine ≥ 0.92 with numeric/negation guard |
 | Generation | `openai/gpt-5.6-sol` via OpenRouter, one call per topic |
+
+### Exact versions
+
+Everything that can change a result, pinned. Read from `pyproject.toml`,
+`uv.lock`, and the module constants at the commit that produced this run.
+
+| Component | Exact version |
+| --- | --- |
+| Python | `3.12.13` |
+| Retrieval endpoint | organizers' `ragtime2` pipeline alias (deployed embedding dimension, query instruction and FAISS index parameters are not published) |
+| Retrieval model | `Qwen/Qwen3-Embedding-8B` (endpoint-side, no revision published) |
+| Corpus | `trec-ragtime/ragtime2` revision `c99bf3e2e8c18c5172498875d7522285f658e2c9` |
+| Reranker | `mixedbread-ai/mxbai-rerank-base-v2` revision `3ea9d4dffa7d12a4f366be8e275c349de9fc9865` |
+| Nuggetizer | `nuggetizer==0.0.5` |
+| Paraphrase embedder | `sentence-transformers/all-MiniLM-L6-v2` |
+| Generation model | `openai/gpt-5.6-sol` (OpenRouter) |
+| `sentence-transformers` | `5.7.0` |
+| `torch` | `2.9.1` |
+| `transformers` | `5.14.1` |
+| `tokenizers` | `0.22.2` |
+| `openai` | `2.53.0` |
+| `msgspec` | `0.21.1` |
+| `spacy` | `3.8.15` |
+| `duckdb` | `1.5.4` |
+
+### Behavior versions
+
+Each names a pinned algorithm and participates in an artifact fingerprint, so
+changing one retires the artifacts it produced.
+
+| Constant | Value |
+| --- | --- |
+| Nuggets | `nuggets-v1` |
+| Paraphrase guard | `numeric-negation-guard-v1` |
+| Retrieval handoff | `retrieval-handoff-v1` |
+| Evidence bundle builder | `evidence-bundle-v1` |
+| Prompt | `report-prompt-v1` |
+| Output schema | `report-sentences-v1` |
+| Sentence segmenter | `sentence-segmenter-v1` |
+| Citation ranking policy | `citation-rank-v2` |
+| Facet budget policy | `facet-budget-v2` |
+| Length packing | `whole-sentence-pack-v1` |
+| Generator behavior | `report-generator-v1` |
 
 ### Upstream inputs
 
