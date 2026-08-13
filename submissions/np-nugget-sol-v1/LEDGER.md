@@ -25,68 +25,36 @@ np-nugget-sol-v1
 
 ### Description
 
-Paste this into the form's description box.
-
-The `run_desc` stored inside the JSONL is a deliberately concise 417-character
-summary of the same system — that field forbids newlines and caps at 1000
-characters, while this box is a free-text area. Exact version pins for every
-component are in §4.
+Paste this into the form's description box. Kept short and organizer-facing;
+exact model revisions and dependency pins are internal and live in §4.
 
 ```
-Faceted multilingual RAG with nugget-grounded, citation-strict generation.
+Facet-decomposed multilingual retrieval, nugget compression, and
+citation-strict generation.
 
-RETRIEVAL. Each topic request is decomposed into roughly seven facet queries
-covering the distinct aspects the requester asked about. Each is issued to the
-organizers' participant endpoint via the ragtime2 pipeline alias, which performs
-dense retrieval with Qwen/Qwen3-Embedding-8B over a FAISS index served by RoutIR
-and fuses the Chinese, Spanish, Russian and English branches. Per-facet result
-lists are combined by reciprocal rank fusion (k=60, depth 100). Documents are
-hydrated to English report_text from a local copy of the collection pinned to
-revision c99bf3e2e8c18c5172498875d7522285f658e2c9 (4,000,380 documents and
-3,000,285 machine translations); the original-language text is preserved as the
-canonical record and only the English rendition is used for synthesis.
+We split each request into roughly seven facet queries and send them to the
+organizers' ragtime2 endpoint, fusing the per-facet rankings with RRF. Pooled
+documents are hydrated to their English text and reranked with
+mxbai-rerank-base-v2. We keep passages at document scale; chunking them cost
+grounding accuracy because a claim's subject often ended up in a neighbouring
+chunk.
 
-RERANKING. Candidate passages are scored on GPU with
-mixedbread-ai/mxbai-rerank-base-v2 pinned to revision
-3ea9d4dffa7d12a4f366be8e275c349de9fc9865. Passages are kept at document scale
-rather than chunked, because splitting them stranded a claim's subject in a
-neighbouring passage and cost grounding accuracy.
+Nuggetizer extracts atomic claims from the reranked evidence and labels each
+passage as full, partial, or no support for each claim. Only full support is
+treated as citable. Generation then receives a sealed bundle holding just the
+passages a retained claim cites; document IDs are replaced by opaque handles,
+so the model cannot emit an identifier it was not given.
 
-COMPRESSION TO NUGGETS. nuggetizer 0.0.5 extracts atomic English claims from the
-reranked evidence, then judges each claim against each passage individually as
-support, partial_support or not_support. That support matrix is the lineage.
-Paraphrases are merged using sentence-transformers/all-MiniLM-L6-v2 at cosine
->= 0.92, guarded by a numeric and negation signature so that "fell 30%" can
-never collapse into "fell 13%". This run retained 1,814 deduplicated nuggets
-over 2,020 evidence passages across 103 topics.
+Reports are written in one gpt-5.6-sol call per topic at temperature 0 under a
+JSON schema restricted to that topic's citable handles. Character budget is
+distributed across the claims in proportion to the evidence backing each. A
+sentence whose cited source does not support the whole sentence is dropped
+rather than rewritten, and conflicting accounts are kept as separate attributed
+sentences. Reports are trimmed to the character limit on sentence boundaries.
 
-SEALED HANDOFF. A self-contained bundle per topic carries only the evidence a
-retained nugget actually cites, with the exact passage text, character offsets
-and SHA-256 content hashes verified before generation is allowed to read it.
-Only links judged full support are marked citation-ready; partial_support is
-retained and labelled but is never promoted to a citation.
-
-GENERATION. One openai/gpt-5.6-sol call per topic at temperature 0 with seed 7,
-constrained by a strict JSON schema whose evidence enum contains only the
-citation-ready passage handles for that topic. Canonical document identifiers
-are never shown to the model, so a citation outside the allowlist is
-unrepresentable rather than merely detected afterwards. The topic's character
-budget is planned across its nugget claims in proportion to how much citable
-evidence backs each claim, computed deterministically from the sealed bundle
-rather than by a separate planning call. A bounded repair pass re-asks when
-candidates are rejected. A candidate that is not exactly one sentence, or whose
-cited source does not support the entire sentence, is dropped rather than
-repaired into place, and conflicting accounts are kept as separate attributed
-sentences rather than blended. Citations are ranked so the strongest fully
-supporting source is scored highest, since assessors check the first citation.
-Reports are packed to the topic's character limit by whole sentences only and
-are never truncated mid-sentence.
-
-ABSTENTION. Topic 2023 carries a single uncited sentence stating that no
-citation-ready evidence was available. Its evidence contains no fully supporting
-passage, and the collection contains no document on the topic's subject, so no
-honest citation exists. Fabricating one or promoting partial support was
-rejected in favour of an explicit abstention.
+Topic 2023 contains a single uncited sentence saying no citation-ready evidence
+was available. Nothing in its evidence fully supports any claim, and we would
+rather abstain than manufacture a citation.
 ```
 
 ### Priority
