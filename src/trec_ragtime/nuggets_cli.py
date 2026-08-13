@@ -182,6 +182,7 @@ def prepare_topic(
         ),
         inputs=tuple(inputs),
         passage_source_fingerprint="|".join((representation, *sources)),
+        retrievals=tuple(results),
     )
 
 

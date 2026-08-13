@@ -140,6 +140,18 @@ def build(config: NuggetizerConfig) -> Nuggetizer:
     return nuggetizer
 
 
+def backend_fingerprint(config: NuggetizerConfig) -> Mapping[str, object]:
+    """Identify a backend configuration without constructing its provider client."""
+
+    if not isinstance(config, NuggetizerConfig):
+        raise TypeError("config must be a NuggetizerConfig")
+    return {
+        "package": dict(package_identity()),
+        "config": msgspec.structs.asdict(config),
+        "max_completion_tokens": MAX_COMPLETION_TOKENS,
+    }
+
+
 class NuggetizerBackend:
     """The nuggetization operations the stage is allowed to use."""
 
@@ -151,11 +163,7 @@ class NuggetizerBackend:
     def fingerprint(self) -> Mapping[str, object]:
         """Identify everything about this backend that can change a result."""
 
-        return {
-            "package": dict(package_identity()),
-            "config": msgspec.structs.asdict(self.config),
-            "max_completion_tokens": MAX_COMPLETION_TOKENS,
-        }
+        return backend_fingerprint(self.config)
 
     def create(
         self, *, topic_id: str, query: str, passages: Sequence[tuple[str, str]]
@@ -214,6 +222,7 @@ __all__ = [
     "NuggetizerBackend",
     "NuggetizerConfig",
     "NuggetizerError",
+    "backend_fingerprint",
     "build",
     "package_identity",
 ]

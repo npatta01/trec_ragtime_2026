@@ -210,6 +210,37 @@ def _runtime_version(distribution: str) -> str:
     return version
 
 
+def _passage_chunker_runtime_components(overlap_tokens: int) -> tuple[str, ...]:
+    if (
+        isinstance(overlap_tokens, bool)
+        or not isinstance(overlap_tokens, int)
+        or overlap_tokens < 0
+    ):
+        raise PassageChunkingError("overlap_tokens must be a nonnegative integer")
+    versions = (
+        f"langchain-text-splitters={_runtime_version('langchain-text-splitters')}",
+        f"spacy={_runtime_version('spacy')}",
+    )
+    pipeline_versions = tuple(
+        f"{pipeline}={_runtime_version(pipeline.replace('_', '-'))}"
+        for pipeline in _PIPELINES_BY_LANGUAGE.values()
+    )
+    return (
+        "passage-chunker-v2",
+        f"overlap-tokens={overlap_tokens}",
+        f"runtime={';'.join(versions)}",
+        f"pipelines={_PINNED_PIPELINE_MAPPING}",
+        f"pipeline-versions={';'.join(pipeline_versions)}",
+    )
+
+
+def passage_chunker_runtime_fingerprint(*, overlap_tokens: int = 256) -> str:
+    """Identify chunker policy/runtime without constructing a tokenizer."""
+
+    material = "|".join(_passage_chunker_runtime_components(overlap_tokens))
+    return "passage-chunker-runtime-v1/" + sha256_bytes(material).hex()
+
+
 def _positive_integer(value: object, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise PassageChunkingError(f"{field_name} must be a positive integer")
@@ -266,24 +297,14 @@ class PassageChunker:
                 "overlap_tokens must be smaller than max_passage_length"
             )
 
-        versions = (
-            f"langchain-text-splitters={_runtime_version('langchain-text-splitters')}",
-            f"spacy={_runtime_version('spacy')}",
-        )
-        pipeline_versions = tuple(
-            f"{pipeline}={_runtime_version(pipeline.replace('_', '-'))}"
-            for pipeline in _PIPELINES_BY_LANGUAGE.values()
-        )
+        runtime_components = _passage_chunker_runtime_components(overlap_tokens)
         fingerprint_material = "|".join(
             (
-                "passage-chunker-v2",
+                runtime_components[0],
                 f"pair-length={pair_fingerprint}",
                 f"max-length={max_length}",
                 f"max-passage-length={max_passage_length}",
-                f"overlap-tokens={overlap_tokens}",
-                f"runtime={';'.join(versions)}",
-                f"pipelines={_PINNED_PIPELINE_MAPPING}",
-                f"pipeline-versions={';'.join(pipeline_versions)}",
+                *runtime_components[1:],
             )
         )
         self._pair_length = pair_length
@@ -719,6 +740,7 @@ __all__ = [
     "PassageChunker",
     "PassageChunkingError",
     "Representation",
+    "passage_chunker_runtime_fingerprint",
     "sha256_bytes",
     "validate_passages",
 ]

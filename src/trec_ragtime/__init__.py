@@ -137,6 +137,12 @@ from .retriever import (
     DocumentCorpus,
     RagtimeRetriever,
 )
+from .retrieval_handoff import RetrievalHandoffBundle
+from .retrieval_handoff_cache import (
+    HandoffFingerprint,
+    HandoffRequest,
+    RetrievalHandoffArtifactCache,
+)
 
 __all__ = [
     "Boundary",
@@ -229,10 +235,14 @@ __all__ = [
     "RerankingError",
     "RerankingResult",
     "RetrievalResult",
+    "RetrievalHandoffArtifactCache",
+    "RetrievalHandoffBundle",
     "RetrievedDocument",
     "RunpodFlashConfig",
     "RunpodFlashPassageScorer",
     "SearchHit",
+    "HandoffFingerprint",
+    "HandoffRequest",
     "WIRE_SCHEMA_VERSION",
     "build_flash_worker",
     "build_from_parquet",

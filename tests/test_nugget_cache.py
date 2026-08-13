@@ -56,6 +56,12 @@ class MemoryArtifactStore:
             self.evict_local(object_key)
             return None
 
+    def read_validated_strict(
+        self, object_key: str, decoder: Callable[[bytes], Any]
+    ) -> Any:
+        payload = self.read(object_key)
+        return None if payload is None else decoder(payload)
+
     def write(self, object_key: str, payload: bytes) -> bool:
         self.writes.append(object_key)
         if self.write_result:

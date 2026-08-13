@@ -734,6 +734,62 @@ evidence and the recorded inputs, so a facet with no cached retrieval is skipped
 without renumbering the ones around it. `trec_ragtime.nuggets_runner` remains
 the supported Python API for callers that want the stage without the command.
 
+### Retrieval bundle for report generation
+
+After the nugget cache is complete, materialize the retrieval pipeline's final
+consumer artifact with the same model and scorer identity used above:
+
+```bash
+uv run ragtime-retrieval-handoff \
+  --model <model-id> \
+  --device cuda \
+  --retriever-fingerprint-sha256 \
+    487a18b1c3ebfdb4c967e6fea15c6a522d91f5bb002841d1ea03cb766c4ee1e7 \
+  --topic-plan-sha256 \
+    2066=e71f54e5ca59eadaa59073536f3c12f551d763c19993ba7c858624af861e3b01 \
+  --manifest /absolute/path/to/retrieval-handoff-manifest.json
+```
+
+The retriever fingerprint pins the canonical endpoint/corpus identity, and the
+topic-specific digest selects the refreshed retrieval for topic 2066. Keep both
+when consuming the current 103-topic nugget run.
+
+This command is cache-only. It reconstructs the exact retrieval, passage-score,
+and nugget identities only for a missing handoff. A warm run discovers and
+strictly validates the self-contained handoff objects directly, without opening
+the retriever, scorer, retrieval artifacts, or nugget artifacts. It never starts
+retrieval, hydration, GPU scoring, or provider work. Each successful topic
+produces one self-contained MessagePack bundle under
+`retrieval-handoff/v1/`. The bundle includes the official topic record, retained
+deduplicated nuggets, and only the exact English passage slices linked by those
+nuggets. Full `support` links are citation-ready. `partial_support` is retained
+as labeled context but is not citation-ready.
+
+The manifest contains each complete bundle's object key. Report generation can
+therefore consume it directly, without reconstructing the upstream request:
+
+```python
+import json
+from pathlib import Path
+
+manifest = json.loads(Path(manifest_path).read_text())
+topic = next(row for row in manifest["topics"] if row["topic_id"] == topic_id)
+bundle = handoff_cache.get_by_object_key(
+    fingerprint,
+    topic["object_key"],
+    topic_catalog_digest=bytes.fromhex(manifest["topic_catalog_digest"]),
+    producer_identity_digest=bytes.fromhex(topic["producer_identity_digest"]),
+)
+if bundle is None:
+    raise RuntimeError("retrieval handoff is incomplete")
+for nugget in bundle.nuggets:
+    citations = tuple(link.alias for link in nugget.support if link.citation_ready)
+```
+
+Generation does not reopen raw retrieval or nugget artifacts and does not need
+to deduplicate evidence. The owner-only manifest records per-topic object keys
+and counts without topic or passage text.
+
 ## Repository Map
 
 - [`AGENTS.md`](AGENTS.md): contributor and agent instructions, including the
