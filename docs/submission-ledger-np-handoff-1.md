@@ -5,6 +5,31 @@ Recorded 2026-08-13. Everything below was read off the artifacts, not from memor
 
 ---
 
+## 0. Values entered in EvalBase
+
+Copy-paste exactly. Form: *Submission to RAG TREC Instrument for Multilingual
+Evaluation, Report generation*.
+
+| Field | Value entered |
+| --- | --- |
+| User name | `npatta01` *(prefilled)* |
+| Email | `npatta01@gmail.com` *(prefilled)* |
+| Organization | `(NP Labs) NP` *(prefilled)* |
+| Submission file | `NP.np-handoff-1.ragtime26.jsonl` |
+| **Runtag** | `np-handoff-1` |
+| **Description** | the block in §4 below |
+| **Priority** | `1` |
+
+The uploaded file is committed to this repository at
+[`submissions/NP.np-handoff-1.ragtime26.jsonl`](../submissions/NP.np-handoff-1.ragtime26.jsonl),
+with its checksum beside it. It is byte-identical to the validated run output —
+same SHA-256 in all three places (run directory, upload staging directory, and
+this repository).
+
+**Submitted:** _record the date/time here once the upload is confirmed._
+
+---
+
 ## 1. What to put in the EvalBase form
 
 The form is *Submission to RAG TREC Instrument for Multilingual Evaluation, Report generation*.
@@ -24,6 +49,14 @@ Three fields are prefilled from the account; three need values.
 
 ## 2. The file to upload
 
+In this repository (tracked, reviewable in the PR):
+
+```
+submissions/NP.np-handoff-1.ragtime26.jsonl
+```
+
+Staging copy outside the repo, identical bytes:
+
 ```
 /home/npatta01/data/competitions/trec_ragtime_2026/.git/ragtime-cache/experiments/reports/submit/NP.np-handoff-1.ragtime26.jsonl
 ```
@@ -38,8 +71,7 @@ Three fields are prefilled from the account; three need values.
 A `.sha256` file sits beside it. To confirm the upload is the file you expect:
 
 ```bash
-cd /home/npatta01/data/competitions/trec_ragtime_2026/.git/ragtime-cache/experiments/reports/submit
-sha256sum -c NP.np-handoff-1.ragtime26.jsonl.sha256
+cd submissions && sha256sum -c NP.np-handoff-1.ragtime26.jsonl.sha256
 ```
 
 This is a byte-identical copy of the run's own `submission.jsonl`, renamed for a
