@@ -86,13 +86,25 @@ class WeightingTests(unittest.TestCase):
         budgets = {b.facet_id: b.characters for b in allocate(item)}
         self.assertGreater(budgets["F1"], budgets["F2"])
 
-    def test_vital_outweighs_okay_at_equal_evidence(self) -> None:
+    def test_self_declared_importance_does_not_move_the_budget(self) -> None:
+        # Measured over all 103 topics, "vital" does not predict evidence depth
+        # (median 2 full-support links either way) and survives as a citable
+        # facet LESS often than "okay" (85.8% vs 96.0%). It is also our label,
+        # not the assessors'. Only citable evidence earns budget.
         item = bundle(
             [facet(1, "vital"), facet(2, "okay")],
             [passage(1, ("F1",)), passage(2, ("F2",))],
         )
         budgets = {b.facet_id: b.characters for b in allocate(item)}
-        self.assertGreater(budgets["F1"], budgets["F2"])
+        self.assertEqual(budgets["F1"], budgets["F2"])
+
+    def test_evidence_still_outranks_importance(self) -> None:
+        item = bundle(
+            [facet(1, "vital"), facet(2, "okay")],
+            [passage(1, ("F1",)), passage(2, ("F2",)), passage(3, ("F2",))],
+        )
+        budgets = {b.facet_id: b.characters for b in allocate(item)}
+        self.assertGreater(budgets["F2"], budgets["F1"])
 
     def test_context_only_evidence_earns_no_budget_weight(self) -> None:
         # e003 is partial-support for F2, so it must not lift F2's allocation.

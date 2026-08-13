@@ -58,7 +58,7 @@ PROMPT_VERSION = "report-prompt-v1"
 OUTPUT_SCHEMA_VERSION = "report-sentences-v1"
 CITATION_POLICY_VERSION = "citation-rank-v2"
 GENERATOR_BEHAVIOR_VERSION = "report-generator-v1"
-BUDGET_POLICY_VERSION = "facet-budget-v1"
+BUDGET_POLICY_VERSION = "facet-budget-v2"
 
 RESPONSE_FORMAT_MODES = frozenset({"json_schema", "json_object"})
 

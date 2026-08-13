@@ -121,23 +121,26 @@ class SentenceCandidate:
     substantive: bool
 
 
-# A vital nugget is worth more report space than an okay one. Two is a
-# deliberate, mild preference: it shifts allocation without letting a single
-# vital facet with thin evidence crowd out several well-attested okay ones.
-_IMPORTANCE_WEIGHT = {"vital": 2, "okay": 1}
-
-
 def facet_weights(bundle: EvidenceBundle) -> tuple[int, ...]:
-    """Weight each facet by how much citable evidence backs it, times importance.
+    """Weight each facet by how much citable evidence actually backs it.
 
     This is the one decision a separate planning call would have made — spend
-    the character budget where the evidence actually is — computed as a pure
-    function of the sealed bundle. No provider call, no hidden input, and the
-    same bundle always yields the same allocation.
+    the character budget where the evidence is — computed as a pure function of
+    the sealed bundle. No provider call, no hidden input, and the same bundle
+    always yields the same allocation.
 
     Only citation-ready passages count. Context-only evidence cannot be cited,
-    so budget spent on the facet it partially attests would produce sentences
-    that must then be dropped.
+    so budget spent on the facet it partially attests would buy sentences that
+    must then be dropped.
+
+    ``importance`` is deliberately NOT a factor. It is the nuggetizer's own
+    self-declared label, and measured across all 103 topics it neither predicts
+    evidence depth (2.68 vs 2.36 full-support links, median 2 for both) nor
+    correlates with citability in the useful direction — 85.8% of vital nuggets
+    survive as citable facets against 96.0% of okay ones, because vital claims
+    skew broad and aggregate. Weighting by it would spend more budget on the
+    claims hardest to cite. It is also our label, not the assessors': scoring
+    runs against their nugget list, which nothing here is calibrated to.
     """
 
     counts: dict[str, int] = {facet.facet_id: 0 for facet in bundle.facets}
@@ -147,10 +150,7 @@ def facet_weights(bundle: EvidenceBundle) -> tuple[int, ...]:
         for facet_id in passage.facet_ids:
             if facet_id in counts:
                 counts[facet_id] += 1
-    return tuple(
-        max(counts[facet.facet_id], 1) * _IMPORTANCE_WEIGHT.get(facet.importance, 1)
-        for facet in bundle.facets
-    )
+    return tuple(max(counts[facet.facet_id], 1) for facet in bundle.facets)
 
 
 def allocate_facet_budget(
