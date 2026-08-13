@@ -61,6 +61,19 @@ class MemoryArtifactStore:
             self.objects.pop(object_key, None)
             return None
 
+    def read_validated_strict(
+        self, object_key: str, decoder: Callable[[bytes], Any]
+    ) -> Any | None:
+        """Decode durable bytes, raising rather than masking an invalid artifact."""
+
+        self.read_validated_calls.append(object_key)
+        if self.read_error is not None:
+            raise self.read_error
+        payload = self.objects.get(object_key)
+        if payload is None:
+            return None
+        return decoder(payload)
+
     def write(self, object_key: str, payload: bytes) -> bool:
         if self.write_error is not None:
             raise self.write_error

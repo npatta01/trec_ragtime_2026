@@ -23,15 +23,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import msgspec
-
-from .artifact_store import ArtifactStoreLike, ArtifactValidationError
-from .retrieval_handoff import (
-    RetrievalHandoffBundle,
-    check_retrieval_handoff,
-    handoff_bundle_digest,
+from .retrieval_handoff import RetrievalHandoffBundle
+from .retrieval_handoff_cache import (
+    HandoffFingerprint,
+    RetrievalHandoffArtifactCache,
 )
-from .retrieval_handoff_cache import HandoffEnvelope, handoff_object_key
 
 HANDOFF_MANIFEST_SCHEMA_VERSION = 1
 
@@ -47,6 +43,7 @@ class HandoffTopicEntry:
     topic_id: str
     status: str
     object_key: str | None
+    producer_identity_digest: bytes | None = None
 
     @property
     def available(self) -> bool:
@@ -111,7 +108,21 @@ def load_handoff_manifest(path: Path | str) -> HandoffManifest:
             raise HandoffSourceError(f"topic {topic_id} has no status")
         if object_key is not None and not isinstance(object_key, str):
             raise HandoffSourceError(f"topic {topic_id} has an invalid object_key")
-        topics.append(HandoffTopicEntry(topic_id, status, object_key or None))
+        producer = row.get("producer_identity_digest")
+        if producer is not None:
+            if not isinstance(producer, str):
+                raise HandoffSourceError(
+                    f"topic {topic_id} has an invalid producer_identity_digest"
+                )
+            try:
+                producer = bytes.fromhex(producer)
+            except ValueError:
+                raise HandoffSourceError(
+                    f"topic {topic_id} producer_identity_digest is not hex"
+                ) from None
+        topics.append(
+            HandoffTopicEntry(topic_id, status, object_key or None, producer)
+        )
 
     fingerprint = payload.get("fingerprint")
     catalog = payload.get("topic_catalog_digest")
@@ -128,61 +139,46 @@ def load_handoff_manifest(path: Path | str) -> HandoffManifest:
     )
 
 
-def _decoder(object_key: str):
-    def decode(payload: bytes) -> RetrievalHandoffBundle:
-        try:
-            envelope = msgspec.msgpack.decode(payload, type=HandoffEnvelope)
-            if msgspec.msgpack.encode(envelope) != payload:
-                raise ValueError("noncanonical encoding")
-            if envelope.bundle_digest != handoff_bundle_digest(envelope.bundle):
-                raise ValueError("bundle digest mismatch")
-            expected = handoff_object_key(
-                envelope.fingerprint_digest, envelope.request_digest
-            )
-            if expected != object_key:
-                raise ValueError("object key does not match the stored identity")
-            check_retrieval_handoff(envelope.bundle)
-        except (msgspec.DecodeError, msgspec.ValidationError, TypeError, ValueError):
-            raise ArtifactValidationError("cached handoff payload is invalid") from None
-        return envelope.bundle
-
-    return decode
-
-
-def read_handoff_bundle(
-    store: ArtifactStoreLike, object_key: str
-) -> RetrievalHandoffBundle | None:
-    """Return a validated handoff bundle, or ``None`` when it is genuinely absent."""
-
-    if not isinstance(object_key, str) or not object_key:
-        raise HandoffSourceError("handoff object key must be a non-empty string")
-    bundle = store.read_validated(object_key, _decoder(object_key))
-    if bundle is None:
-        return None
-    if not isinstance(bundle, RetrievalHandoffBundle):
-        raise ArtifactValidationError("handoff decoder returned an invalid value")
-    return bundle
-
-
 def require_handoff_bundle(
-    store: ArtifactStoreLike, entry: HandoffTopicEntry
+    store: Any,
+    entry: HandoffTopicEntry,
+    *,
+    topic_catalog_digest: bytes,
+    fingerprint: HandoffFingerprint | None = None,
 ) -> RetrievalHandoffBundle:
-    """Return the bundle for one manifest entry, failing closed if unusable."""
+    """Return the bundle for one manifest entry, failing closed if unusable.
+
+    Reading goes through the upstream keyed reader, which recovers the request
+    digest from the canonical object key and validates the complete request
+    identity against the catalog and producer digests the manifest records.
+    """
 
     if not entry.available:
         raise HandoffSourceError(
             f"topic {entry.topic_id} has no usable handoff artifact (status {entry.status})"
         )
     assert entry.object_key is not None
-    bundle = read_handoff_bundle(store, entry.object_key)
+    if entry.producer_identity_digest is None:
+        raise HandoffSourceError(
+            f"topic {entry.topic_id} has no producer identity digest in the manifest"
+        )
+    cache = RetrievalHandoffArtifactCache(store)
+    try:
+        bundle = cache.get_by_object_key(
+            fingerprint or HandoffFingerprint(),
+            entry.object_key,
+            topic_catalog_digest=topic_catalog_digest,
+            producer_identity_digest=entry.producer_identity_digest,
+        )
+    except Exception as error:
+        raise HandoffSourceError(
+            f"handoff artifact for topic {entry.topic_id} is unreadable:"
+            f" {type(error).__name__}: {error}"
+        ) from None
     if bundle is None:
-        # read_validated returns None both for a genuine miss and for bytes the
-        # decoder rejected, so distinguish them rather than blaming absence.
         reader = getattr(store, "read", None)
         present = callable(reader) and reader(entry.object_key) is not None
-        detail = (
-            "is stored but invalid" if present else "is absent from the cache"
-        )
+        detail = "is stored but invalid" if present else "is absent from the cache"
         raise HandoffSourceError(
             f"handoff artifact for topic {entry.topic_id} {detail}"
         )
@@ -242,13 +238,22 @@ def merge_handoff_manifests(paths: Sequence[Path | str]) -> HandoffManifest:
     )
 
 
+def catalog_digest_bytes(manifest: HandoffManifest) -> bytes:
+    """Return the manifest's topic catalog digest as raw bytes."""
+
+    try:
+        return bytes.fromhex(manifest.topic_catalog_digest)
+    except ValueError:
+        raise HandoffSourceError("topic_catalog_digest is not hex") from None
+
+
 __all__ = [
     "HANDOFF_MANIFEST_SCHEMA_VERSION",
+    "catalog_digest_bytes",
     "HandoffManifest",
     "HandoffSourceError",
     "HandoffTopicEntry",
     "load_handoff_manifest",
     "merge_handoff_manifests",
-    "read_handoff_bundle",
     "require_handoff_bundle",
 ]

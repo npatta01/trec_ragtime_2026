@@ -5,32 +5,27 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-import msgspec
-
 from trec_ragtime.artifact_store import ArtifactStoreRemoteError
 from trec_ragtime.evidence_bundle import build_evidence_bundle_from_handoff
 from trec_ragtime.report_generation import SentenceCandidate, rank_citations
 from trec_ragtime.report_handoff import HandoffSourceError, HandoffTopicEntry, require_handoff_bundle
-from trec_ragtime.retrieval_handoff import HandoffSupport
-from tests.test_evidence_handoff import TOPICS_DIGEST, evidence, handoff, nugget
+from tests.test_evidence_handoff import TOPICS_DIGEST, described_handoff
 from tests.test_report_cache import MemoryArtifactStore
+from tests.test_report_handoff import CATALOG, PRODUCER, unstored_key
 
 
 def bundle_with_ranks(*ranks: int, citation_ready: bool = True):
-    rows = tuple(
-        msgspec.structs.replace(evidence(f"e00{i}", i), document_rank=rank)
-        for i, rank in enumerate(ranks, start=1)
+    """One nugget citing every alias, each carrying its own corpus rank."""
+
+    aliases = [f"e{i:03d}" for i in range(1, len(ranks) + 1)]
+    # Citation readiness is not free-standing: only a full support link is
+    # citable, so asking for non-citable evidence means a partial_support link.
+    assignment = "support" if citation_ready else "partial_support"
+    bundle = described_handoff(
+        ("A claim under test.", "okay", [(alias, assignment) for alias in aliases]),
+        ranks=dict(zip(aliases, ranks, strict=True)),
     )
-    support = tuple(
-        HandoffSupport(
-            alias=f"e00{i}", assignment="support", variant_index=0, citation_ready=citation_ready
-        )
-        for i in range(1, len(ranks) + 1)
-    )
-    nuggets = (nugget("a", "A claim under test.", support),)
-    return build_evidence_bundle_from_handoff(
-        handoff(evidence_rows=rows, nuggets=nuggets), topics_sha256=TOPICS_DIGEST
-    )
+    return build_evidence_bundle_from_handoff(bundle, topics_sha256=TOPICS_DIGEST)
 
 
 class CitationScoreDescentTests(unittest.TestCase):
@@ -81,22 +76,11 @@ class PartialSupportFacetTests(unittest.TestCase):
     """A facet nothing can cite must not be presented as a coverage target."""
 
     def only_partial(self):
-        rows = (evidence("e001", 1), evidence("e002", 2, facet_index=1))
-        nuggets = (
-            nugget(
-                "a",
-                "A fully attested claim.",
-                (HandoffSupport(alias="e001", assignment="support", variant_index=0, citation_ready=True),),
-            ),
-            nugget(
-                "b",
-                "A claim only partially attested.",
-                (HandoffSupport(alias="e002", assignment="partial_support", variant_index=0, citation_ready=False),),
-            ),
+        bundle = described_handoff(
+            ("A fully attested claim.", "okay", [("e001", "support")]),
+            ("A claim only partially attested.", "okay", [("e002", "partial_support")]),
         )
-        return build_evidence_bundle_from_handoff(
-            handoff(evidence_rows=rows, nuggets=nuggets), topics_sha256=TOPICS_DIGEST
-        )
+        return build_evidence_bundle_from_handoff(bundle, topics_sha256=TOPICS_DIGEST)
 
     def test_partial_only_facet_is_not_a_coverage_target(self) -> None:
         bundle = self.only_partial()
@@ -118,19 +102,15 @@ class PartialSupportFacetTests(unittest.TestCase):
         self.assertFalse(bundle.passage("e002").citable)
 
     def test_a_partial_link_to_a_retained_facet_keeps_its_label(self) -> None:
-        rows = (evidence("e001", 1), evidence("e002", 2, facet_index=1))
-        nuggets = (
-            nugget(
-                "a",
-                "A claim.",
-                (
-                    HandoffSupport(alias="e001", assignment="support", variant_index=0, citation_ready=True),
-                    HandoffSupport(alias="e002", assignment="partial_support", variant_index=0, citation_ready=False),
-                ),
-            ),
-        )
         bundle = build_evidence_bundle_from_handoff(
-            handoff(evidence_rows=rows, nuggets=nuggets), topics_sha256=TOPICS_DIGEST
+            described_handoff(
+                (
+                    "A claim.",
+                    "okay",
+                    [("e001", "support"), ("e002", "partial_support")],
+                )
+            ),
+            topics_sha256=TOPICS_DIGEST,
         )
         link = bundle.passage("e002").support[0]
         self.assertEqual(link.assignment, "partial_support")
@@ -138,6 +118,15 @@ class PartialSupportFacetTests(unittest.TestCase):
 
 
 class HandoffFailureReportingTests(unittest.TestCase):
+    """Absent, unreadable and unreachable must stay three distinct reports.
+
+    Every key here is canonical and under the real fingerprint root, so the
+    reader gets far enough to distinguish them instead of rejecting the key.
+    """
+
+    def entry(self, key: str) -> HandoffTopicEntry:
+        return HandoffTopicEntry("2000", "written", key, PRODUCER)
+
     def test_an_invalid_artifact_is_not_reported_as_absent(self) -> None:
         class RetainingStore(MemoryArtifactStore):
             """Models a real remote: a rejected payload stays durably stored."""
@@ -152,26 +141,29 @@ class HandoffFailureReportingTests(unittest.TestCase):
                     return None
 
         store = RetainingStore()
-        key = "retrieval-handoff/v1/" + "a" * 64 + "/bb/" + "b" * 64 + ".mpk"
+        key = unstored_key(b"\xbb" * 32)
         store.objects[key] = b"\x00 not a valid envelope"
-        entry = HandoffTopicEntry("2000", "written", key)
         with self.assertRaises(HandoffSourceError) as caught:
-            require_handoff_bundle(store, entry)
+            require_handoff_bundle(store, self.entry(key), topic_catalog_digest=CATALOG)
         self.assertIn("invalid", str(caught.exception).lower())
         self.assertNotIn("absent", str(caught.exception).lower())
 
     def test_a_genuinely_missing_artifact_is_reported_as_absent(self) -> None:
-        entry = HandoffTopicEntry("2000", "written", "retrieval-handoff/v1/missing.mpk")
         with self.assertRaises(HandoffSourceError) as caught:
-            require_handoff_bundle(MemoryArtifactStore(), entry)
+            require_handoff_bundle(
+                MemoryArtifactStore(),
+                self.entry(unstored_key()),
+                topic_catalog_digest=CATALOG,
+            )
         self.assertIn("absent", str(caught.exception).lower())
 
     def test_a_remote_store_failure_is_surfaced_not_swallowed(self) -> None:
         store = MemoryArtifactStore()
         store.read_error = ArtifactStoreRemoteError("bucket throttled")
-        entry = HandoffTopicEntry("2000", "written", "retrieval-handoff/v1/k.mpk")
         with self.assertRaises((HandoffSourceError, ArtifactStoreRemoteError)):
-            require_handoff_bundle(store, entry)
+            require_handoff_bundle(
+                store, self.entry(unstored_key()), topic_catalog_digest=CATALOG
+            )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
+from collections.abc import Mapping, Sequence
 
 import msgspec
 
@@ -8,6 +10,8 @@ from trec_ragtime.evidence_bundle import (
     EvidenceBundleError,
     build_evidence_bundle_from_handoff,
 )
+from trec_ragtime.nugget_cache import nugget_object_key
+from trec_ragtime.nuggets import SCHEMA_VERSION as NUGGET_SCHEMA_VERSION, normalize_claim
 from trec_ragtime.retrieval_handoff import (
     BEHAVIOR_VERSION,
     HandoffCounts,
@@ -22,12 +26,30 @@ from trec_ragtime.retrieval_handoff import (
 )
 
 TOPICS_DIGEST = "c" * 64
+TOPIC_ID = "2000"
+NUGGET_FINGERPRINT = b"\x03" * 32
+NUGGET_REQUEST = b"\x04" * 32
+NUGGET_BUNDLE_DIGEST = b"\x05" * 32
+
+# One nugget as a test cares about it: the claim, how important it is, and the
+# evidence it cites as ``(alias, assignment)``.
+ClaimSpec = tuple[str, str, Sequence[tuple[str, str]]]
 
 
-def evidence(alias: str, index: int, *, facet_index: int = 0) -> HandoffEvidence:
+def facet_query(facet_index: int) -> str:
+    return f"facet query {facet_index}"
+
+
+def evidence(
+    alias: str,
+    index: int,
+    *,
+    facet_index: int = 0,
+    document_rank: int | None = None,
+) -> HandoffEvidence:
+    """Build one selected evidence row whose offsets and hash agree with its text."""
+
     text = f"English passage {index} about the ban and its measured outcomes."
-    import hashlib
-
     return HandoffEvidence(
         alias=alias,
         document_id=f"doc-{index}",
@@ -38,27 +60,75 @@ def evidence(alias: str, index: int, *, facet_index: int = 0) -> HandoffEvidence
         end_char=len(text),
         content_hash=hashlib.sha256(text.encode("utf-8")).digest(),
         passage_score=1.0 / index,
-        document_rank=index,
+        document_rank=index if document_rank is None else document_rank,
         facet_index=facet_index,
-        facet_query=f"facet query {facet_index}",
+        facet_query=facet_query(facet_index),
         retrieval_input_index=facet_index,
+    )
+
+
+def support(alias: str, assignment: str = "support", *, variant_index: int = 0) -> HandoffSupport:
+    """Link a nugget to evidence.
+
+    check_retrieval_handoff requires citation_ready to equal
+    ``assignment == "support"`` exactly, so it is derived rather than passed in.
+    """
+
+    return HandoffSupport(
+        alias=alias,
+        assignment=assignment,
+        variant_index=variant_index,
+        citation_ready=assignment == "support",
     )
 
 
 def nugget(
     suffix: str,
     claim: str,
-    support: tuple[HandoffSupport, ...],
+    support_links: Sequence[HandoffSupport],
     *,
     importance: str = "okay",
+    topic_id: str = TOPIC_ID,
 ) -> HandoffNugget:
+    """Build a nugget whose IDs match what the handoff validator recomputes.
+
+    check_retrieval_handoff derives nugget_id and cluster_id from the topic,
+    the normalized claim, and the cited aliases, so a fixture with invented
+    identifiers is rejected as broken lineage. Variants are normalized claims,
+    because the validator requires every variant to equal normalize_claim of
+    itself and requires the normalized claim to appear among them.
+    """
+
+    del suffix  # A readability label for the caller; identity comes from the claim.
+    links = tuple(sorted(support_links, key=lambda link: link.alias))
+    aliases = tuple(link.alias for link in links)
+    variants = (normalize_claim(claim),)
+    nugget_id = "nug1_" + hashlib.sha256(
+        msgspec.msgpack.encode(
+            {
+                "schema_version": NUGGET_SCHEMA_VERSION,
+                "topic_id": topic_id,
+                "claim": normalize_claim(claim),
+                "aliases": sorted(aliases),
+            }
+        )
+    ).hexdigest()[:24]
+    cluster_id = "nugc1_" + hashlib.sha256(
+        msgspec.msgpack.encode(
+            {
+                "schema_version": NUGGET_SCHEMA_VERSION,
+                "topic_id": topic_id,
+                "variants": sorted(variants),
+            }
+        )
+    ).hexdigest()[:24]
     return HandoffNugget(
-        nugget_id=f"nug1_{suffix * 24}"[:29],
-        cluster_id=f"nugc1_{suffix * 24}"[:30],
+        nugget_id=nugget_id,
+        cluster_id=cluster_id,
         claim=claim,
-        variants=(claim,),
+        variants=variants,
         importance=importance,
-        support=support,
+        support=links,
     )
 
 
@@ -68,59 +138,153 @@ def handoff(
     nuggets: tuple[HandoffNugget, ...] | None = None,
     limit: int = 5000,
 ) -> RetrievalHandoffBundle:
+    """Assemble a bundle whose derived parts agree with its evidence and nuggets.
+
+    check_retrieval_handoff recomputes the retrieval inputs, the facet coverage,
+    the nugget order and every count from the bundle contents, so this fixture
+    derives all of them instead of hand-writing them. A caller supplies only the
+    evidence and nuggets a test is actually about; anything else holds by
+    construction, and a defect a test injects on purpose survives untouched.
+    """
+
     if evidence_rows is None:
         evidence_rows = (evidence("e001", 1), evidence("e002", 2, facet_index=1))
     if nuggets is None:
         nuggets = (
-        nugget("a", "The ban took effect in 2019.",
-               (HandoffSupport(alias="e001", assignment="support", variant_index=0, citation_ready=True),),
-               importance="vital"),
-        nugget("b", "Youth vaping prevalence fell.",
-               (HandoffSupport(alias="e002", assignment="support", variant_index=0, citation_ready=True),)),
+            nugget(
+                "a",
+                "The ban took effect in 2019.",
+                (support("e001"),),
+                importance="vital",
+            ),
+            nugget("b", "Youth vaping prevalence fell.", (support("e002"),)),
         )
-    aliases = {row.alias for row in evidence_rows}
+    evidence_rows = tuple(sorted(evidence_rows, key=lambda row: row.alias))
+    scores = {row.alias: row.passage_score for row in evidence_rows}
+    # The validator demands vital before okay, then the strongest cited passage,
+    # then the nugget id. A missing alias is a defect the validator reports on
+    # its own, so ordering must not raise before it gets there.
+    nuggets = tuple(
+        sorted(
+            nuggets,
+            key=lambda row: (
+                0 if row.importance == "vital" else 1,
+                -max((scores.get(link.alias, 0.0) for link in row.support), default=0.0),
+                row.nugget_id,
+            ),
+        )
+    )
+
+    # Retrieval inputs cover facet 0..max contiguously so that every row's
+    # retrieval_input_index equals its facet_index, as the validator checks.
+    facet_indices = tuple(
+        range(max((row.facet_index for row in evidence_rows), default=0) + 1)
+    )
+    retrieval_inputs = tuple(
+        HandoffRetrievalInput(
+            facet_index=index,
+            query=facet_query(index),
+            object_key=f"retrieval/v1/{index}",
+            request_digest=bytes([index + 1]) * 32,
+        )
+        for index in facet_indices
+    )
+    selected: dict[int, set[str]] = {
+        index: {row.alias for row in evidence_rows if row.facet_index == index}
+        for index in facet_indices
+    }
+    facets = tuple(
+        HandoffFacet(
+            facet_index=index,
+            query=facet_query(index),
+            evidence_count=len(selected[index]),
+            nugget_count=sum(
+                1
+                for row in nuggets
+                if any(link.alias in selected[index] for link in row.support)
+            ),
+        )
+        for index in facet_indices
+    )
+
+    offered = sum(facet.evidence_count for facet in facets)
     full = sum(1 for n in nuggets for s in n.support if s.assignment == "support")
-    partial = sum(1 for n in nuggets for s in n.support if s.assignment == "partial_support")
-    ready = sum(1 for n in nuggets for s in n.support if s.citation_ready)
+    partial = sum(
+        1 for n in nuggets for s in n.support if s.assignment == "partial_support"
+    )
     return RetrievalHandoffBundle(
         schema_version=1,
         behavior_version=BEHAVIOR_VERSION,
         representation="report_text",
         topic=HandoffTopic(
-            topic_id="2000",
+            topic_id=TOPIC_ID,
             collection_id="ragtime/2/all",
             title="Anti-vaping legislation",
             problem_statement="A statement about vaping law.",
             background="A legislative aide needs this.",
             limit=limit,
         ),
-        retrieval_inputs=(
-            HandoffRetrievalInput(facet_index=0, query="facet query 0", object_key="retrieval/v1/a", request_digest=b"\x01" * 32),
-            HandoffRetrievalInput(facet_index=1, query="facet query 1", object_key="retrieval/v1/b", request_digest=b"\x02" * 32),
-        ),
+        retrieval_inputs=retrieval_inputs,
         nugget_source=HandoffNuggetSource(
-            object_key="nuggets/v1/x",
-            fingerprint_digest=b"\x03" * 32,
-            request_digest=b"\x04" * 32,
-            bundle_digest=b"\x05" * 32,
+            object_key=nugget_object_key(NUGGET_FINGERPRINT, NUGGET_REQUEST),
+            fingerprint_digest=NUGGET_FINGERPRINT,
+            request_digest=NUGGET_REQUEST,
+            bundle_digest=NUGGET_BUNDLE_DIGEST,
         ),
         evidence=evidence_rows,
         nuggets=nuggets,
-        facets=(
-            HandoffFacet(facet_index=0, query="facet query 0", evidence_count=1, nugget_count=1),
-            HandoffFacet(facet_index=1, query="facet query 1", evidence_count=1, nugget_count=1),
-        ),
+        facets=facets,
         counts=HandoffCounts(
-            offered_evidence=len(aliases),
+            offered_evidence=offered,
             selected_evidence=len(evidence_rows),
-            omitted_evidence=0,
+            omitted_evidence=offered - len(evidence_rows),
             nuggets=len(nuggets),
             full_support=full,
             partial_support=partial,
-            citation_ready=ready,
+            citation_ready=full,
             rejected=0,
         ),
     )
+
+
+def described_handoff(
+    *claims: ClaimSpec,
+    limit: int = 5000,
+    ranks: Mapping[str, int] | None = None,
+) -> RetrievalHandoffBundle:
+    """Build a valid bundle from a plain description of the nuggets under test.
+
+    Each claim is ``(text, importance, [(alias, assignment), ...])``. Evidence
+    rows are created for exactly the aliases the claims cite, because the
+    validator requires the evidence table to be the union of referenced
+    aliases -- no unreferenced rows and no dangling links. ``ranks`` overrides
+    the corpus document_rank of individual aliases.
+    """
+
+    ranks = dict(ranks or {})
+    aliases = sorted(
+        {alias for _, _, links in claims for alias, _ in links},
+        key=lambda alias: int(alias[1:]),
+    )
+    rows = tuple(
+        evidence(
+            alias,
+            int(alias[1:]),
+            facet_index=position % 2,
+            document_rank=ranks.get(alias),
+        )
+        for position, alias in enumerate(aliases)
+    )
+    nuggets = tuple(
+        nugget(
+            f"n{position}",
+            text,
+            tuple(support(alias, assignment) for alias, assignment in links),
+            importance=importance,
+        )
+        for position, (text, importance, links) in enumerate(claims)
+    )
+    return handoff(evidence_rows=rows, nuggets=nuggets, limit=limit)
 
 
 class ProjectionTests(unittest.TestCase):
@@ -177,13 +341,13 @@ class ProjectionTests(unittest.TestCase):
 
 class CitationReadinessTests(unittest.TestCase):
     def partial_bundle(self) -> RetrievalHandoffBundle:
-        rows = (evidence("e001", 1), evidence("e002", 2, facet_index=1))
-        nuggets = (
-            nugget("a", "The ban took effect in 2019.",
-                   (HandoffSupport(alias="e001", assignment="support", variant_index=0, citation_ready=True),
-                    HandoffSupport(alias="e002", assignment="partial_support", variant_index=0, citation_ready=False))),
+        return described_handoff(
+            (
+                "The ban took effect in 2019.",
+                "okay",
+                [("e001", "support"), ("e002", "partial_support")],
+            )
         )
-        return handoff(evidence_rows=rows, nuggets=nuggets)
 
     def test_partial_support_evidence_is_present_but_not_citable(self) -> None:
         item = build_evidence_bundle_from_handoff(self.partial_bundle(), topics_sha256=TOPICS_DIGEST)
@@ -208,15 +372,11 @@ class CitationReadinessTests(unittest.TestCase):
         self.assertEqual(item.passage("e001").facet_ids, ("F1",))
 
     def test_a_topic_with_no_citable_evidence_fails_closed(self) -> None:
-        rows = (evidence("e001", 1),)
-        nuggets = (
-            nugget("a", "A partially attested claim.",
-                   (HandoffSupport(alias="e001", assignment="partial_support", variant_index=0, citation_ready=False),)),
+        bundle = described_handoff(
+            ("A partially attested claim.", "okay", [("e001", "partial_support")])
         )
         with self.assertRaises(EvidenceBundleError):
-            build_evidence_bundle_from_handoff(
-                handoff(evidence_rows=rows, nuggets=nuggets), topics_sha256=TOPICS_DIGEST
-            )
+            build_evidence_bundle_from_handoff(bundle, topics_sha256=TOPICS_DIGEST)
 
 
 class HandoffValidationTests(unittest.TestCase):
@@ -225,11 +385,10 @@ class HandoffValidationTests(unittest.TestCase):
             build_evidence_bundle_from_handoff(object(), topics_sha256=TOPICS_DIGEST)
 
     def test_support_link_to_an_unknown_alias_fails_closed(self) -> None:
+        # Everything else about this bundle is consistent, so the only defect
+        # left is the support link naming evidence that was never selected.
         rows = (evidence("e001", 1),)
-        nuggets = (
-            nugget("a", "A claim.",
-                   (HandoffSupport(alias="e999", assignment="support", variant_index=0, citation_ready=True),)),
-        )
+        nuggets = (nugget("a", "A claim.", (support("e999"),)),)
         with self.assertRaises(EvidenceBundleError):
             build_evidence_bundle_from_handoff(
                 handoff(evidence_rows=rows, nuggets=nuggets), topics_sha256=TOPICS_DIGEST
@@ -237,7 +396,11 @@ class HandoffValidationTests(unittest.TestCase):
 
     def test_evidence_text_not_matching_its_hash_fails_closed(self) -> None:
         rows = list(handoff().evidence)
-        rows[0] = msgspec.structs.replace(rows[0], text="Swapped text.")
+        # Same length as the original, so the offsets stay valid and the content
+        # hash is the single invariant this bundle breaks.
+        swapped = rows[0].text.replace("English", "Swapped")
+        self.assertEqual(len(swapped), len(rows[0].text))
+        rows[0] = msgspec.structs.replace(rows[0], text=swapped)
         with self.assertRaises(EvidenceBundleError):
             build_evidence_bundle_from_handoff(
                 handoff(evidence_rows=tuple(rows)), topics_sha256=TOPICS_DIGEST

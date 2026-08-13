@@ -70,6 +70,16 @@ class UnknownEvidenceHandleError(EvidenceBundleError):
     """A handle is not in the bundle's allowlist."""
 
 
+class NoCitableEvidenceError(EvidenceBundleError):
+    """A handoff carried evidence, but nothing that may be cited.
+
+    Distinct from a malformed bundle: the upstream stages worked and simply
+    found no passage that fully supports any claim. Only a caller that can make
+    a submission-level decision may act on it, and never by promoting partial
+    support.
+    """
+
+
 def sha256_file(path: Path | str) -> str:
     """Return the hex SHA-256 of a file, read in bounded chunks."""
 
@@ -1091,7 +1101,7 @@ def build_evidence_bundle_from_handoff(
         )
 
     if not any(passage.citable for passage in passages):
-        raise EvidenceBundleError(
+        raise NoCitableEvidenceError(
             f"topic {handoff.topic.topic_id} has no citation-ready evidence"
         )
 
@@ -1152,6 +1162,7 @@ __all__ = [
     "SUPPORTED_RUN_SCHEMAS",
     "EvidenceBundle",
     "EvidenceBundleError",
+    "NoCitableEvidenceError",
     "EvidenceBundleSource",
     "EvidenceCandidate",
     "EvidenceFacet",

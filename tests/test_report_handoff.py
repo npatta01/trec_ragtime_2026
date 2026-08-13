@@ -11,79 +11,139 @@ import msgspec
 from trec_ragtime.report_cache import GenerationSettings
 from trec_ragtime.report_handoff import (
     HandoffSourceError,
+    HandoffTopicEntry,
     load_handoff_manifest,
-    read_handoff_bundle,
     require_handoff_bundle,
 )
 from trec_ragtime.report_runner import run_report_generation
 from trec_ragtime.report_submission import validate_submission_file
 from trec_ragtime.retrieval_handoff import handoff_bundle_digest
-from trec_ragtime.retrieval_handoff_cache import HandoffEnvelope, handoff_object_key
-from tests.test_evidence_handoff import evidence, handoff, nugget
-from trec_ragtime.retrieval_handoff import HandoffSupport
+from trec_ragtime.retrieval_handoff_cache import (
+    HandoffEnvelope,
+    HandoffFingerprint,
+    handoff_object_key,
+    request_for_bundle,
+)
+from tests.test_evidence_handoff import described_handoff, handoff
 from tests.test_report_cache import MemoryArtifactStore
 from tests.test_report_generation import completion, draft, line
 
 TEAM_ID = "PLACEHOLDER-TEAM"
 RUN_ID = "handoff-run-1"
-FP = b"\x11" * 32
+
+# The strict reader recovers the request digest from the object key and refuses
+# any key outside the root of the fingerprint it was handed, so fixtures must
+# publish under the real fingerprint rather than an invented one.
+FINGERPRINT = HandoffFingerprint()
+CATALOG = b"\x09" * 32
+PRODUCER = b"\x07" * 32
+# An arbitrary but well-formed request digest, for keys that are never stored.
 RQ = b"\x22" * 32
 
 
-def store_bundle(store: MemoryArtifactStore, bundle: Any, *, request_digest: bytes = RQ) -> str:
+def store_bundle(
+    store: MemoryArtifactStore,
+    bundle: Any,
+    *,
+    topic_catalog_digest: bytes = CATALOG,
+    producer_identity_digest: bytes = PRODUCER,
+) -> str:
+    """Publish one handoff exactly where the strict reader will look for it.
+
+    The reader rebuilds the request from the stored bundle plus the catalog and
+    producer digests its caller supplies, so the key has to be derived from that
+    same request rather than chosen freely.
+    """
+
+    request = request_for_bundle(
+        bundle,
+        topic_catalog_digest=topic_catalog_digest,
+        producer_identity_digest=producer_identity_digest,
+    )
     envelope = HandoffEnvelope(
-        fingerprint_digest=FP,
-        request_digest=request_digest,
+        fingerprint_digest=FINGERPRINT.digest,
+        request_digest=request.digest,
         bundle_digest=handoff_bundle_digest(bundle),
         bundle=bundle,
     )
-    key = handoff_object_key(FP, request_digest)
+    key = handoff_object_key(FINGERPRINT.digest, request.digest)
     store.objects[key] = msgspec.msgpack.encode(envelope)
     return key
 
 
+def unstored_key(request_digest: bytes = RQ) -> str:
+    """A canonical key under the real fingerprint root, with nothing behind it."""
+
+    return handoff_object_key(FINGERPRINT.digest, request_digest)
+
+
+def entry_for(key: str, topic_id: str = "2000") -> HandoffTopicEntry:
+    return HandoffTopicEntry(topic_id, "written", key, PRODUCER)
+
+
+def manifest_topic(
+    topic_id: str, status: str, object_key: str | None
+) -> dict[str, Any]:
+    return {
+        "topic_id": topic_id,
+        "status": status,
+        "object_key": object_key,
+        "producer_identity_digest": PRODUCER.hex(),
+    }
+
+
 class ReaderTests(unittest.TestCase):
+    """Failure reporting around the upstream strict reader.
+
+    Envelope decoding, canonical encoding, and identity checks now belong to
+    RetrievalHandoffArtifactCache.get_by_object_key and are tested there. What
+    remains here is this module's own contract: a caller must be able to tell an
+    absent artifact from an unreadable one, and neither may pass silently. The
+    successful round trip is covered end to end by GenerationFromHandoffTests.
+    """
+
     def setUp(self) -> None:
         self.store = MemoryArtifactStore()
 
-    def test_round_trip_by_object_key(self) -> None:
-        bundle = handoff()
-        key = store_bundle(self.store, bundle)
-        loaded = read_handoff_bundle(self.store, key)
-        self.assertIsNotNone(loaded)
-        assert loaded is not None
-        self.assertEqual(loaded.topic.topic_id, "2000")
+    def test_absent_artifact_is_reported_as_absent(self) -> None:
+        entry = entry_for(unstored_key())
+        with self.assertRaises(HandoffSourceError) as caught:
+            require_handoff_bundle(self.store, entry, topic_catalog_digest=CATALOG)
+        self.assertIn("absent", str(caught.exception).lower())
 
-    def test_absent_artifact_is_none(self) -> None:
-        self.assertIsNone(
-            read_handoff_bundle(self.store, handoff_object_key(FP, RQ))
-        )
-
-    def test_key_that_disagrees_with_the_envelope_is_rejected(self) -> None:
-        bundle = handoff()
-        envelope = HandoffEnvelope(
-            fingerprint_digest=FP,
-            request_digest=RQ,
-            bundle_digest=handoff_bundle_digest(bundle),
-            bundle=bundle,
-        )
-        wrong = handoff_object_key(FP, b"\x33" * 32)
-        self.store.objects[wrong] = msgspec.msgpack.encode(envelope)
-        self.assertIsNone(read_handoff_bundle(self.store, wrong))
+    def test_garbage_payload_is_reported_not_swallowed(self) -> None:
+        key = unstored_key()
+        self.store.objects[key] = b"\x00\x01\x02"
+        with self.assertRaises(HandoffSourceError) as caught:
+            require_handoff_bundle(self.store, entry_for(key), topic_catalog_digest=CATALOG)
+        self.assertNotIn("absent", str(caught.exception).lower())
 
     def test_tampered_bundle_digest_is_rejected(self) -> None:
+        # Everything else about this envelope resolves, so the digest is the
+        # single thing standing between the payload and acceptance.
         bundle = handoff()
+        key = unstored_key()
         envelope = HandoffEnvelope(
-            fingerprint_digest=FP, request_digest=RQ, bundle_digest=b"\x00" * 32, bundle=bundle
+            fingerprint_digest=FINGERPRINT.digest,
+            request_digest=RQ,
+            bundle_digest=b"\x00" * 32,
+            bundle=bundle,
         )
-        key = handoff_object_key(FP, RQ)
         self.store.objects[key] = msgspec.msgpack.encode(envelope)
-        self.assertIsNone(read_handoff_bundle(self.store, key))
+        with self.assertRaises(HandoffSourceError):
+            require_handoff_bundle(self.store, entry_for(key), topic_catalog_digest=CATALOG)
 
-    def test_garbage_payload_is_rejected(self) -> None:
-        key = handoff_object_key(FP, RQ)
-        self.store.objects[key] = b"\x00\x01\x02"
-        self.assertIsNone(read_handoff_bundle(self.store, key))
+    def test_a_failed_entry_is_refused_before_any_read(self) -> None:
+        entry = HandoffTopicEntry("2000", "failed", None, PRODUCER)
+        with self.assertRaises(HandoffSourceError):
+            require_handoff_bundle(self.store, entry, topic_catalog_digest=CATALOG)
+        self.assertEqual(self.store.read_validated_calls, [])
+
+    def test_an_entry_without_a_producer_digest_fails_closed(self) -> None:
+        entry = HandoffTopicEntry("2000", "written", unstored_key(), None)
+        with self.assertRaises(HandoffSourceError) as caught:
+            require_handoff_bundle(self.store, entry, topic_catalog_digest=CATALOG)
+        self.assertIn("producer identity", str(caught.exception).lower())
 
 
 class ManifestTests(unittest.TestCase):
@@ -116,13 +176,13 @@ class ManifestTests(unittest.TestCase):
         self.assertIsNone(manifest.entry("9999"))
 
     def test_failed_topic_is_not_available(self) -> None:
-        path = self.write(
-            self.base([{"topic_id": "2000", "status": "failed", "object_key": None}])
-        )
+        path = self.write(self.base([manifest_topic("2000", "failed", None)]))
         manifest = load_handoff_manifest(path)
         self.assertEqual(manifest.available_topic_ids, ())
         with self.assertRaises(HandoffSourceError):
-            require_handoff_bundle(MemoryArtifactStore(), manifest.entry("2000"))
+            require_handoff_bundle(
+                MemoryArtifactStore(), manifest.entry("2000"), topic_catalog_digest=CATALOG
+            )
 
     def test_unsupported_schema_is_rejected(self) -> None:
         payload = self.base([{"topic_id": "2000", "status": "written", "object_key": "k"}])
@@ -139,21 +199,35 @@ class ManifestTests(unittest.TestCase):
             load_handoff_manifest(self.write(self.base(rows)))
 
     def test_missing_artifact_fails_closed(self) -> None:
+        # A well-formed key with nothing behind it, so the entry is complete and
+        # absence is the only thing left for the reader to report.
         path = self.write(
-            self.base([{"topic_id": "2000", "status": "written", "object_key": "absent"}])
+            self.base([manifest_topic("2000", "written", unstored_key())])
         )
         manifest = load_handoff_manifest(path)
         with self.assertRaises(HandoffSourceError):
-            require_handoff_bundle(MemoryArtifactStore(), manifest.entry("2000"))
+            require_handoff_bundle(
+                MemoryArtifactStore(), manifest.entry("2000"), topic_catalog_digest=CATALOG
+            )
 
 
 class TripwireStore(MemoryArtifactStore):
     """Fails loudly if anything but the handoff and report prefixes is read."""
 
     def read_validated(self, object_key: str, decoder: Any) -> Any:
+        self._guard(object_key)
+        return super().read_validated(object_key, decoder)
+
+    def read_validated_strict(self, object_key: str, decoder: Any) -> Any:
+        # Handoff reads take the strict path, so the tripwire has to cover it
+        # too or it would stop guarding the artifact this suite is about.
+        self._guard(object_key)
+        return super().read_validated_strict(object_key, decoder)
+
+    @staticmethod
+    def _guard(object_key: str) -> None:
         if not object_key.startswith(("retrieval-handoff/", "reports/", "api-responses/")):
             raise AssertionError(f"generation opened a forbidden artifact: {object_key}")
-        return super().read_validated(object_key, decoder)
 
 
 class GenerationFromHandoffTests(unittest.TestCase):
@@ -188,11 +262,11 @@ class GenerationFromHandoffTests(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "fingerprint": "a" * 64,
-                    "topic_catalog_digest": "b" * 64,
+                    # The reader rebuilds the stored request from this digest,
+                    # so it has to be the one the artifact was published under.
+                    "topic_catalog_digest": CATALOG.hex(),
                     "complete": True,
-                    "topics": [
-                        {"topic_id": "2000", "status": "written", "object_key": key}
-                    ],
+                    "topics": [manifest_topic("2000", "written", key)],
                 }
             ),
             encoding="utf-8",
@@ -271,18 +345,13 @@ class GenerationFromHandoffTests(unittest.TestCase):
         self.assertNotIn("doc-1", body)
 
     def test_partial_support_evidence_is_not_offered_for_citation(self) -> None:
-        rows = (evidence("e001", 1), evidence("e002", 2, facet_index=1))
-        nuggets = (
-            nugget(
-                "a",
+        partial = described_handoff(
+            (
                 "The ban took effect in 2019.",
-                (
-                    HandoffSupport(alias="e001", assignment="support", variant_index=0, citation_ready=True),
-                    HandoffSupport(alias="e002", assignment="partial_support", variant_index=0, citation_ready=False),
-                ),
-            ),
+                "okay",
+                [("e001", "support"), ("e002", "partial_support")],
+            )
         )
-        partial = handoff(evidence_rows=rows, nuggets=nuggets)
         payload = completion(draft(line("The ban took effect in 2019.", ["e001"])))
         _, provider = self.generate(payload, bundle=partial)
         schema = provider.requests[0]["response_format"]["json_schema"]["schema"]
@@ -290,18 +359,13 @@ class GenerationFromHandoffTests(unittest.TestCase):
         self.assertEqual(enum, ["e001"])
 
     def test_citing_partial_support_evidence_is_refused(self) -> None:
-        rows = (evidence("e001", 1), evidence("e002", 2, facet_index=1))
-        nuggets = (
-            nugget(
-                "a",
+        partial = described_handoff(
+            (
                 "The ban took effect in 2019.",
-                (
-                    HandoffSupport(alias="e001", assignment="support", variant_index=0, citation_ready=True),
-                    HandoffSupport(alias="e002", assignment="partial_support", variant_index=0, citation_ready=False),
-                ),
-            ),
+                "okay",
+                [("e001", "support"), ("e002", "partial_support")],
+            )
         )
-        partial = handoff(evidence_rows=rows, nuggets=nuggets)
         payload = completion(draft(line("A claim from context only.", ["e002"])))
         result, _ = self.generate(payload, bundle=partial)
         self.assertEqual(result.status, "incomplete")
@@ -359,11 +423,11 @@ class GenerationFromHandoffTests(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "fingerprint": "a" * 64,
-                    "topic_catalog_digest": "b" * 64,
+                    "topic_catalog_digest": CATALOG.hex(),
                     "complete": False,
                     "topics": [
-                        {"topic_id": "2000", "status": "written", "object_key": key},
-                        {"topic_id": "2001", "status": "failed", "object_key": None},
+                        manifest_topic("2000", "written", key),
+                        manifest_topic("2001", "failed", None),
                     ],
                 }
             ),

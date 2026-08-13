@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ from .artifact_store import ArtifactStore, ArtifactStoreError
 from .evidence_bundle import (
     EvidenceBundle,
     EvidenceBundleError,
+    NoCitableEvidenceError,
     build_evidence_bundle_from_handoff,
     build_evidence_bundles,
     load_evidence_run,
@@ -40,10 +41,13 @@ from .evidence_bundle import (
 )
 from .report_handoff import (
     HandoffSourceError,
+    catalog_digest_bytes,
     merge_handoff_manifests,
     require_handoff_bundle,
 )
+from .client import RagtimeConfigurationError
 from .paths import default_project_cache_dir, ensure_private_cache_dir
+from .providers import provider_settings
 from .report_cache import (
     GenerationSettings,
     ReportArtifactCache,
@@ -74,6 +78,14 @@ DEFAULT_TOPICS_PATH = "topics/topics.all.2026.v0625-fix.jsonl"
 DEFAULT_API_KEY_ENVS = ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "LITELLM_PROXY_API_KEY")
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 ALLOWED_CONCURRENCY = (1, 2, 4, 8, 12, 16)
+
+# A topic whose evidence contains nothing citable cannot honestly carry a
+# report. This states our system's position without asserting anything about
+# the subject, and cites nothing, so it can never be mistaken for a supported
+# claim. Both the official and local validators accept it.
+ABSTENTION_SENTENCE = (
+    "Insufficient citation-ready evidence was available to produce a supported report."
+)
 
 
 class ReportRunError(RuntimeError):
@@ -300,17 +312,21 @@ def _bundles_from_handoff(
     """Load one self-contained handoff bundle per topic, cache-only."""
 
     manifest = merge_handoff_manifests(manifest_paths)
+    catalog_digest = catalog_digest_bytes(manifest)
     bundles: list[EvidenceBundle] = []
     available: list[Topic] = []
     missing: list[str] = []
     unusable: dict[str, str] = {}
+    uncitable: dict[str, str] = {}
     for topic in topics:
         entry = manifest.entry(topic.topic_id)
         if entry is None or not entry.available:
             missing.append(topic.topic_id)
             continue
         try:
-            handoff = require_handoff_bundle(store, entry)
+            handoff = require_handoff_bundle(
+                store, entry, topic_catalog_digest=catalog_digest
+            )
             if not _handoff_topic_matches(handoff, topic):
                 raise ReportRunError(
                     f"handoff topic record for {topic.topic_id} does not match the"
@@ -319,10 +335,15 @@ def _bundles_from_handoff(
             bundle = build_evidence_bundle_from_handoff(
                 handoff, topics_sha256=topics_sha256, evidence_chars=evidence_chars
             )
+        except NoCitableEvidenceError as error:
+            # Upstream worked; nothing fully supports any claim. Recorded
+            # separately because it is the one case a submission-level
+            # abstention can honestly cover.
+            missing.append(topic.topic_id)
+            uncitable[topic.topic_id] = str(error)
+            continue
         except Exception as error:
-            # One unusable handoff must not abort the other 102. A topic whose
-            # evidence is entirely partial-support, for instance, has nothing
-            # citable and is recorded rather than raised.
+            # One unusable handoff must not abort the other 102.
             missing.append(topic.topic_id)
             unusable[topic.topic_id] = f"{type(error).__name__}: {error}"
             continue
@@ -332,9 +353,10 @@ def _bundles_from_handoff(
         "run_schema": "retrieval_handoff_v1",
         "manifest_path_names": manifest.path_name,
         "handoff_fingerprint": manifest.fingerprint,
-        "topic_catalog_digest": manifest.topic_catalog_digest,
         "handoff_complete": manifest.complete,
+        "topic_catalog_digest": manifest.topic_catalog_digest,
         "unusable_topics": unusable,
+        "uncitable_topics": uncitable,
     }
     return tuple(bundles), tuple(available), tuple(missing), record
 
@@ -356,6 +378,7 @@ def run_report_generation(
     clock: Callable[[], float] = time.time,
     refresh: bool = False,
     allow_partial: bool = False,
+    abstain_uncitable: bool = False,
     dry_run: bool = False,
     progress: Callable[[str], None] | None = None,
     cache_probes: Sequence[Callable[[], bool] | None] | None = None,
@@ -498,6 +521,9 @@ def run_report_generation(
                 "pending": max(0, len(available) - len(records) - len(failures)),
             }
             payload["missing_topics"] = list(missing)
+            payload["abstained_topics"] = sorted(
+                input_record.get("uncitable_topics", {}) if abstain_uncitable else {}
+            )
             payload["reports"] = [
                 {
                     "topic_id": item["topic_id"],
@@ -633,13 +659,25 @@ def run_report_generation(
                 "failed_topics": sorted(failures),
                 "missing_evidence_topics": list(missing),
                 "unusable_evidence": dict(input_record.get("unusable_topics", {})),
+                "uncitable_evidence": dict(input_record.get("uncitable_topics", {})),
                 "details": failures,
             },
         )
 
         complete = not failures and not missing
-        status = "complete" if complete else "incomplete"
+        status_base = complete
         records = ordered(checkpoints)
+        status = "complete" if status_base else "incomplete"
+
+        uncitable_topics = dict(input_record.get("uncitable_topics", {}))
+        abstained = (
+            tuple(t for t in topics if t.topic_id in uncitable_topics)
+            if abstain_uncitable
+            else ()
+        )
+        emitted = {topic.topic_id for topic in available if topic.topic_id in reports}
+        emitted.update(topic.topic_id for topic in abstained)
+        complete = complete or not (set(t.topic_id for t in topics) - emitted)
 
         if complete or allow_partial:
             submission = [
@@ -648,20 +686,22 @@ def run_report_generation(
                     topic_id=topic.topic_id,
                     run_id=run_id,
                     run_desc=run_desc,
-                    sentences=reports[topic.topic_id].sentence_payloads(),
+                    sentences=(
+                        [{"text": ABSTENTION_SENTENCE, "citations": {}}]
+                        if topic.topic_id in {a.topic_id for a in abstained}
+                        else reports[topic.topic_id].sentence_payloads()
+                    ),
                 )
-                for topic in available
-                if topic.topic_id in reports
+                for topic in topics
+                if topic.topic_id in emitted
             ]
             submission_path = run_dir / "submission.jsonl"
             _write_jsonl(submission_path, submission)
-            emitted = {
-                topic.topic_id: topic.limit
-                for topic in available
-                if topic.topic_id in reports
+            emitted_limits = {
+                topic.topic_id: topic.limit for topic in topics if topic.topic_id in emitted
             }
             validation = validate_submission_file(
-                submission_path, topics=emitted, team_id=team_id, run_id=run_id
+                submission_path, topics=emitted_limits, team_id=team_id, run_id=run_id
             )
             if not validation.ok:
                 submission_path.unlink(missing_ok=True)
@@ -717,11 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL,
-        help="OpenAI-compatible base URL",
-    )
-    parser.add_argument(
-        "--api-key-env", default=None, help="Environment variable holding the API key"
+        default=None,
+        help="Override the base URL resolved by provider_settings()",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=None)
@@ -740,20 +777,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", default=None, help="Run output root")
     parser.add_argument("--refresh-llm", action="store_true")
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument(
+        "--abstain-uncitable",
+        action="store_true",
+        help=(
+            "Emit a deterministic uncited abstention for a topic whose evidence "
+            "contains nothing citation-ready, so the submission covers it "
+            "explicitly rather than omitting it"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
-
-
-def _api_key(name: str | None) -> tuple[str, str]:
-    names = (name,) if name else DEFAULT_API_KEY_ENVS
-    for candidate in names:
-        value = os.getenv(candidate or "")
-        if value:
-            return candidate, value
-    raise ReportRunError(
-        f"no API key found; set one of {list(names)} or pass --api-key-env"
-    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -795,7 +830,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         settings = GenerationSettings(
-            base_url=args.base_url,
+            base_url=args.base_url or DEFAULT_BASE_URL,
             model=args.model,
             temperature=args.temperature,
             top_p=args.top_p,
@@ -831,19 +866,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             workers = [object()]
         else:
             try:
-                key_name, api_key = _api_key(args.api_key_env)
-            except ReportRunError as error:
+                resolved_base_url, api_key = provider_settings()
+            except (RagtimeConfigurationError, ValueError) as error:
                 print(str(error), file=sys.stderr)
                 return 2
-            if not args.quiet:
-                print(f"using API key from {key_name}")
+            if args.base_url:
+                resolved_base_url = args.base_url
+            settings = replace(settings, base_url=resolved_base_url)
             from openai import OpenAI
 
             from .llm_cache import CachedChatCompletions
 
             for _ in range(concurrency):
                 client = OpenAI(
-                    base_url=args.base_url, api_key=api_key, max_retries=0
+                    base_url=resolved_base_url, api_key=api_key, max_retries=0
                 )
                 observed = ObservedCacheStore(store)
                 workers.append(CachedChatCompletions(client, observed))
@@ -865,6 +901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 concurrency=concurrency,
                 refresh=args.refresh_llm,
                 allow_partial=args.allow_partial,
+                abstain_uncitable=args.abstain_uncitable,
                 dry_run=args.dry_run,
                 cache_probes=[
                     (lambda observer=observer: bool(observer.last_read_hit))
