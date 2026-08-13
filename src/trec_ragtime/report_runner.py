@@ -343,6 +343,7 @@ def run_report_generation(
     allow_partial: bool = False,
     dry_run: bool = False,
     progress: Callable[[str], None] | None = None,
+    cache_probes: Sequence[Callable[[], bool] | None] | None = None,
 ) -> ReportRunResult:
     """Generate, validate, and export reports for every requested topic."""
 
@@ -381,7 +382,7 @@ def run_report_generation(
                 topics_sha256=topics_sha256,
                 evidence_chars=settings.evidence_chars,
             )
-        except (HandoffSourceError, EvidenceBundleError) as error:
+        except (HandoffSourceError, EvidenceBundleError, ArtifactStoreError) as error:
             raise ReportRunError(str(error)) from None
         corpus_record: dict[str, Any] = {"dataset": None, "revision": None}
         if not available:
@@ -508,12 +509,12 @@ def run_report_generation(
             return ReportRunResult(run_dir, "dry_run", 0, 0, 0, missing)
 
         cache = ReportArtifactCache(store, clock=clock)
-        probes: list[Callable[[], bool] | None] = [
-            (lambda worker=worker: bool(getattr(worker, "last_read_hit", False)))
-            if hasattr(worker, "last_read_hit")
-            else None
-            for worker in workers
-        ]
+        if cache_probes is None:
+            probes: list[Callable[[], bool] | None] = [None] * len(workers)
+        else:
+            probes = list(cache_probes)
+            if len(probes) < len(workers):
+                raise ReportRunError("a cache probe is required for every worker")
 
         tasks = [
             _TopicTask(ordinal, topic, bundle, request)
@@ -771,6 +772,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stack.callback(lambda: None)
 
         workers: list[Any] = []
+        observers: list[ObservedCacheStore] = []
         if args.dry_run:
             workers = [object()]
         else:
@@ -789,9 +791,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 client = OpenAI(
                     base_url=args.base_url, api_key=api_key, max_retries=0
                 )
-                workers.append(
-                    CachedChatCompletions(client, ObservedCacheStore(store))
-                )
+                observed = ObservedCacheStore(store)
+                workers.append(CachedChatCompletions(client, observed))
+                observers.append(observed)
 
         try:
             result = run_report_generation(
@@ -810,12 +812,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 refresh=args.refresh_llm,
                 allow_partial=args.allow_partial,
                 dry_run=args.dry_run,
+                cache_probes=[
+                    (lambda observer=observer: bool(observer.last_read_hit))
+                    for observer in observers
+                ]
+                or None,
                 progress=None if args.quiet else lambda line: print(line),
             )
         except ReportRunError as error:
             print(str(error), file=sys.stderr)
             return 4 if "validation" in str(error) else 2
-        except (EvidenceBundleError, ValueError) as error:
+        except (EvidenceBundleError, ArtifactStoreError, ValueError) as error:
             print(str(error), file=sys.stderr)
             return 2
 

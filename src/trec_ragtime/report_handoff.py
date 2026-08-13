@@ -175,8 +175,15 @@ def require_handoff_bundle(
     assert entry.object_key is not None
     bundle = read_handoff_bundle(store, entry.object_key)
     if bundle is None:
+        # read_validated returns None both for a genuine miss and for bytes the
+        # decoder rejected, so distinguish them rather than blaming absence.
+        reader = getattr(store, "read", None)
+        present = callable(reader) and reader(entry.object_key) is not None
+        detail = (
+            "is stored but invalid" if present else "is absent from the cache"
+        )
         raise HandoffSourceError(
-            f"handoff artifact for topic {entry.topic_id} is absent from the cache"
+            f"handoff artifact for topic {entry.topic_id} {detail}"
         )
     if bundle.topic.topic_id != entry.topic_id:
         raise HandoffSourceError(

@@ -362,11 +362,17 @@ def rank_citations(
     the cap is our policy, not a model error.
     """
 
-    span = max(bundle.max_passages, 1)
+    ranks = [item.rank for item in bundle.passages]
+    lowest, highest = min(ranks), max(ranks)
+    # Selected evidence keeps its original corpus rank, which is unbounded
+    # relative to how many passages were selected. Normalizing by the observed
+    # span keeps every penalty inside [0, _RANK_SPAN), so the position gap
+    # always dominates and scores strictly descend for any rank whatsoever.
+    span = max(highest - lowest, 1)
     citations: list[ReportCitation] = []
     for position, handle in enumerate(candidate.handles[:max_citations]):
         passage = bundle.passage(handle)
-        penalty = _RANK_SPAN * (passage.rank - 1) / span
+        penalty = _RANK_SPAN * (passage.rank - lowest) / span
         score = round(_TOP_SCORE - _POSITION_GAP * position - penalty, 4)
         if not math.isfinite(score):
             raise ReportGenerationError("citation score is not finite")

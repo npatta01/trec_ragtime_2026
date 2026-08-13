@@ -45,6 +45,9 @@ class MemoryArtifactStore:
         self.read_error: BaseException | None = None
         self.write_error: BaseException | None = None
 
+    def read(self, object_key: str) -> bytes | None:
+        return self.objects.get(object_key)
+
     def read_validated(self, object_key: str, decoder: Callable[[bytes], Any]) -> Any | None:
         self.read_validated_calls.append(object_key)
         if self.read_error is not None:
@@ -225,7 +228,7 @@ class FingerprintTests(unittest.TestCase):
             "prompt_version": "report-prompt-v2",
             "output_schema_version": "report-sentences-v2",
             "segmenter_version": "pysbd-0.3.4-en-v1",
-            "citation_policy_version": "citation-rank-v2",
+            "citation_policy_version": "citation-rank-v9",
             "length_packing_version": "whole-sentence-pack-v2",
             "generator_behavior_version": "report-generator-extractive-v1",
         }

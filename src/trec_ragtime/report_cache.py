@@ -56,7 +56,7 @@ OFFICIAL_FORMAT_VERSION = SUBMISSION_FORMAT_VERSION
 
 PROMPT_VERSION = "report-prompt-v1"
 OUTPUT_SCHEMA_VERSION = "report-sentences-v1"
-CITATION_POLICY_VERSION = "citation-rank-v1"
+CITATION_POLICY_VERSION = "citation-rank-v2"
 GENERATOR_BEHAVIOR_VERSION = "report-generator-v1"
 
 RESPONSE_FORMAT_MODES = frozenset({"json_schema", "json_object"})

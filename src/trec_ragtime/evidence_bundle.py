@@ -1095,10 +1095,25 @@ def build_evidence_bundle_from_handoff(
             f"topic {handoff.topic.topic_id} has no citation-ready evidence"
         )
 
-    used = {link.facet_id for passage in passages for link in passage.support}
+    # Only citation-ready support keeps a facet alive. A facet whose links are
+    # all partial_support can never be cited, so offering it as a coverage
+    # target would spend budget on sentences that must then be dropped.
+    used = {
+        link.facet_id
+        for passage in passages
+        for link in passage.support
+        if link.citation_ready
+    }
     kept_facets = tuple(facet for facet in facets if facet.facet_id in used)
     if not kept_facets:
-        raise EvidenceBundleError("no facet retained any supporting evidence")
+        raise EvidenceBundleError("no facet retained any citation-ready evidence")
+    passages = [
+        replace(
+            passage,
+            support=tuple(link for link in passage.support if link.facet_id in used),
+        )
+        for passage in passages
+    ]
 
     source = EvidenceBundleSource(
         run_schema=RETRIEVAL_HANDOFF_SCHEMA,
