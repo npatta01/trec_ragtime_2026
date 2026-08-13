@@ -462,6 +462,7 @@ def run_report_generation(
                     " choose a new --run-id"
                 )
 
+        failures: dict[str, str] = {}
         base_manifest: dict[str, Any] = {
             "schema_version": REPORT_RUN_SCHEMA_VERSION,
             "run_id": run_id,
@@ -490,7 +491,11 @@ def run_report_generation(
                 "topics_missing_evidence": len(missing),
                 "reports": len(records),
                 "cache_hits": sum(1 for item in records if item.get("cache_hit")),
-                "failed": len(available) - len(records),
+                # Mid-run these are distinct: a topic not yet attempted is
+                # pending, not failed. Conflating them made a healthy run look
+                # like a catastrophe to anyone tailing the manifest.
+                "failed": len(failures),
+                "pending": max(0, len(available) - len(records) - len(failures)),
             }
             payload["missing_topics"] = list(missing)
             payload["reports"] = [
@@ -543,7 +548,6 @@ def run_report_generation(
         ]
         reports: dict[str, TopicReport] = {}
         bundle_by_topic = {bundle.topic_id: bundle for bundle in bundles}
-        failures: dict[str, str] = {}
         checkpoints: dict[str, dict[str, Any]] = {}
 
         def ordered(mapping: Mapping[str, Any]) -> list[Any]:
