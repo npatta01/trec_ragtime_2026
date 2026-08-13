@@ -734,6 +734,73 @@ evidence and the recorded inputs, so a facet with no cached retrieval is skipped
 without renumbering the ones around it. `trec_ragtime.nuggets_runner` remains
 the supported Python API for callers that want the stage without the command.
 
+## Generate RAGTIME Reports
+
+`ragtime-report` turns a completed retrieval run into a validated official
+submission. It reads only the topic request, a sealed evidence bundle, and the
+generation configuration; it never retrieves, and it cannot cite a document
+outside the bundle's allowlist.
+
+```bash
+sops decrypt --output .env config/secrets.sops.env
+export OPENROUTER_API_KEY=...   # provider keys are not stored in sops
+
+uv run ragtime-report \
+  --input "$(git rev-parse --git-common-dir)/ragtime-cache/experiments/query-baselines/baseline-c-facet-rrf-alias-2026-08-09" \
+  --team-id YOUR-REGISTERED-TEAM \
+  --run-id my-run-1 \
+  --model some/model \
+  --base-url https://openrouter.ai/api/v1 \
+  --max-evidence 20 --evidence-chars 1200 --concurrency 4
+```
+
+Check the produced file with **both** validators. The official one is what NIST
+runs, and a run that fails it is rejected outright:
+
+```bash
+uv run --no-project --with git+https://github.com/hltcoe/rag-run-validator.git \
+  rag_run_validator <run>/submission.jsonl --topics topics/topics.all.2026.v0625-fix.jsonl
+```
+
+It exits non-zero and prints `[Error]` lines on failure. It checks the JSON
+schema and the required topic set, but it does **not** check that `references`
+equals the union of citation keys — the local validator below does, so run both:
+
+```bash
+uv run ragtime-report-validate <run>/submission.jsonl \
+  --topics topics/topics.all.2026.v0625-fix.jsonl --strict-order
+```
+
+Exit codes are `0` complete, `2` usage or configuration error, `3` incomplete,
+and `4` aggregate validation failure. Start with `--dry-run` plus a few
+`--topic` flags to confirm prompt size and that your provider supports
+`json_schema` structured output before running all 103 topics.
+
+### How generation is bounded
+
+- Prompts show compact `S1..Sn` handles, never canonical document IDs, so an
+  out-of-allowlist citation is unrepresentable rather than merely detected.
+- Every substantive sentence needs at least one citation whose source supports
+  the whole sentence. A multi-sentence candidate is dropped and repaired rather
+  than re-split with inherited citations.
+- Reports are packed to the topic's NFKC character limit by whole sentences
+  only; nothing is ever cut mid-sentence.
+- Conflicting accounts stay as separate attributed sentences.
+
+### Resumability and reproducibility
+
+Each validated report is stored as one artifact at
+`reports/v1/<generator-fingerprint>/<prefix>/<request-hash>.mpk` in the private
+Hugging Face Bucket. The fingerprint covers the model, prompt, output schema,
+sampling parameters and seed, segmenter, citation policy, and packing algorithm;
+the request hash covers the topic and its sealed evidence bundle. `team_id` and
+`run_id` are deliberately outside both, so re-tagging a run reuses every report.
+
+Re-running the same command warm makes zero provider calls and reproduces the
+submission byte for byte. Only complete reports that pass every domain and
+submission check are cached: refusals, truncated completions, malformed output,
+unknown handles, uncited sentences, and over-limit reports are never stored.
+
 ### Retrieval bundle for report generation
 
 After the nugget cache is complete, materialize the retrieval pipeline's final

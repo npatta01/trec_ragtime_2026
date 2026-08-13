@@ -1,0 +1,595 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any
+
+import msgspec
+
+from trec_ragtime.report_cache import GenerationSettings
+from trec_ragtime.report_handoff import (
+    HandoffSourceError,
+    HandoffTopicEntry,
+    load_handoff_manifest,
+    require_handoff_bundle,
+)
+from trec_ragtime.report_runner import run_report_generation
+from trec_ragtime.report_submission import validate_submission_file
+from trec_ragtime.retrieval_handoff import handoff_bundle_digest
+from trec_ragtime.retrieval_handoff_cache import (
+    HandoffEnvelope,
+    HandoffFingerprint,
+    handoff_object_key,
+    request_for_bundle,
+)
+from tests.test_evidence_handoff import described_handoff, handoff
+from tests.test_report_cache import MemoryArtifactStore
+from tests.test_report_generation import completion, draft, line
+
+TEAM_ID = "PLACEHOLDER-TEAM"
+RUN_ID = "handoff-run-1"
+
+# The strict reader recovers the request digest from the object key and refuses
+# any key outside the root of the fingerprint it was handed, so fixtures must
+# publish under the real fingerprint rather than an invented one.
+FINGERPRINT = HandoffFingerprint()
+CATALOG = b"\x09" * 32
+PRODUCER = b"\x07" * 32
+# An arbitrary but well-formed request digest, for keys that are never stored.
+RQ = b"\x22" * 32
+
+
+def store_bundle(
+    store: MemoryArtifactStore,
+    bundle: Any,
+    *,
+    topic_catalog_digest: bytes = CATALOG,
+    producer_identity_digest: bytes = PRODUCER,
+) -> str:
+    """Publish one handoff exactly where the strict reader will look for it.
+
+    The reader rebuilds the request from the stored bundle plus the catalog and
+    producer digests its caller supplies, so the key has to be derived from that
+    same request rather than chosen freely.
+    """
+
+    request = request_for_bundle(
+        bundle,
+        topic_catalog_digest=topic_catalog_digest,
+        producer_identity_digest=producer_identity_digest,
+    )
+    envelope = HandoffEnvelope(
+        fingerprint_digest=FINGERPRINT.digest,
+        request_digest=request.digest,
+        bundle_digest=handoff_bundle_digest(bundle),
+        bundle=bundle,
+    )
+    key = handoff_object_key(FINGERPRINT.digest, request.digest)
+    store.objects[key] = msgspec.msgpack.encode(envelope)
+    return key
+
+
+def unstored_key(request_digest: bytes = RQ) -> str:
+    """A canonical key under the real fingerprint root, with nothing behind it."""
+
+    return handoff_object_key(FINGERPRINT.digest, request_digest)
+
+
+def entry_for(key: str, topic_id: str = "2000") -> HandoffTopicEntry:
+    return HandoffTopicEntry(topic_id, "written", key, PRODUCER)
+
+
+def manifest_topic(
+    topic_id: str, status: str, object_key: str | None
+) -> dict[str, Any]:
+    return {
+        "topic_id": topic_id,
+        "status": status,
+        "object_key": object_key,
+        "producer_identity_digest": PRODUCER.hex(),
+    }
+
+
+class ReaderTests(unittest.TestCase):
+    """Failure reporting around the upstream strict reader.
+
+    Envelope decoding, canonical encoding, and identity checks now belong to
+    RetrievalHandoffArtifactCache.get_by_object_key and are tested there. What
+    remains here is this module's own contract: a caller must be able to tell an
+    absent artifact from an unreadable one, and neither may pass silently. The
+    successful round trip is covered end to end by GenerationFromHandoffTests.
+    """
+
+    def setUp(self) -> None:
+        self.store = MemoryArtifactStore()
+
+    def test_absent_artifact_is_reported_as_absent(self) -> None:
+        entry = entry_for(unstored_key())
+        with self.assertRaises(HandoffSourceError) as caught:
+            require_handoff_bundle(self.store, entry, topic_catalog_digest=CATALOG)
+        self.assertIn("absent", str(caught.exception).lower())
+
+    def test_garbage_payload_is_reported_not_swallowed(self) -> None:
+        key = unstored_key()
+        self.store.objects[key] = b"\x00\x01\x02"
+        with self.assertRaises(HandoffSourceError) as caught:
+            require_handoff_bundle(self.store, entry_for(key), topic_catalog_digest=CATALOG)
+        self.assertNotIn("absent", str(caught.exception).lower())
+
+    def test_tampered_bundle_digest_is_rejected(self) -> None:
+        # Everything else about this envelope resolves, so the digest is the
+        # single thing standing between the payload and acceptance.
+        bundle = handoff()
+        key = unstored_key()
+        envelope = HandoffEnvelope(
+            fingerprint_digest=FINGERPRINT.digest,
+            request_digest=RQ,
+            bundle_digest=b"\x00" * 32,
+            bundle=bundle,
+        )
+        self.store.objects[key] = msgspec.msgpack.encode(envelope)
+        with self.assertRaises(HandoffSourceError):
+            require_handoff_bundle(self.store, entry_for(key), topic_catalog_digest=CATALOG)
+
+    def test_a_failed_entry_is_refused_before_any_read(self) -> None:
+        entry = HandoffTopicEntry("2000", "failed", None, PRODUCER)
+        with self.assertRaises(HandoffSourceError):
+            require_handoff_bundle(self.store, entry, topic_catalog_digest=CATALOG)
+        self.assertEqual(self.store.read_validated_calls, [])
+
+    def test_an_entry_without_a_producer_digest_fails_closed(self) -> None:
+        entry = HandoffTopicEntry("2000", "written", unstored_key(), None)
+        with self.assertRaises(HandoffSourceError) as caught:
+            require_handoff_bundle(self.store, entry, topic_catalog_digest=CATALOG)
+        self.assertIn("producer identity", str(caught.exception).lower())
+
+
+class ManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+
+    def write(self, payload: dict[str, Any]) -> Path:
+        path = self.root / "handoff-manifest.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def base(self, topics: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "fingerprint": "a" * 64,
+            "topic_catalog_digest": "b" * 64,
+            "complete": True,
+            "topics": topics,
+        }
+
+    def test_manifest_round_trip(self) -> None:
+        path = self.write(
+            self.base([{"topic_id": "2000", "status": "written", "object_key": "k1"}])
+        )
+        manifest = load_handoff_manifest(path)
+        self.assertEqual(manifest.available_topic_ids, ("2000",))
+        self.assertEqual(manifest.entry("2000").object_key, "k1")
+        self.assertIsNone(manifest.entry("9999"))
+
+    def test_failed_topic_is_not_available(self) -> None:
+        path = self.write(self.base([manifest_topic("2000", "failed", None)]))
+        manifest = load_handoff_manifest(path)
+        self.assertEqual(manifest.available_topic_ids, ())
+        with self.assertRaises(HandoffSourceError):
+            require_handoff_bundle(
+                MemoryArtifactStore(), manifest.entry("2000"), topic_catalog_digest=CATALOG
+            )
+
+    def test_unsupported_schema_is_rejected(self) -> None:
+        payload = self.base([{"topic_id": "2000", "status": "written", "object_key": "k"}])
+        payload["schema_version"] = 9
+        with self.assertRaises(HandoffSourceError):
+            load_handoff_manifest(self.write(payload))
+
+    def test_duplicate_topic_is_rejected(self) -> None:
+        rows = [
+            {"topic_id": "2000", "status": "written", "object_key": "k1"},
+            {"topic_id": "2000", "status": "written", "object_key": "k2"},
+        ]
+        with self.assertRaises(HandoffSourceError):
+            load_handoff_manifest(self.write(self.base(rows)))
+
+    def test_missing_artifact_fails_closed(self) -> None:
+        # A well-formed key with nothing behind it, so the entry is complete and
+        # absence is the only thing left for the reader to report.
+        path = self.write(
+            self.base([manifest_topic("2000", "written", unstored_key())])
+        )
+        manifest = load_handoff_manifest(path)
+        with self.assertRaises(HandoffSourceError):
+            require_handoff_bundle(
+                MemoryArtifactStore(), manifest.entry("2000"), topic_catalog_digest=CATALOG
+            )
+
+
+class TripwireStore(MemoryArtifactStore):
+    """Fails loudly if anything but the handoff and report prefixes is read."""
+
+    def read_validated(self, object_key: str, decoder: Any) -> Any:
+        self._guard(object_key)
+        return super().read_validated(object_key, decoder)
+
+    def read_validated_strict(self, object_key: str, decoder: Any) -> Any:
+        # Handoff reads take the strict path, so the tripwire has to cover it
+        # too or it would stop guarding the artifact this suite is about.
+        self._guard(object_key)
+        return super().read_validated_strict(object_key, decoder)
+
+    @staticmethod
+    def _guard(object_key: str) -> None:
+        if not object_key.startswith(("retrieval-handoff/", "reports/", "api-responses/")):
+            raise AssertionError(f"generation opened a forbidden artifact: {object_key}")
+
+
+class GenerationFromHandoffTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        self.store = TripwireStore()
+
+    def write_topics(self, limit: int = 5000) -> Path:
+        path = self.root / "topics.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "topic_id": "2000",
+                    "collection_id": "ragtime/2/all",
+                    "title": "Anti-vaping legislation",
+                    "problem_statement": "A statement about vaping law.",
+                    "background": "A legislative aide needs this.",
+                    "limit": limit,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def write_manifest(self, key: str) -> Path:
+        path = self.root / "handoff-manifest.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "fingerprint": "a" * 64,
+                    # The reader rebuilds the stored request from this digest,
+                    # so it has to be the one the artifact was published under.
+                    "topic_catalog_digest": CATALOG.hex(),
+                    "complete": True,
+                    "topics": [manifest_topic("2000", "written", key)],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def generate(self, responses: Any, *, bundle: Any = None, **overrides: Any):
+        key = store_bundle(self.store, bundle or handoff())
+
+        class Provider:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def create(self, *, refresh: bool = False, **request: Any) -> Any:
+                self.requests.append(request)
+                return responses
+
+        provider = Provider()
+        settings = GenerationSettings(
+            base_url="https://api.example.test/v1",
+            model="test-model",
+            temperature=0.0,
+            top_p=None,
+            max_output_tokens=4000,
+            seed=7,
+            max_repairs=0,
+            max_citations=3,
+            max_passages=30,
+            evidence_chars=0,
+            budget_ratio=0.9,
+        )
+        result = run_report_generation(
+            handoff_manifest=self.write_manifest(key),
+            topics_path=self.write_topics(),
+            output_root=self.root / "runs",
+            team_id=TEAM_ID,
+            run_id=RUN_ID,
+            run_desc="handoff integration test",
+            settings=settings,
+            completions=[provider],
+            store=self.store,
+            clock=lambda: 1_700_000_000.0,
+            **overrides,
+        )
+        return result, provider
+
+    def test_generation_consumes_only_the_handoff(self) -> None:
+        payload = completion(
+            draft(
+                line("The ban took effect in 2019.", ["e001"]),
+                line("Youth vaping prevalence fell.", ["e002"], ["F2"]),
+            )
+        )
+        result, _ = self.generate(payload)
+        self.assertEqual(result.status, "complete")
+        report = validate_submission_file(
+            result.run_dir / "submission.jsonl",
+            topics={"2000": 5000},
+            team_id=TEAM_ID,
+            run_id=RUN_ID,
+        )
+        self.assertTrue(report.ok, report.violations)
+
+    def test_citations_resolve_to_canonical_document_ids(self) -> None:
+        payload = completion(draft(line("The ban took effect in 2019.", ["e001"])))
+        result, _ = self.generate(payload)
+        record = json.loads((result.run_dir / "submission.jsonl").read_text().strip())
+        self.assertEqual(record["references"], ["doc-1"])
+        self.assertEqual(list(record["responses"][0]["citations"]), ["doc-1"])
+
+    def test_prompt_offers_upstream_aliases_and_hides_document_ids(self) -> None:
+        payload = completion(draft(line("The ban took effect in 2019.", ["e001"])))
+        _, provider = self.generate(payload)
+        body = "".join(item["content"] for item in provider.requests[0]["messages"])
+        self.assertIn("[e001]", body)
+        self.assertNotIn("doc-1", body)
+
+    def test_partial_support_evidence_is_not_offered_for_citation(self) -> None:
+        partial = described_handoff(
+            (
+                "The ban took effect in 2019.",
+                "okay",
+                [("e001", "support"), ("e002", "partial_support")],
+            )
+        )
+        payload = completion(draft(line("The ban took effect in 2019.", ["e001"])))
+        _, provider = self.generate(payload, bundle=partial)
+        schema = provider.requests[0]["response_format"]["json_schema"]["schema"]
+        enum = schema["properties"]["sentences"]["items"]["properties"]["evidence"]["items"]["enum"]
+        self.assertEqual(enum, ["e001"])
+
+    def test_citing_partial_support_evidence_is_refused(self) -> None:
+        partial = described_handoff(
+            (
+                "The ban took effect in 2019.",
+                "okay",
+                [("e001", "support"), ("e002", "partial_support")],
+            )
+        )
+        payload = completion(draft(line("A claim from context only.", ["e002"])))
+        result, _ = self.generate(payload, bundle=partial)
+        self.assertEqual(result.status, "incomplete")
+        self.assertEqual(result.failed, 1)
+        self.assertFalse((result.run_dir / "submission.jsonl").exists())
+
+    def test_manifest_records_the_handoff_provenance(self) -> None:
+        payload = completion(draft(line("The ban took effect in 2019.", ["e001"])))
+        result, _ = self.generate(payload)
+        manifest = json.loads((result.run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["input"]["run_schema"], "retrieval_handoff_v1")
+        self.assertEqual(manifest["input"]["handoff_fingerprint"], "a" * 64)
+
+    def test_warm_rerun_makes_no_provider_call(self) -> None:
+        payload = completion(draft(line("The ban took effect in 2019.", ["e001"])))
+        self.generate(payload)
+
+        class Tripwire:
+            def create(self, *, refresh: bool = False, **request: Any) -> Any:
+                raise AssertionError("provider called")
+
+        key = store_bundle(self.store, handoff())
+        result = run_report_generation(
+            handoff_manifest=self.write_manifest(key),
+            topics_path=self.write_topics(),
+            output_root=self.root / "runs",
+            team_id=TEAM_ID,
+            run_id=RUN_ID,
+            run_desc="handoff integration test",
+            settings=GenerationSettings(
+                base_url="https://api.example.test/v1",
+                model="test-model",
+                temperature=0.0,
+                top_p=None,
+                max_output_tokens=4000,
+                seed=7,
+                max_repairs=0,
+                max_citations=3,
+                max_passages=30,
+                evidence_chars=0,
+                budget_ratio=0.9,
+            ),
+            completions=[Tripwire()],
+            store=self.store,
+            clock=lambda: 1_700_000_000.0,
+        )
+        self.assertEqual(result.cached, 1)
+
+    def test_topic_absent_from_the_handoff_is_reported(self) -> None:
+        payload = completion(draft(line("The ban took effect in 2019.", ["e001"])))
+        key = store_bundle(self.store, handoff())
+        manifest_path = self.root / "handoff-manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "fingerprint": "a" * 64,
+                    "topic_catalog_digest": CATALOG.hex(),
+                    "complete": False,
+                    "topics": [
+                        manifest_topic("2000", "written", key),
+                        manifest_topic("2001", "failed", None),
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        topics = self.root / "topics.jsonl"
+        rows = []
+        for topic_id in ("2000", "2001"):
+            rows.append(
+                json.dumps(
+                    {
+                        "topic_id": topic_id,
+                        "collection_id": "ragtime/2/all",
+                        "title": "Anti-vaping legislation",
+                        "problem_statement": "A statement about vaping law.",
+                        "background": "A legislative aide needs this.",
+                        "limit": 5000,
+                    }
+                )
+            )
+        topics.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+        class Provider:
+            def create(self, *, refresh: bool = False, **request: Any) -> Any:
+                return payload
+
+        result = run_report_generation(
+            handoff_manifest=manifest_path,
+            topics_path=topics,
+            output_root=self.root / "runs2",
+            team_id=TEAM_ID,
+            run_id=RUN_ID,
+            run_desc="handoff integration test",
+            settings=GenerationSettings(
+                base_url="https://api.example.test/v1",
+                model="test-model",
+                temperature=0.0,
+                top_p=None,
+                max_output_tokens=4000,
+                seed=7,
+                max_repairs=0,
+                max_citations=3,
+                max_passages=30,
+                evidence_chars=0,
+                budget_ratio=0.9,
+            ),
+            completions=[Provider()],
+            store=self.store,
+            clock=lambda: 1_700_000_000.0,
+        )
+        self.assertIn("2001", result.missing)
+        self.assertEqual(result.status, "incomplete")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class MergeManifestTests(unittest.TestCase):
+    """A retry run emits its own manifest, so consumption must span several."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+
+    def write(self, name: str, topics: list[dict[str, Any]], **overrides: Any) -> Path:
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "fingerprint": "a" * 64,
+            "topic_catalog_digest": "b" * 64,
+            "complete": True,
+            "topics": topics,
+        }
+        payload.update(overrides)
+        path = self.root / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_later_manifest_supplies_a_topic_the_first_failed(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json",
+            [
+                {"topic_id": "2000", "status": "written", "object_key": "k0"},
+                {"topic_id": "2040", "status": "failed", "object_key": None},
+            ],
+            complete=False,
+        )
+        second = self.write(
+            "retry.json", [{"topic_id": "2040", "status": "written", "object_key": "k40"}]
+        )
+        merged = merge_handoff_manifests([first, second])
+        self.assertEqual(sorted(merged.available_topic_ids), ["2000", "2040"])
+        self.assertEqual(merged.entry("2040").object_key, "k40")
+        self.assertTrue(merged.complete)
+
+    def test_a_written_entry_is_never_replaced_by_a_failure(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k0"}]
+        )
+        second = self.write(
+            "retry.json", [{"topic_id": "2000", "status": "failed", "object_key": None}]
+        )
+        merged = merge_handoff_manifests([first, second])
+        self.assertEqual(merged.entry("2000").object_key, "k0")
+
+    def test_later_written_entry_overrides_an_earlier_one(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "old"}]
+        )
+        second = self.write(
+            "retry.json", [{"topic_id": "2000", "status": "written", "object_key": "new"}]
+        )
+        self.assertEqual(
+            merge_handoff_manifests([first, second]).entry("2000").object_key, "new"
+        )
+
+    def test_a_fingerprint_mismatch_fails_closed(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k"}]
+        )
+        second = self.write(
+            "other.json",
+            [{"topic_id": "2001", "status": "written", "object_key": "k2"}],
+            fingerprint="c" * 64,
+        )
+        with self.assertRaises(HandoffSourceError):
+            merge_handoff_manifests([first, second])
+
+    def test_a_topic_catalog_mismatch_fails_closed(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k"}]
+        )
+        second = self.write(
+            "other.json",
+            [{"topic_id": "2001", "status": "written", "object_key": "k2"}],
+            topic_catalog_digest="d" * 64,
+        )
+        with self.assertRaises(HandoffSourceError):
+            merge_handoff_manifests([first, second])
+
+    def test_a_single_manifest_merges_to_itself(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        path = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k"}]
+        )
+        merged = merge_handoff_manifests([path])
+        self.assertEqual(merged.available_topic_ids, ("2000",))
+
+    def test_no_manifest_is_rejected(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        with self.assertRaises(HandoffSourceError):
+            merge_handoff_manifests([])
