@@ -308,6 +308,23 @@ class RunTests(RunnerTestCase):
             (parallel.run_dir / "submission.jsonl").read_bytes(),
         )
 
+    def test_every_topic_runs_when_topics_outnumber_workers(self) -> None:
+        # The pool must refill a freed worker without dropping queued topics.
+        # Pulling from the task iterator before checking for a free slot
+        # silently discarded a topic whenever the pool was saturated.
+        ids = tuple(str(2000 + n) for n in range(9))
+        result = self.generate(
+            ids,
+            concurrency=2,
+            completions=[EndlessCompletions(good_draft), EndlessCompletions(good_draft)],
+        )
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.generated + result.cached, len(ids))
+        lines = (result.run_dir / "submission.jsonl").read_text().strip().split("\n")
+        self.assertEqual(
+            [json.loads(line)["metadata"]["topic_id"] for line in lines], list(ids)
+        )
+
     def test_too_few_completions_for_the_concurrency_is_rejected(self) -> None:
         with self.assertRaises(ReportRunError):
             self.generate(concurrency=2, completions=[EndlessCompletions(good_draft)])

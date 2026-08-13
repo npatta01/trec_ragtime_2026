@@ -73,7 +73,7 @@ REPORT_RUN_SCHEMA_VERSION = "report_generation_v1"
 DEFAULT_TOPICS_PATH = "topics/topics.all.2026.v0625-fix.jsonl"
 DEFAULT_API_KEY_ENVS = ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "LITELLM_PROXY_API_KEY")
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-ALLOWED_CONCURRENCY = (1, 2, 4, 8)
+ALLOWED_CONCURRENCY = (1, 2, 4, 8, 12, 16)
 
 
 class ReportRunError(RuntimeError):
@@ -558,12 +558,29 @@ def run_report_generation(
             max_workers=concurrency, thread_name_prefix="ragtime-report"
         )
         try:
+            # Free-running pool: refill a worker the moment it frees rather than
+            # draining a whole wave first. query_baselines schedules in waves to
+            # bound concurrent load on the organizer endpoint; generation has no
+            # such shared capacity to protect, and wave-locking left slots idle
+            # whenever one topic ran long. Output order is unaffected -- reports
+            # and the submission are emitted in topic order, not completion
+            # order -- so this changes throughput only.
             task_iterator = iter(tasks)
-            while True:
-                wave = list(islice(task_iterator, concurrency))
-                if not wave:
-                    break
-                futures: dict[Future[_TopicOutcome], _TopicTask] = {
+            free_workers = list(zip(workers, probes))[:concurrency]
+            futures: dict[Future[_TopicOutcome], tuple[_TopicTask, Any]] = {}
+
+            def submit_next() -> bool:
+                # Check for a free slot BEFORE pulling from the iterator: taking
+                # the task first would consume and silently drop it whenever the
+                # pool is saturated.
+                if not free_workers:
+                    return False
+                task = next(task_iterator, None)
+                if task is None:
+                    return False
+                slot = free_workers.pop()
+                worker, probe = slot
+                futures[
                     executor.submit(
                         _run_topic,
                         task,
@@ -572,30 +589,33 @@ def run_report_generation(
                         clock=clock,
                         refresh=refresh,
                         probe=probe,
-                    ): task
-                    for (worker, probe), task in zip(
-                        list(zip(workers, probes))[: len(wave)], wave, strict=True
                     )
-                }
-                while futures:
-                    done, _pending = wait(futures, return_when=FIRST_COMPLETED)
-                    for future in sorted(done, key=lambda item: futures[item].ordinal):
-                        task = futures.pop(future)
-                        outcome = future.result()
-                        if outcome.report is None:
-                            failures[outcome.topic_id] = outcome.error or "unknown error"
-                        else:
-                            reports[outcome.topic_id] = outcome.report
-                            checkpoints[outcome.topic_id] = _checkpoint(outcome.report)
-                        _write_jsonl(run_dir / "reports.jsonl", ordered(checkpoints))
-                        write_manifest("running", ordered(checkpoints))
-                        if progress is not None:
-                            progress(
-                                f"topics={len(checkpoints)}/{len(tasks)} "
-                                f"topic={outcome.topic_id} "
-                                f"status={'error' if outcome.report is None else 'success'} "
-                                f"failed={len(failures)}"
-                            )
+                ] = (task, slot)
+                return True
+
+            while submit_next():
+                pass
+            while futures:
+                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda item: futures[item][0].ordinal):
+                    _task, slot = futures.pop(future)
+                    outcome = future.result()
+                    free_workers.append(slot)
+                    if outcome.report is None:
+                        failures[outcome.topic_id] = outcome.error or "unknown error"
+                    else:
+                        reports[outcome.topic_id] = outcome.report
+                        checkpoints[outcome.topic_id] = _checkpoint(outcome.report)
+                    _write_jsonl(run_dir / "reports.jsonl", ordered(checkpoints))
+                    write_manifest("running", ordered(checkpoints))
+                    if progress is not None:
+                        progress(
+                            f"topics={len(checkpoints)}/{len(tasks)} "
+                            f"topic={outcome.topic_id} "
+                            f"status={'error' if outcome.report is None else 'success'} "
+                            f"failed={len(failures)}"
+                        )
+                    submit_next()
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
