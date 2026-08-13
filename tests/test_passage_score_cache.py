@@ -18,6 +18,7 @@ from trec_ragtime.artifact_store import (
     ArtifactValidationError,
 )
 from trec_ragtime.passage_score_cache import (
+    CacheOnlyPassageScorer,
     CachedPassageScorer,
     PassageScoreArtifactValidationError,
     PassageScoreCache,
@@ -286,6 +287,14 @@ def _legacy_v2_fingerprint(config: LocalCrossEncoderConfig) -> str:
 
 
 class PassageScoreCacheTests(unittest.TestCase):
+    def test_cache_only_scorer_has_identity_and_refuses_compute(self) -> None:
+        scorer = CacheOnlyPassageScorer("model-v1")
+        self.assertEqual(scorer.fingerprint, "model-v1")
+        with self.assertRaisesRegex(
+            PassageScoreArtifactValidationError, "cached passage scores required"
+        ):
+            scorer.score("secret query", ())
+
     def test_key_and_map_bytes_are_stable_across_subprocesses(self) -> None:
         code = """
 from trec_ragtime.passage_score_cache import encode_score_map, score_object_key

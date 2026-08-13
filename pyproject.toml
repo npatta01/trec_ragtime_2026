@@ -48,6 +48,7 @@ ragtime-retrieval-import = "trec_ragtime.retrieval_import:main"
 ragtime-nuggets = "trec_ragtime.nuggets_cli:main"
 ragtime-report-validate = "trec_ragtime.report_submission:main"
 ragtime-report = "trec_ragtime.report_runner:main"
+ragtime-retrieval-handoff = "trec_ragtime.retrieval_handoff_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12"]

@@ -14,6 +14,7 @@ from trec_ragtime.nuggetizer_adapter import (
     NuggetizerBackend,
     NuggetizerConfig,
     NuggetizerError,
+    backend_fingerprint,
     build,
     package_identity,
 )
@@ -105,6 +106,10 @@ class PackageIdentityTestCase(unittest.TestCase):
         self.assertTrue(identity["version"])
         # A published release carries no VCS metadata; a Git pin would.
         self.assertEqual(set(identity) - {"commit"}, {"name", "version"})
+
+    def test_backend_fingerprint_needs_no_provider_client(self) -> None:
+        identity = backend_fingerprint(CONFIG)
+        self.assertEqual(identity, NuggetizerBackend(CONFIG, nuggetizer=object()).fingerprint)
 
 
 class ProviderResolutionTestCase(ProviderKeyTestCase):

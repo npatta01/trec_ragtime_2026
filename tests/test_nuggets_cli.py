@@ -183,6 +183,7 @@ class PrepareTopicTestCase(unittest.TestCase):
     def test_carries_the_retrieval_artifact_reference(self) -> None:
         _, work = self._prepare({"grain exports": "a"})
         self.assertEqual(work.inputs[0].object_key, "retrieval/v1/aa/bb/a.mpk")
+        self.assertEqual(len(work.retrievals), 1)
         self.assertEqual(work.topic_id, "2000")
         self.assertIn("report_text", work.passage_source_fingerprint)
 

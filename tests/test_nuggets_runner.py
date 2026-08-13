@@ -23,6 +23,7 @@ from trec_ragtime.nuggets_runner import (
     TopicWork,
     build_fingerprint,
     evidence_from_reranking,
+    prepare_nugget_request,
     run_topic,
     run_topics,
     write_manifest,
@@ -99,6 +100,12 @@ class RunTopicTestCase(unittest.TestCase):
         }
         options.update(changes)
         return run_topic(work(), **options)
+
+    def test_request_can_be_prepared_without_a_backend(self) -> None:
+        rows, request = prepare_nugget_request(work(), FINGERPRINT)
+        self.assertEqual(tuple(row.evidence.alias for row in rows), ("e001", "e002"))
+        self.assertEqual(request.topic_id, "2000")
+        self.assertEqual(request.inputs, work().inputs)
 
     def test_writes_and_then_verifies_the_durable_object(self) -> None:
         outcome = self._run()

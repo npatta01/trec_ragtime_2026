@@ -163,6 +163,12 @@ from .retriever import (
     DocumentCorpus,
     RagtimeRetriever,
 )
+from .retrieval_handoff import RetrievalHandoffBundle
+from .retrieval_handoff_cache import (
+    HandoffFingerprint,
+    HandoffRequest,
+    RetrievalHandoffArtifactCache,
+)
 
 __all__ = [
     "Boundary",
@@ -218,6 +224,8 @@ __all__ = [
     "generate_topic_report",
     "GenerationSettings",
     "generator_fingerprint",
+    "HandoffFingerprint",
+    "HandoffRequest",
     "HuggingFaceApiError",
     "HuggingFaceConfigurationError",
     "HuggingFaceCorpus",
@@ -278,6 +286,8 @@ __all__ = [
     "RerankedDocument",
     "RerankingError",
     "RerankingResult",
+    "RetrievalHandoffArtifactCache",
+    "RetrievalHandoffBundle",
     "RetrievalResult",
     "RetrievedDocument",
     "run_topic_nuggets",

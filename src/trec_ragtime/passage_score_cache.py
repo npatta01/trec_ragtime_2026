@@ -382,8 +382,32 @@ class CachedPassageScorer:
         return self._cache.score(query, passages)
 
 
+class CacheOnlyPassageScorer:
+    """Identity-only scorer that fails rather than computing a cache miss."""
+
+    __slots__ = ("_fingerprint",)
+
+    def __init__(self, fingerprint: str) -> None:
+        self._fingerprint = _non_blank(fingerprint, "scorer_fingerprint")
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    def score(
+        self,
+        query: str,
+        passages: Sequence[Passage],
+    ) -> Mapping[bytes, float]:
+        del query
+        raise PassageScoreArtifactValidationError(
+            f"cached passage scores required for {len(passages)} passages"
+        )
+
+
 __all__ = [
     "CACHE_SCHEMA_VERSION",
+    "CacheOnlyPassageScorer",
     "CachedPassageScorer",
     "PassageScoreArtifactValidationError",
     "PassageScoreCache",
