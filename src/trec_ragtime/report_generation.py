@@ -121,21 +121,78 @@ class SentenceCandidate:
     substantive: bool
 
 
+# A vital nugget is worth more report space than an okay one. Two is a
+# deliberate, mild preference: it shifts allocation without letting a single
+# vital facet with thin evidence crowd out several well-attested okay ones.
+_IMPORTANCE_WEIGHT = {"vital": 2, "okay": 1}
+
+
+def facet_weights(bundle: EvidenceBundle) -> tuple[int, ...]:
+    """Weight each facet by how much citable evidence backs it, times importance.
+
+    This is the one decision a separate planning call would have made — spend
+    the character budget where the evidence actually is — computed as a pure
+    function of the sealed bundle. No provider call, no hidden input, and the
+    same bundle always yields the same allocation.
+
+    Only citation-ready passages count. Context-only evidence cannot be cited,
+    so budget spent on the facet it partially attests would produce sentences
+    that must then be dropped.
+    """
+
+    counts: dict[str, int] = {facet.facet_id: 0 for facet in bundle.facets}
+    for passage in bundle.passages:
+        if not passage.citable:
+            continue
+        for facet_id in passage.facet_ids:
+            if facet_id in counts:
+                counts[facet_id] += 1
+    return tuple(
+        max(counts[facet.facet_id], 1) * _IMPORTANCE_WEIGHT.get(facet.importance, 1)
+        for facet in bundle.facets
+    )
+
+
 def allocate_facet_budget(
     bundle: EvidenceBundle, *, limit: int, budget_ratio: float
 ) -> tuple[FacetBudget, ...]:
-    """Split the character budget evenly across facets, remainder first."""
+    """Apportion the character budget across facets by evidence and importance.
+
+    Every facet is guaranteed at least one character, the allocation sums
+    exactly to the budget, and the remainder is distributed by largest
+    fractional share with ties broken in bundle facet order. The arithmetic is
+    integer-only so the result is byte-stable across machines.
+    """
 
     facets = bundle.facets
     if not facets:
         raise ReportGenerationError("bundle has no facets to budget")
-    total = max(len(facets), int(limit * budget_ratio))
-    base, remainder = divmod(total, len(facets))
+    count = len(facets)
+    total = max(count, int(limit * budget_ratio))
+
+    weights = facet_weights(bundle)
+    total_weight = sum(weights)
+    # Reserve one character per facet first so none can be starved to zero,
+    # then apportion what is left.
+    remaining = total - count
+
+    shares = [0] * count
+    fractions: list[tuple[int, int]] = []
+    if remaining > 0 and total_weight > 0:
+        for position, weight in enumerate(weights):
+            scaled = remaining * weight
+            shares[position] = scaled // total_weight
+            fractions.append((scaled % total_weight, position))
+        leftover = remaining - sum(shares)
+        # Largest fractional remainder wins; earlier facets break ties.
+        for _, position in sorted(fractions, key=lambda item: (-item[0], item[1]))[:leftover]:
+            shares[position] += 1
+
     return tuple(
         FacetBudget(
             facet_id=facet.facet_id,
             text=facet.text,
-            characters=base + (1 if position < remainder else 0),
+            characters=1 + shares[position],
         )
         for position, facet in enumerate(facets)
     )
@@ -522,6 +579,7 @@ def generate_topic_report(
     )
 
     started = clock()
+    spend: dict[str, int] = {}
     best: tuple[list[SentenceCandidate], list[DroppedSentence], Any] | None = None
     repair_reasons: list[str] = []
     attempts = 0
@@ -538,6 +596,9 @@ def generate_topic_report(
         )
         try:
             response = completions.create(refresh=refresh and attempt == 1, **payload)
+            # Charged whether or not this attempt is the one we keep.
+            for key, value in (_usage_mapping(response) or {}).items():
+                spend[key] = spend.get(key, 0) + value
             candidates = parse_sentence_candidates(response, bundle)
         except MalformedModelOutputError as error:
             last_error = error
@@ -608,7 +669,7 @@ def generate_topic_report(
             model_id=getattr(response, "model", ""),
             repair_attempts=max(0, attempts - 1),
             latency_seconds=max(0.0, float(finished) - float(started)),
-            usage=_usage_mapping(response),
+            usage=dict(spend) or None,
             dropped=tuple(dropped),
             llm_cache_hit=bool(llm_cache_probe()) if llm_cache_probe else False,
         ),
@@ -647,6 +708,7 @@ __all__ = [
     "ReportGenerationError",
     "SentenceCandidate",
     "allocate_facet_budget",
+    "facet_weights",
     "build_messages",
     "build_response_format",
     "generate_topic_report",

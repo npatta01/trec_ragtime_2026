@@ -58,6 +58,7 @@ PROMPT_VERSION = "report-prompt-v1"
 OUTPUT_SCHEMA_VERSION = "report-sentences-v1"
 CITATION_POLICY_VERSION = "citation-rank-v2"
 GENERATOR_BEHAVIOR_VERSION = "report-generator-v1"
+BUDGET_POLICY_VERSION = "facet-budget-v1"
 
 RESPONSE_FORMAT_MODES = frozenset({"json_schema", "json_object"})
 
@@ -133,6 +134,7 @@ class GenerationSettings:
     output_schema_version: str = OUTPUT_SCHEMA_VERSION
     segmenter_version: str = SENTENCE_SEGMENTER_VERSION
     citation_policy_version: str = CITATION_POLICY_VERSION
+    budget_policy_version: str = BUDGET_POLICY_VERSION
     length_packing_version: str = LENGTH_PACKING_VERSION
     generator_behavior_version: str = GENERATOR_BEHAVIOR_VERSION
 
@@ -171,6 +173,7 @@ class GenerationSettings:
             (self.output_schema_version, "output_schema_version"),
             (self.segmenter_version, "segmenter_version"),
             (self.citation_policy_version, "citation_policy_version"),
+            (self.budget_policy_version, "budget_policy_version"),
             (self.length_packing_version, "length_packing_version"),
             (self.generator_behavior_version, "generator_behavior_version"),
         ):
@@ -209,6 +212,7 @@ def generator_fingerprint(settings: GenerationSettings) -> bytes:
         "budget_ratio": float(settings.budget_ratio),
         "segmenter_version": settings.segmenter_version,
         "citation_policy_version": settings.citation_policy_version,
+        "budget_policy_version": settings.budget_policy_version,
         "length_packing_version": settings.length_packing_version,
         "generator_behavior_version": settings.generator_behavior_version,
     }

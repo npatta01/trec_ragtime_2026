@@ -176,6 +176,7 @@ def _settings_record(settings: GenerationSettings) -> dict[str, Any]:
         "output_schema_version": settings.output_schema_version,
         "segmenter_version": settings.segmenter_version,
         "citation_policy_version": settings.citation_policy_version,
+        "budget_policy_version": settings.budget_policy_version,
         "length_packing_version": settings.length_packing_version,
         "generator_behavior_version": settings.generator_behavior_version,
     }
@@ -264,8 +265,13 @@ def _run_topic(
             refresh=refresh,
             llm_cache_probe=probe,
         )
-    except (ReportGenerationError, ArtifactStoreError, ValueError) as error:
-        return _TopicOutcome(task.ordinal, task.topic.topic_id, None, f"{type(error).__name__}: {error}")
+    except Exception as error:
+        # Deliberately broad: one topic's failure, including a provider error
+        # this code has never seen, must not abort the other 102. The type is
+        # recorded so failures.json still says what actually happened.
+        return _TopicOutcome(
+            task.ordinal, task.topic.topic_id, None, f"{type(error).__name__}: {error}"
+        )
     return _TopicOutcome(task.ordinal, task.topic.topic_id, report, None)
 
 
@@ -682,7 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-evidence", type=int, default=30, help="Passages per topic")
     parser.add_argument("--evidence-chars", type=int, default=0, help="0 keeps full text")
     parser.add_argument("--max-citations", type=int, default=3)
-    parser.add_argument("--budget-ratio", type=float, default=0.9)
+    parser.add_argument("--budget-ratio", type=float, default=0.98)
     parser.add_argument("--max-repairs", type=int, default=1)
     parser.add_argument(
         "--structured-output", choices=("json_schema", "json_object"), default="json_schema"

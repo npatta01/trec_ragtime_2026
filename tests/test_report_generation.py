@@ -183,9 +183,13 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual([item.facet_id for item in budgets], ["F1", "F2"])
         self.assertEqual(sum(item.characters for item in budgets), 900)
 
-    def test_remainder_goes_to_the_earliest_facets(self) -> None:
+    def test_budget_follows_the_weight_of_citable_evidence(self) -> None:
+        # The default bundle backs F1 with two citable passages and F2 with one,
+        # so the split is 2:1 rather than even. Allocation still sums exactly.
         budgets = allocate_facet_budget(bundle(), limit=1001, budget_ratio=1.0)
-        self.assertEqual([item.characters for item in budgets], [501, 500])
+        characters = [item.characters for item in budgets]
+        self.assertEqual(sum(characters), 1001)
+        self.assertGreater(characters[0], characters[1])
 
     def test_every_facet_receives_a_positive_budget(self) -> None:
         budgets = allocate_facet_budget(bundle(), limit=3, budget_ratio=1.0)

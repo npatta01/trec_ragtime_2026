@@ -176,3 +176,101 @@ class HandoffFailureReportingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunContainmentTests(unittest.TestCase):
+    """One topic's unexpected failure must not kill the other 102."""
+
+    def test_an_unexpected_provider_error_fails_only_its_topic(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from trec_ragtime.report_cache import GenerationSettings
+        from trec_ragtime.report_runner import run_report_generation
+        from tests.test_report_generation import completion, draft, line
+        from tests.test_report_runner import RunnerTestCase
+
+        class RateLimited(Exception):
+            """Stands in for a provider error the runner has never seen."""
+
+        case = RunnerTestCase("run")
+        case.setUp()
+        self.addCleanup(case._directory.cleanup)
+
+        payload = completion(
+            draft(line("The ban took effect in 2019.", ["S1"]))
+        )
+
+        class Flaky:
+            def create(self, *, refresh: bool = False, **request: Any) -> Any:
+                body = "".join(item["content"] for item in request["messages"])
+                if "2000" in body:
+                    raise RateLimited("429 slow down")
+                return payload
+
+        result = run_report_generation(
+            input_dir=case.write_run("2000", "2001"),
+            topics_path=case.write_topics("2000", "2001"),
+            output_root=case.output_root,
+            team_id="PLACEHOLDER-TEAM",
+            run_id="containment-1",
+            run_desc="containment test",
+            settings=GenerationSettings(
+                base_url="https://api.example.test/v1",
+                model="test-model",
+                temperature=0.0,
+                top_p=None,
+                max_output_tokens=4000,
+                seed=7,
+                max_repairs=0,
+                max_citations=3,
+                max_passages=3,
+                evidence_chars=0,
+                budget_ratio=0.9,
+            ),
+            completions=[Flaky()],
+            store=case.store,
+            clock=lambda: 1_700_000_000.0,
+        )
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(result.generated, 1)
+        failures = json.loads((result.run_dir / "failures.json").read_text())
+        self.assertEqual(failures["failed_topics"], ["2000"])
+        self.assertIn("RateLimited", failures["details"]["2000"])
+
+
+class UsageAccountingTests(unittest.TestCase):
+    def test_usage_aggregates_across_repair_attempts(self) -> None:
+        from trec_ragtime.report_generation import generate_topic_report
+        from tests.test_report_generation import (
+            ScriptedCompletions,
+            bundle as gen_bundle,
+            completion,
+            draft,
+            identity,
+            line,
+            settings as gen_settings,
+        )
+
+        item = gen_bundle()
+        request = identity(item, settings=gen_settings(max_repairs=1))
+        broken = completion(draft(line("An invented claim.", ["S9"])))
+        fixed = completion(
+            draft(
+                line("A supported claim.", ["S1"]),
+                line("Another supported claim.", ["S2"], ["F2"]),
+            )
+        )
+        report = generate_topic_report(
+            bundle=item,
+            request=request,
+            completions=ScriptedCompletions([broken, fixed]),
+            cache=None,
+            clock=lambda: 1_700_000_000.0,
+        )
+        self.assertEqual(report.diagnostics.repair_attempts, 1)
+        # Each scripted completion reports 5 total tokens; both calls were paid
+        # for, so recorded spend must reflect two calls, not just the kept one.
+        self.assertEqual(report.diagnostics.usage["total_tokens"], 10)
+        self.assertEqual(report.diagnostics.usage["prompt_tokens"], 6)
