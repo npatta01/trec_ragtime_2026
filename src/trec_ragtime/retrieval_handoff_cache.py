@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 import msgspec
@@ -37,6 +37,7 @@ class HandoffFingerprint(msgspec.Struct, frozen=True, forbid_unknown_fields=True
 
 class HandoffRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     topic_catalog_digest: bytes
+    producer_identity_digest: bytes
     topic: HandoffTopic
     nugget_source: HandoffNuggetSource
     retrieval_inputs: tuple[HandoffRetrievalInput, ...]
@@ -60,10 +61,16 @@ def selected_evidence_digest(bundle: RetrievalHandoffBundle) -> bytes:
 
 
 def request_for_bundle(
-    bundle: RetrievalHandoffBundle, *, topic_catalog_digest: bytes
+    bundle: RetrievalHandoffBundle,
+    *,
+    topic_catalog_digest: bytes,
+    producer_identity_digest: bytes,
 ) -> HandoffRequest:
     return HandoffRequest(
         topic_catalog_digest=_digest(topic_catalog_digest, "topic catalog"),
+        producer_identity_digest=_digest(
+            producer_identity_digest, "producer identity"
+        ),
         topic=bundle.topic,
         nugget_source=bundle.nugget_source,
         retrieval_inputs=bundle.retrieval_inputs,
@@ -81,7 +88,7 @@ class RetrievalHandoffArtifactCache:
     """Read and publish only validated, self-contained handoff bundles."""
 
     def __init__(self, store: ArtifactStoreLike) -> None:
-        for method in ("read_validated", "write", "evict_local"):
+        for method in ("read_validated_strict", "write", "evict_local"):
             if not callable(getattr(store, method, None)):
                 raise TypeError(f"store must implement {method}")
         self.store = store
@@ -92,8 +99,75 @@ class RetrievalHandoffArtifactCache:
     def get(
         self, fingerprint: HandoffFingerprint, request: HandoffRequest
     ) -> RetrievalHandoffBundle | None:
-        bundle = self.store.read_validated(
+        bundle = self.store.read_validated_strict(
             self.object_key(fingerprint, request), _decoder(fingerprint, request)
+        )
+        if bundle is not None and not isinstance(bundle, RetrievalHandoffBundle):
+            raise ArtifactValidationError("handoff decoder returned an invalid value")
+        return bundle
+
+    def get_by_object_key(
+        self,
+        fingerprint: HandoffFingerprint,
+        object_key: str,
+        *,
+        topic_catalog_digest: bytes,
+        producer_identity_digest: bytes | None = None,
+        producer_identity_digests: Mapping[str, bytes] | None = None,
+    ) -> RetrievalHandoffBundle | None:
+        """Read one listed handoff without rebuilding its upstream request.
+
+        The request digest is recoverable from the canonical object key, while
+        the rest of the request is recoverable from the envelope's bundle.  A
+        catalog digest supplied by the caller is therefore enough to validate
+        the complete request identity without loading topics, retrievals, or
+        nugget artifacts.
+        """
+
+        if (producer_identity_digest is None) == (producer_identity_digests is None):
+            raise ValueError(
+                "provide exactly one of producer_identity_digest or "
+                "producer_identity_digests"
+            )
+        try:
+            catalog_digest = _digest(topic_catalog_digest, "topic catalog")
+        except (TypeError, ValueError):
+            raise ArtifactValidationError("topic catalog digest is invalid") from None
+        single_producer_digest: bytes | None = None
+        producer_digests: Mapping[str, bytes] | None = None
+        if producer_identity_digest is not None:
+            try:
+                single_producer_digest = _digest(
+                    producer_identity_digest, "producer identity"
+                )
+            except (TypeError, ValueError):
+                raise ArtifactValidationError(
+                    "producer identity digest is invalid"
+                ) from None
+        else:
+            if not isinstance(producer_identity_digests, Mapping):
+                raise ValueError("producer_identity_digests must be a mapping")
+            checked: dict[str, bytes] = {}
+            try:
+                for topic_id, digest in producer_identity_digests.items():
+                    if not isinstance(topic_id, str) or not topic_id:
+                        raise ValueError("producer identity mapping topic is invalid")
+                    checked[topic_id] = _digest(digest, "producer identity")
+            except (TypeError, ValueError):
+                raise ArtifactValidationError(
+                    "producer identity digest mapping is invalid"
+                ) from None
+            producer_digests = checked
+        request_digest = _request_digest_from_object_key(fingerprint, object_key)
+        bundle = self.store.read_validated_strict(
+            object_key,
+            _object_key_decoder(
+                fingerprint,
+                request_digest,
+                topic_catalog_digest=catalog_digest,
+                producer_identity_digest=single_producer_digest,
+                producer_identity_digests=producer_digests,
+            ),
         )
         if bundle is not None and not isinstance(bundle, RetrievalHandoffBundle):
             raise ArtifactValidationError("handoff decoder returned an invalid value")
@@ -127,9 +201,7 @@ def _decoder(
 ) -> Callable[[bytes], RetrievalHandoffBundle]:
     def decode(payload: bytes) -> RetrievalHandoffBundle:
         try:
-            envelope = msgspec.msgpack.decode(payload, type=HandoffEnvelope)
-            if msgspec.msgpack.encode(envelope) != payload:
-                raise ValueError("noncanonical encoding")
+            envelope = _decode_envelope(payload)
             if (
                 envelope.fingerprint_digest != fingerprint.digest
                 or envelope.request_digest != request.digest
@@ -144,6 +216,88 @@ def _decoder(
     return decode
 
 
+def _object_key_decoder(
+    fingerprint: HandoffFingerprint,
+    request_digest: bytes,
+    *,
+    topic_catalog_digest: bytes,
+    producer_identity_digest: bytes | None,
+    producer_identity_digests: Mapping[str, bytes] | None,
+) -> Callable[[bytes], RetrievalHandoffBundle | None]:
+    def decode(payload: bytes) -> RetrievalHandoffBundle | None:
+        try:
+            envelope = _decode_envelope(payload)
+            if envelope.fingerprint_digest != fingerprint.digest:
+                raise ValueError("fingerprint identity mismatch")
+            if envelope.request_digest != request_digest:
+                raise ValueError("request identity does not match object key")
+            if envelope.bundle_digest != handoff_bundle_digest(envelope.bundle):
+                raise ValueError("bundle identity mismatch")
+            topic_id = envelope.bundle.topic.topic_id
+            if producer_identity_digest is not None:
+                expected_producer_digest = producer_identity_digest
+            else:
+                assert producer_identity_digests is not None
+                expected_producer_digest = producer_identity_digests.get(topic_id)
+                if expected_producer_digest is None:
+                    return None
+            request = request_for_bundle(
+                envelope.bundle,
+                topic_catalog_digest=topic_catalog_digest,
+                producer_identity_digest=expected_producer_digest,
+            )
+            if envelope.request_digest != request.digest:
+                # A valid object under this fingerprint can belong to another
+                # topic-catalog snapshot.  It is a confirmed identity miss,
+                # not malformed data, so callers may continue discovery.
+                return None
+            _validate(fingerprint, request, envelope.bundle)
+        except Exception:
+            raise ArtifactValidationError("cached handoff payload is invalid") from None
+        return envelope.bundle
+
+    return decode
+
+
+def _decode_envelope(payload: bytes) -> HandoffEnvelope:
+    try:
+        envelope = msgspec.msgpack.decode(payload, type=HandoffEnvelope)
+        if msgspec.msgpack.encode(envelope) != payload:
+            raise ValueError("noncanonical encoding")
+    except Exception:
+        raise ArtifactValidationError("cached handoff envelope is invalid") from None
+    return envelope
+
+
+def _request_digest_from_object_key(
+    fingerprint: HandoffFingerprint, object_key: str
+) -> bytes:
+    if not isinstance(fingerprint, HandoffFingerprint):
+        raise TypeError("fingerprint must be a HandoffFingerprint")
+    if not isinstance(object_key, str):
+        raise ArtifactValidationError("handoff object key is invalid")
+    parts = object_key.split("/")
+    root_parts = OBJECT_ROOT.split("/")
+    if len(parts) != len(root_parts) + 3 or tuple(parts[: len(root_parts)]) != tuple(root_parts):
+        raise ArtifactValidationError("handoff object key is invalid")
+    if parts[len(root_parts)] != fingerprint.digest.hex():
+        raise ArtifactValidationError("handoff object key is outside the fingerprint root")
+
+    shard = parts[-2]
+    request_name = parts[-1]
+    if not request_name.endswith(".mpk"):
+        raise ArtifactValidationError("handoff object key is invalid")
+    request_hex = request_name[: -len(".mpk")]
+    if (
+        len(request_hex) != hashlib.sha256().digest_size * 2
+        or request_hex.lower() != request_hex
+        or any(character not in "0123456789abcdef" for character in request_hex)
+        or shard != request_hex[:2]
+    ):
+        raise ArtifactValidationError("handoff object key is invalid")
+    return bytes.fromhex(request_hex)
+
+
 def _validate(
     fingerprint: HandoffFingerprint,
     request: HandoffRequest,
@@ -153,6 +307,7 @@ def _validate(
         raise TypeError("fingerprint must be a HandoffFingerprint")
     for value, name in (
         (request.topic_catalog_digest, "topic catalog"),
+        (request.producer_identity_digest, "producer identity"),
         (request.selected_evidence_digest, "selected evidence"),
     ):
         _digest(value, name)

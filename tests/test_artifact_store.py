@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import fsspec
@@ -178,16 +179,30 @@ class FakeHfApi:
         *,
         private: bool = True,
         bucket_error: BaseException | None = None,
+        bucket_paths: tuple[object, ...] = (),
     ) -> None:
         self.private = private
         self.bucket_error = bucket_error
+        self.bucket_paths = bucket_paths
         self.bucket_calls: list[str] = []
+        self.tree_calls: list[tuple[str, str | None, bool | None, object]] = []
 
     def bucket_info(self, bucket_id: str):
         self.bucket_calls.append(bucket_id)
         if self.bucket_error is not None:
             raise self.bucket_error
         return type("BucketInfo", (), {"private": self.private})()
+
+    def list_bucket_tree(
+        self,
+        bucket_id: str,
+        prefix: str | None = None,
+        *,
+        recursive: bool | None = None,
+        token: object = None,
+    ):
+        self.tree_calls.append((bucket_id, prefix, recursive, token))
+        return iter(self.bucket_paths)
 
 
 class ArtifactStoreTestCase(unittest.TestCase):
@@ -204,6 +219,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.fs: FakeSimpleCache | None = None
         self.api_constructed = 0
         self.fs_constructed = 0
+        self.bucket_paths: tuple[object, ...] = ()
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -221,7 +237,11 @@ class ArtifactStoreTestCase(unittest.TestCase):
     ) -> ArtifactStore:
         def api_factory(**kwargs):
             self.api_constructed += 1
-            self.api = FakeHfApi(private=private, bucket_error=api_error)
+            self.api = FakeHfApi(
+                private=private,
+                bucket_error=api_error,
+                bucket_paths=self.bucket_paths,
+            )
             return self.api
 
         def fs_factory(protocol: str, **kwargs):
@@ -265,6 +285,29 @@ class ArtifactStoreTestCase(unittest.TestCase):
 
         self.assertEqual(store.read("object.mpk"), b"local")
         self.assertEqual(self.api_constructed, 0)
+        self.assertEqual(self.fs_constructed, 0)
+
+    def test_lists_only_file_keys_beneath_a_validated_durable_prefix(self) -> None:
+        self.bucket_paths = (
+            SimpleNamespace(type="file", path="foo/retrieval-handoff/v1/fp/b.mpk"),
+            SimpleNamespace(type="directory", path="foo/retrieval-handoff/v1/fp/sub"),
+            SimpleNamespace(type="file", path="foo/retrieval-handoff/v1/fp/a.mpk"),
+            SimpleNamespace(type="file", path="other/unrelated.mpk"),
+        )
+        store = self.make_store()
+
+        self.assertEqual(
+            store.list_keys("retrieval-handoff/v1/fp"),
+            (
+                "retrieval-handoff/v1/fp/a.mpk",
+                "retrieval-handoff/v1/fp/b.mpk",
+            ),
+        )
+        assert self.api is not None
+        self.assertEqual(
+            self.api.tree_calls,
+            [("owner/bucket", "foo/retrieval-handoff/v1/fp", True, "secret-token")],
+        )
         self.assertEqual(self.fs_constructed, 0)
 
     def test_local_candidate_matches_real_simplecache_mapper_without_hf_io(self) -> None:
@@ -423,6 +466,14 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertEqual(caught, [])
         self.assertFalse(store.local_candidate("object.mpk").exists())
 
+    def test_corrupt_l2_strict_read_raises_validation_error(self) -> None:
+        store = self.make_store()
+        self.remote["owner/bucket/foo/object.mpk"] = b"bad"
+
+        with self.assertRaises(ArtifactValidationError):
+            store.read_validated_strict("object.mpk", self.decoder)
+        self.assertFalse(store.local_candidate("object.mpk").exists())
+
     def test_a_failed_write_raises_and_cleans_its_exact_candidate(self) -> None:
         store = self.make_store(upload_error=RuntimeError("token=secret-token"))
         other = store.local_candidate("other.mpk")
@@ -520,6 +571,22 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertFalse(store.local_candidate("object.mpk").exists())
         self.assertEqual(store.local_candidate("other.mpk").read_bytes(), b"other")
 
+    def test_evict_local_raises_a_sanitized_error_when_unlink_fails(self) -> None:
+        store = self.make_store()
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"local")
+
+        with patch.object(
+            Path, "unlink", side_effect=OSError("token=secret-token")
+        ):
+            with self.assertRaisesRegex(
+                ArtifactStoreRemoteError, "could not evict local candidate"
+            ) as raised:
+                store.evict_local("object.mpk")
+
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertTrue(candidate.exists())
+
     def test_read_validated_only_repairs_artifact_validation_errors(self) -> None:
         store = self.make_store()
         store.local_candidate("object.mpk").write_bytes(b"local")
@@ -568,7 +635,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
             [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
         )
 
-    def test_local_l1_eviction_failure_warns_and_disables_without_l2(self) -> None:
+    def test_local_l1_eviction_failure_is_fatal_and_disables_l2(self) -> None:
         store = self.make_store()
         store.local_candidate("object.mpk").write_bytes(b"stale")
 
@@ -577,9 +644,27 @@ class ArtifactStoreTestCase(unittest.TestCase):
         ), patch.object(Path, "unlink", side_effect=OSError("permission denied")):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                self.assertIsNone(store.read("object.mpk"))
+                with self.assertRaises(ArtifactStoreRemoteError):
+                    store.read("object.mpk")
                 with self.assertRaises(ArtifactStoreRemoteError):
                     store.write("other.mpk", b"payload")
+        self.assert_one_sanitized_warning(caught)
+        self.assertEqual(self.api_constructed, 0)
+        self.assertEqual(self.fs_constructed, 0)
+
+    def test_strict_validated_read_never_turns_l1_eviction_failure_into_miss(
+        self,
+    ) -> None:
+        store = self.make_store()
+        store.local_candidate("object.mpk").write_bytes(b"stale")
+
+        with patch.object(
+            Path, "read_bytes", side_effect=OSError("permission denied")
+        ), patch.object(Path, "unlink", side_effect=OSError("permission denied")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with self.assertRaises(ArtifactStoreRemoteError):
+                    store.read_validated_strict("object.mpk", self.decoder)
         self.assert_one_sanitized_warning(caught)
         self.assertEqual(self.api_constructed, 0)
         self.assertEqual(self.fs_constructed, 0)

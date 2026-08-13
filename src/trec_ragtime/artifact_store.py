@@ -79,7 +79,13 @@ class ArtifactStoreLike(Protocol):
 
     def read(self, object_key: str) -> bytes | None: ...
 
+    def list_keys(self, prefix: str) -> tuple[str, ...]: ...
+
     def read_validated(
+        self, object_key: str, decoder: Callable[[bytes], T]
+    ) -> T | None: ...
+
+    def read_validated_strict(
         self, object_key: str, decoder: Callable[[bytes], T]
     ) -> T | None: ...
 
@@ -452,6 +458,54 @@ class ArtifactStore:
             )
         return bytes(payload)
 
+    def list_keys(self, prefix: str) -> tuple[str, ...]:
+        """List durable file keys beneath a validated logical prefix."""
+
+        prefix = self._validate_object_key(prefix)
+        if self._remote_disabled:
+            raise ArtifactStoreRemoteError(
+                "remote artifact access is disabled after an earlier failure"
+            )
+        self._verify_private_bucket()
+        full_prefix = self._full_object_key(prefix)
+        remote_prefix = f"{full_prefix}/"
+        try:
+            entries = self._get_api().list_bucket_tree(
+                self.bucket_id,
+                prefix=full_prefix,
+                recursive=True,
+                token=self.token,
+            )
+            keys: set[str] = set()
+            for entry in entries:
+                if isinstance(entry, Mapping):
+                    entry_type = entry.get("type")
+                    entry_path = entry.get("path")
+                else:
+                    entry_type = getattr(entry, "type", None)
+                    entry_path = getattr(entry, "path", None)
+                if entry_type != "file" or not isinstance(entry_path, str):
+                    continue
+                if not entry_path.startswith(remote_prefix):
+                    continue
+                if self.prefix:
+                    store_prefix = f"{self.prefix}/"
+                    if not entry_path.startswith(store_prefix):
+                        continue
+                    entry_path = entry_path[len(store_prefix) :]
+                try:
+                    key = self._validate_object_key(entry_path)
+                except ArtifactStoreConfigurationError:
+                    continue
+                if key == prefix or not key.startswith(f"{prefix}/"):
+                    continue
+                keys.add(key)
+            return tuple(sorted(keys))
+        except Exception:
+            raise ArtifactStoreRemoteError(
+                "failed to list artifact objects"
+            ) from None
+
     def read(self, object_key: str) -> bytes | None:
         """Read raw bytes, using L1 before the private HF Bucket."""
 
@@ -462,7 +516,9 @@ class ArtifactStore:
         except OSError:
             if not self._best_effort_remove_candidate(candidate):
                 self._disable_remote()
-                return None
+                raise ArtifactStoreRemoteError(
+                    "artifact store could not repair an unreadable local candidate"
+                ) from None
             return self._read_remote(object_key)
         if found:
             return cast(bytes, payload)
@@ -473,10 +529,31 @@ class ArtifactStore:
 
         object_key = self._validate_object_key(object_key)
         candidate = self.local_candidate(object_key)
-        self._best_effort_remove_candidate(candidate)
+        if not self._best_effort_remove_candidate(candidate):
+            raise ArtifactStoreRemoteError(
+                "artifact store could not evict local candidate"
+            ) from None
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], T]
+    ) -> T | None:
+        """Decode an artifact, repairing one invalid local candidate."""
+
+        return self._read_validated(object_key, decoder, strict_l2=False)
+
+    def read_validated_strict(
+        self, object_key: str, decoder: Callable[[bytes], T]
+    ) -> T | None:
+        """Decode an artifact, raising when the durable bytes are invalid."""
+
+        return self._read_validated(object_key, decoder, strict_l2=True)
+
+    def _read_validated(
+        self,
+        object_key: str,
+        decoder: Callable[[bytes], T],
+        *,
+        strict_l2: bool,
     ) -> T | None:
         """Decode an artifact, repairing one invalid local candidate."""
 
@@ -487,7 +564,9 @@ class ArtifactStore:
         except OSError:
             if not self._best_effort_remove_candidate(candidate):
                 self._disable_remote()
-                return None
+                raise ArtifactStoreRemoteError(
+                    "artifact store could not repair an unreadable local candidate"
+                ) from None
             payload = self._read_remote(object_key)
             if payload is None:
                 return None
@@ -495,6 +574,8 @@ class ArtifactStore:
                 return decoder(payload)
             except ArtifactValidationError:
                 self._best_effort_remove_candidate(candidate)
+                if strict_l2:
+                    raise
                 return None
         if found:
             try:
@@ -511,6 +592,8 @@ class ArtifactStore:
             # this exact object so a corrupt artifact becomes a miss without
             # disturbing neighboring cache entries.
             self._best_effort_remove_candidate(candidate)
+            if strict_l2:
+                raise
             return None
 
     def write(self, object_key: str, payload: bytes) -> bool:

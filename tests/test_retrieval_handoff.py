@@ -9,6 +9,7 @@ import msgspec
 from trec_ragtime.models import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
 from trec_ragtime.nuggets import NuggetSupport
 from trec_ragtime.nugget_cache import nugget_object_key
+from trec_ragtime.retrieval_cache import RetrievalArtifactReference, retrieval_object_key
 from trec_ragtime.retrieval_handoff import (
     HandoffError,
     HandoffNuggetSource,
@@ -96,6 +97,176 @@ class RetrievalHandoffTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self.project(changed)
+
+    def test_projection_rejects_a_request_that_does_not_pin_bundle_evidence(self) -> None:
+        wrong_request = msgspec.structs.replace(
+            self.request, evidence_digest=hashlib.sha256(b"other evidence").digest()
+        )
+        wrong_source = msgspec.structs.replace(
+            self.source,
+            object_key=nugget_object_key(
+                self.source.fingerprint_digest, wrong_request.digest
+            ),
+            request_digest=wrong_request.digest,
+        )
+
+        with self.assertRaisesRegex(HandoffError, "evidence"):
+            project_retrieval_handoff(
+                topic=self.topic,
+                nugget_bundle=self.nuggets,
+                nugget_request=wrong_request,
+                nugget_source=wrong_source,
+                retrievals=self.retrievals,
+            )
+
+    def test_self_contained_validator_rejects_negative_variant_index(self) -> None:
+        bundle = self.project()
+        link = msgspec.structs.replace(
+            bundle.nuggets[0].support[0], variant_index=-1
+        )
+        nugget = msgspec.structs.replace(bundle.nuggets[0], support=(link,))
+        with self.assertRaisesRegex(HandoffError, "support"):
+            check_retrieval_handoff(
+                msgspec.structs.replace(bundle, nuggets=(nugget,))
+            )
+
+    def test_self_contained_validator_rejects_invalid_stable_ids(self) -> None:
+        bundle = self.project()
+        nugget = msgspec.structs.replace(
+            bundle.nuggets[0],
+            nugget_id="nug1_" + "0" * 24,
+            cluster_id="nugc1_" + "0" * 24,
+        )
+        with self.assertRaisesRegex(HandoffError, "nugget"):
+            check_retrieval_handoff(
+                msgspec.structs.replace(bundle, nuggets=(nugget,))
+            )
+
+    def test_self_contained_validator_rejects_offset_length_mismatch(self) -> None:
+        bundle = self.project()
+        evidence = msgspec.structs.replace(bundle.evidence[0], end_char=999)
+        with self.assertRaisesRegex(HandoffError, "evidence"):
+            check_retrieval_handoff(
+                msgspec.structs.replace(bundle, evidence=(evidence,))
+            )
+
+    def test_self_contained_validator_rejects_schema_type_corruption(self) -> None:
+        bundle = self.project()
+        topic = msgspec.structs.replace(bundle.topic, limit=True)
+        with self.assertRaisesRegex(HandoffError, "schema"):
+            check_retrieval_handoff(msgspec.structs.replace(bundle, topic=topic))
+
+    def test_self_contained_validator_rejects_unknown_support_assignment(self) -> None:
+        bundle = self.project()
+        link = msgspec.structs.replace(
+            bundle.nuggets[0].support[0], assignment="unknown", citation_ready=False
+        )
+        nugget = msgspec.structs.replace(bundle.nuggets[0], support=(link,))
+        with self.assertRaisesRegex(HandoffError, "schema"):
+            check_retrieval_handoff(msgspec.structs.replace(bundle, nuggets=(nugget,)))
+
+    def test_self_contained_validator_rejects_counts_below_selected_evidence(self) -> None:
+        bundle = self.project()
+        counts = msgspec.structs.replace(
+            bundle.counts, offered_evidence=0, omitted_evidence=-1
+        )
+        with self.assertRaisesRegex(HandoffError, "counts"):
+            check_retrieval_handoff(msgspec.structs.replace(bundle, counts=counts))
+
+    def test_self_contained_validator_rejects_facet_metadata_drift(self) -> None:
+        bundle = self.project()
+        facet = msgspec.structs.replace(bundle.facets[0], query="different query")
+        with self.assertRaisesRegex(HandoffError, "facet"):
+            check_retrieval_handoff(msgspec.structs.replace(bundle, facets=(facet,)))
+
+    def test_projection_rejects_non_english_source_evidence(self) -> None:
+        evidence = msgspec.structs.replace(self.nuggets.evidence[0], language="spa")
+        changed = msgspec.structs.replace(
+            self.nuggets, evidence=(evidence, *self.nuggets.evidence[1:])
+        )
+        changed_request = request(changed)
+        changed_source = msgspec.structs.replace(
+            self.source,
+            object_key=nugget_object_key(
+                self.source.fingerprint_digest, changed_request.digest
+            ),
+            request_digest=changed_request.digest,
+            bundle_digest=hashlib.sha256(msgspec.msgpack.encode(changed)).digest(),
+        )
+        with self.assertRaisesRegex(HandoffError, "language"):
+            project_retrieval_handoff(
+                topic=self.topic,
+                nugget_bundle=changed,
+                nugget_request=changed_request,
+                nugget_source=changed_source,
+                retrievals=self.retrievals,
+            )
+
+    def test_projection_rejects_facet_metadata_disagreement(self) -> None:
+        facet = msgspec.structs.replace(self.nuggets.facets[0], query="different query")
+        changed = msgspec.structs.replace(self.nuggets, facets=(facet,))
+        with self.assertRaisesRegex(HandoffError, "facet"):
+            self.project(changed)
+
+    def test_same_document_disagreement_between_facets_fails_closed(self) -> None:
+        other = RetrievalResult(
+            PipelineResult("other facet", "ragtime2%20", (SearchHit(1, "doc-a", 0.8),), True, True, None, None, None),
+            (RetrievedDocument(1, "doc-a", 0.8, "conflicting passage", None, None, "eng", "fixture", True),),
+            retrieval_artifact=SimpleNamespace(
+                object_key="retrieval/v1/other",
+                request_digest=b"o" * 32,
+            ),
+        )
+        retrievals = dict(self.retrievals)
+        retrievals[1] = other
+        with self.assertRaisesRegex(HandoffError, "document"):
+            project_retrieval_handoff(
+                topic=self.topic,
+                nugget_bundle=self.nuggets,
+                nugget_request=self.request,
+                nugget_source=self.source,
+                retrievals=retrievals,
+            )
+
+    def test_retrieval_fingerprint_mismatch_fails_closed(self) -> None:
+        request_digest = self.request.inputs[0].request_digest
+        fingerprint_a = b"a" * 32
+        fingerprint_b = b"b" * 32
+        reference_a = RetrievalArtifactReference(
+            object_key=retrieval_object_key(fingerprint_a, request_digest),
+            request_digest=request_digest,
+            retriever_fingerprint=fingerprint_a,
+            stored_at=1.0,
+            cache_hit=True,
+        )
+        reference_b = RetrievalArtifactReference(
+            object_key=retrieval_object_key(fingerprint_b, b"q" * 32),
+            request_digest=b"q" * 32,
+            retriever_fingerprint=fingerprint_b,
+            stored_at=1.0,
+            cache_hit=True,
+        )
+        selected = self.retrievals[0]
+        retrievals = {
+            0: RetrievalResult(
+                selected.search_result,
+                selected.documents,
+                retrieval_artifact=reference_a,
+            ),
+            1: RetrievalResult(
+                PipelineResult("other facet", "ragtime2%20", (SearchHit(1, "doc-b", 0.4),), True, True, None, None, None),
+                (RetrievedDocument(1, "doc-b", 0.4, "other passage", None, None, "eng", "fixture", True),),
+                retrieval_artifact=reference_b,
+            ),
+        }
+        with self.assertRaisesRegex(HandoffError, "fingerprint"):
+            project_retrieval_handoff(
+                topic=self.topic,
+                nugget_bundle=self.nuggets,
+                nugget_request=self.request,
+                nugget_source=self.source,
+                retrievals=retrievals,
+            )
 
     def test_retrieval_identity_disagreement_fails_closed(self) -> None:
         result = self.retrievals[0]

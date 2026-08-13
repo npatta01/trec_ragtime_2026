@@ -185,6 +185,8 @@ The handoff fingerprint covers every non-topic-specific behavior:
 The request identity covers:
 
 - exact official topic record and topic-catalog hash;
+- exact producer identity, including the query plan, retriever/corpus pin,
+  scorer and chunker runtime, and nugget fingerprint;
 - exact nugget artifact object key, fingerprint, request digest, and content
   digest;
 - all exact retrieval artifact references used by that nugget request;
