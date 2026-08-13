@@ -14,7 +14,7 @@ Form: *Submission to RAG TREC Instrument for Multilingual Evaluation, Report gen
 Upload this file:
 
 ```
-submissions/NP.np-nugget-sol-v1.ragtime26.jsonl
+submissions/np-nugget-sol-v1/NP.np-nugget-sol-v1.ragtime26.jsonl
 ```
 
 ### Runtag
@@ -82,7 +82,7 @@ Fill this line in and commit:
 
 | | |
 | --- | --- |
-| In repo | `submissions/NP.np-nugget-sol-v1.ragtime26.jsonl` |
+| In repo | [`NP.np-nugget-sol-v1.ragtime26.jsonl`](NP.np-nugget-sol-v1.ragtime26.jsonl) — beside this ledger |
 | Size | 804,810 bytes (786 KB) |
 | SHA-256 | `3e8d0a9b65532b636ac2b44b17385b425367d1742f7ac7b7964fab15cf37af74` |
 | Lines | 103 — one JSON object per topic |
@@ -91,7 +91,7 @@ Fill this line in and commit:
 Verify before uploading:
 
 ```bash
-cd submissions && sha256sum -c NP.np-nugget-sol-v1.ragtime26.jsonl.sha256
+cd submissions/np-nugget-sol-v1 && sha256sum -c NP.np-nugget-sol-v1.ragtime26.jsonl.sha256
 ```
 
 ---
@@ -184,7 +184,8 @@ Three independent checkers, all against the file in §2.
 Re-check any time:
 
 ```bash
-uv run ragtime-validate-submission submissions/NP.np-nugget-sol-v1.ragtime26.jsonl --strict
+uv run ragtime-validate-submission \
+  submissions/np-nugget-sol-v1/NP.np-nugget-sol-v1.ragtime26.jsonl --strict
 ```
 
 ---
