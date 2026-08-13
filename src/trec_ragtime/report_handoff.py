@@ -18,6 +18,7 @@ the upstream ``check_retrieval_handoff`` validator rather than restating it.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -193,12 +194,61 @@ def require_handoff_bundle(
     return bundle
 
 
+def merge_handoff_manifests(paths: Sequence[Path | str]) -> HandoffManifest:
+    """Combine several handoff manifests into one consumable index.
+
+    A retry run writes its own manifest rather than rewriting the original, so
+    the complete picture spans several files. Manifests are applied in the order
+    given: a later written entry replaces an earlier one for the same topic, but
+    a failure never replaces a success, because a retry manifest only reports on
+    the topics it attempted.
+
+    All manifests must share a fingerprint and topic catalog. Merging across
+    different handoff semantics would silently mix incompatible evidence.
+    """
+
+    items = [load_handoff_manifest(path) for path in paths]
+    if not items:
+        raise HandoffSourceError("at least one handoff manifest is required")
+
+    first = items[0]
+    for other in items[1:]:
+        if other.fingerprint != first.fingerprint:
+            raise HandoffSourceError(
+                f"handoff manifest {other.path_name} has fingerprint"
+                f" {other.fingerprint[:12]}, expected {first.fingerprint[:12]}"
+            )
+        if other.topic_catalog_digest != first.topic_catalog_digest:
+            raise HandoffSourceError(
+                f"handoff manifest {other.path_name} was built against a"
+                " different topic catalog"
+            )
+
+    merged: dict[str, HandoffTopicEntry] = {}
+    for manifest in items:
+        for entry in manifest.topics:
+            existing = merged.get(entry.topic_id)
+            if existing is not None and existing.available and not entry.available:
+                continue
+            merged[entry.topic_id] = entry
+
+    topics = tuple(merged.values())
+    return HandoffManifest(
+        path_name=" + ".join(item.path_name for item in items),
+        fingerprint=first.fingerprint,
+        topic_catalog_digest=first.topic_catalog_digest,
+        complete=all(entry.available for entry in topics),
+        topics=topics,
+    )
+
+
 __all__ = [
     "HANDOFF_MANIFEST_SCHEMA_VERSION",
     "HandoffManifest",
     "HandoffSourceError",
     "HandoffTopicEntry",
     "load_handoff_manifest",
+    "merge_handoff_manifests",
     "read_handoff_bundle",
     "require_handoff_bundle",
 ]

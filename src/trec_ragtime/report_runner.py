@@ -40,7 +40,7 @@ from .evidence_bundle import (
 )
 from .report_handoff import (
     HandoffSourceError,
-    load_handoff_manifest,
+    merge_handoff_manifests,
     require_handoff_bundle,
 )
 from .paths import default_project_cache_dir, ensure_private_cache_dir
@@ -290,7 +290,7 @@ def _handoff_topic_matches(handoff: Any, topic: Topic) -> bool:
 
 
 def _bundles_from_handoff(
-    manifest_path: Path,
+    manifest_paths: Sequence[Path],
     *,
     topics: Sequence[Topic],
     store: Any,
@@ -299,7 +299,7 @@ def _bundles_from_handoff(
 ) -> tuple[tuple[EvidenceBundle, ...], tuple[Topic, ...], tuple[str, ...], dict[str, Any]]:
     """Load one self-contained handoff bundle per topic, cache-only."""
 
-    manifest = load_handoff_manifest(manifest_path)
+    manifest = merge_handoff_manifests(manifest_paths)
     bundles: list[EvidenceBundle] = []
     available: list[Topic] = []
     missing: list[str] = []
@@ -330,7 +330,7 @@ def _bundles_from_handoff(
         available.append(topic)
     record = {
         "run_schema": "retrieval_handoff_v1",
-        "manifest_path_name": manifest.path_name,
+        "manifest_path_names": manifest.path_name,
         "handoff_fingerprint": manifest.fingerprint,
         "topic_catalog_digest": manifest.topic_catalog_digest,
         "handoff_complete": manifest.complete,
@@ -342,7 +342,7 @@ def _bundles_from_handoff(
 def run_report_generation(
     *,
     input_dir: Path | str | None = None,
-    handoff_manifest: Path | str | None = None,
+    handoff_manifest: Sequence[Path | str] | Path | str | None = None,
     topics_path: Path | str,
     output_root: Path | str,
     team_id: str,
@@ -388,10 +388,14 @@ def run_report_generation(
         topics = all_topics
 
     topics_sha256 = sha256_file(topics_path)
-    if handoff_manifest is not None:
+    if handoff_manifest is not None and not isinstance(handoff_manifest, (str, Path)):
+        handoff_manifest = list(handoff_manifest)
+    elif handoff_manifest is not None:
+        handoff_manifest = [handoff_manifest]
+    if handoff_manifest:
         try:
             bundles, available, missing, input_record = _bundles_from_handoff(
-                Path(handoff_manifest),
+                [Path(item) for item in handoff_manifest],
                 topics=topics,
                 store=store,
                 topics_sha256=topics_sha256,
@@ -661,7 +665,11 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--input", help="Retrieval run directory")
     source.add_argument(
         "--handoff-manifest",
-        help="Manifest from ragtime-retrieval-handoff; consumes one sealed bundle per topic",
+        action="append",
+        help=(
+            "Manifest from ragtime-retrieval-handoff; consumes one sealed bundle "
+            "per topic. Repeatable, so a retry manifest can supplement the first."
+        ),
     )
     parser.add_argument("--topics", default=DEFAULT_TOPICS_PATH, help="Official topics JSONL")
     parser.add_argument(
@@ -734,14 +742,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     input_dir = Path(args.input) if args.input else None
-    handoff_manifest = Path(args.handoff_manifest) if args.handoff_manifest else None
+    handoff_manifest = [Path(item) for item in (args.handoff_manifest or [])] or None
     topics_path = Path(args.topics)
     if input_dir is not None and not input_dir.is_dir():
         print(f"input run directory not found: {input_dir}", file=sys.stderr)
         return 2
-    if handoff_manifest is not None and not handoff_manifest.is_file():
-        print(f"handoff manifest not found: {handoff_manifest}", file=sys.stderr)
-        return 2
+    for item in handoff_manifest or []:
+        if not item.is_file():
+            print(f"handoff manifest not found: {item}", file=sys.stderr)
+            return 2
     if not topics_path.is_file():
         print(f"topics file not found: {topics_path}", file=sys.stderr)
         return 2

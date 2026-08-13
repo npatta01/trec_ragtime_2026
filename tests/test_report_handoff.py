@@ -420,3 +420,112 @@ class GenerationFromHandoffTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeManifestTests(unittest.TestCase):
+    """A retry run emits its own manifest, so consumption must span several."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+
+    def write(self, name: str, topics: list[dict[str, Any]], **overrides: Any) -> Path:
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "fingerprint": "a" * 64,
+            "topic_catalog_digest": "b" * 64,
+            "complete": True,
+            "topics": topics,
+        }
+        payload.update(overrides)
+        path = self.root / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_later_manifest_supplies_a_topic_the_first_failed(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json",
+            [
+                {"topic_id": "2000", "status": "written", "object_key": "k0"},
+                {"topic_id": "2040", "status": "failed", "object_key": None},
+            ],
+            complete=False,
+        )
+        second = self.write(
+            "retry.json", [{"topic_id": "2040", "status": "written", "object_key": "k40"}]
+        )
+        merged = merge_handoff_manifests([first, second])
+        self.assertEqual(sorted(merged.available_topic_ids), ["2000", "2040"])
+        self.assertEqual(merged.entry("2040").object_key, "k40")
+        self.assertTrue(merged.complete)
+
+    def test_a_written_entry_is_never_replaced_by_a_failure(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k0"}]
+        )
+        second = self.write(
+            "retry.json", [{"topic_id": "2000", "status": "failed", "object_key": None}]
+        )
+        merged = merge_handoff_manifests([first, second])
+        self.assertEqual(merged.entry("2000").object_key, "k0")
+
+    def test_later_written_entry_overrides_an_earlier_one(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "old"}]
+        )
+        second = self.write(
+            "retry.json", [{"topic_id": "2000", "status": "written", "object_key": "new"}]
+        )
+        self.assertEqual(
+            merge_handoff_manifests([first, second]).entry("2000").object_key, "new"
+        )
+
+    def test_a_fingerprint_mismatch_fails_closed(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k"}]
+        )
+        second = self.write(
+            "other.json",
+            [{"topic_id": "2001", "status": "written", "object_key": "k2"}],
+            fingerprint="c" * 64,
+        )
+        with self.assertRaises(HandoffSourceError):
+            merge_handoff_manifests([first, second])
+
+    def test_a_topic_catalog_mismatch_fails_closed(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        first = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k"}]
+        )
+        second = self.write(
+            "other.json",
+            [{"topic_id": "2001", "status": "written", "object_key": "k2"}],
+            topic_catalog_digest="d" * 64,
+        )
+        with self.assertRaises(HandoffSourceError):
+            merge_handoff_manifests([first, second])
+
+    def test_a_single_manifest_merges_to_itself(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        path = self.write(
+            "plan.json", [{"topic_id": "2000", "status": "written", "object_key": "k"}]
+        )
+        merged = merge_handoff_manifests([path])
+        self.assertEqual(merged.available_topic_ids, ("2000",))
+
+    def test_no_manifest_is_rejected(self) -> None:
+        from trec_ragtime.report_handoff import merge_handoff_manifests
+
+        with self.assertRaises(HandoffSourceError):
+            merge_handoff_manifests([])
