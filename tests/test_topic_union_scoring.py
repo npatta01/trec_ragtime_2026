@@ -10,6 +10,7 @@ from trec_ragtime.topic_union_scoring import (
     InformationNeed,
     TopicRetrievalInput,
     TopicUnionScoringError,
+    select_conservative_pair_length,
     deduplicate_topic_documents,
     score_topic_union,
 )
@@ -93,6 +94,21 @@ class RecordingScorer:
 
 
 class TopicUnionScoringTests(unittest.TestCase):
+    def test_selects_the_pair_length_with_the_smallest_passage_budget(self) -> None:
+        class PairLength:
+            def __init__(self, text: str) -> None:
+                self.query = text
+                self.max_passage_length = {"short need": 700, "restrictive need": 500}[text]
+                self.fingerprint = f"pair:{text}"
+
+        selected = select_conservative_pair_length(
+            object(),
+            (InformationNeed("N1", "short need"), InformationNeed("N2", "restrictive need")),
+            factory=lambda _config, text: PairLength(text),
+        )
+
+        self.assertEqual(selected.query, "restrictive need")
+
     def test_union_deduplicates_document_ids_and_keeps_all_sources(self) -> None:
         shared = document("doc-shared", 2, "shared")
         rows = deduplicate_topic_documents(

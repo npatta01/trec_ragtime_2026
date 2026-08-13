@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Callable
 
 from .models import RetrievalResult, RetrievedDocument
 from .passage_scoring import validate_passage_scores
@@ -85,6 +86,35 @@ class TopicScoreResult:
     documents: tuple[ScoredTopicDocument, ...]
     scorer_fingerprint: str
     chunker_fingerprint: str
+
+
+def select_conservative_pair_length(
+    config: object,
+    needs: Sequence[InformationNeed],
+    *,
+    factory: Callable[[object, str], object] | None = None,
+) -> object:
+    """Choose the need leaving the smallest safe passage-token budget."""
+
+    rows = tuple(needs)
+    if not rows:
+        raise TopicUnionScoringError("at least one information need is required")
+    if factory is None:
+        from .passage_scoring import CrossEncoderPairLengthFunction
+
+        factory = CrossEncoderPairLengthFunction  # type: ignore[assignment]
+    pair_lengths = tuple(factory(config, row.text) for row in rows)
+    for pair_length in pair_lengths:
+        budget = getattr(pair_length, "max_passage_length", None)
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise TopicUnionScoringError("pair length has no positive passage budget")
+    return min(
+        pair_lengths,
+        key=lambda row: (
+            getattr(row, "max_passage_length"),
+            getattr(row, "fingerprint", ""),
+        ),
+    )
 
 
 def _same_content(left: RetrievedDocument, right: RetrievedDocument) -> bool:
@@ -285,5 +315,6 @@ __all__ = [
     "TopicUnionScoringError",
     "UnionDocument",
     "deduplicate_topic_documents",
+    "select_conservative_pair_length",
     "score_topic_union",
 ]

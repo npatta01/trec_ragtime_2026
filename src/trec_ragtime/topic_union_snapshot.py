@@ -47,10 +47,15 @@ class TopicSnapshot:
     needs: tuple[InformationNeed, ...]
     retrievals: tuple[SnapshotRetrieval, ...]
     input_object_keys: tuple[str, ...]
+    sealed_query_count: int
 
     @property
     def successful_query_count(self) -> int:
         return len(self.retrievals)
+
+    @property
+    def is_complete(self) -> bool:
+        return self.successful_query_count == self.sealed_query_count
 
 
 def _json(path: Path) -> Any:
@@ -255,6 +260,7 @@ def build_snapshot(
                 needs=tuple(InformationNeed(row.need_id, row.objective) for row in plan.information_needs),
                 retrievals=ordered,
                 input_object_keys=object_keys,
+                sealed_query_count=len(plan.tasks),
             )
         )
     return tuple(snapshots)
