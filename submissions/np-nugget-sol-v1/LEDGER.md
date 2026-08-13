@@ -73,11 +73,18 @@ rather abstain than manufacture a citation.
 | Email | `npatta01@gmail.com` |
 | Organization | `(NP Labs) NP` |
 
-### After you upload
+### Submitted
 
-Fill this line in and commit:
+| | |
+| --- | --- |
+| Status | **Submitted to NIST via EvalBase** |
+| Date | 13 August 2026 |
+| Track / task | `trec2026-ragtime-repgen` — ragtime, Report generation |
+| Runtag as accepted | `np-nugget-sol-v1` |
+| Submitted by | `npatta01` (NP Labs) |
+| EvalBase state | *waiting for validation* |
 
-**Submitted:** _(date/time, and the EvalBase confirmation id if it gives one)_
+This is the only report-generation run submitted for the track.
 
 ---
 
