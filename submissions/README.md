@@ -11,7 +11,7 @@ should be reproducible and auditable from its folder alone.
 
 | Runtag | Task | Topics | Status | Validation | Ledger |
 | --- | --- | --- | --- | --- | --- |
-| [`np-nugget-sol-v1`](np-nugget-sol-v1/) | Report generation | 103 / 103 | prepared, upload pending | AutoJudge `ragtime26` `--strict`: 103/103 ✅ | [LEDGER.md](np-nugget-sol-v1/LEDGER.md) |
+| [`np-nugget-sol-v1`](np-nugget-sol-v1/) | Report generation | 103 / 103 | **submitted 2026-08-13** | AutoJudge `ragtime26` `--strict`: 103/103 ✅ | [LEDGER.md](np-nugget-sol-v1/LEDGER.md) |
 
 ## Layout
 
@@ -43,8 +43,9 @@ Exit 0 means the organizers' checker accepts the run.
 2. `mkdir submissions/<runtag>` and copy in the submission JSONL.
 3. Write `<file>.sha256` with `sha256sum`.
 4. Copy an existing `LEDGER.md` as the template and fill in every section.
-   Leave the **Submitted** line blank until the upload is confirmed — a ledger
-   claiming a submission that has not happened is worse than one with a gap.
+   Leave the **Submitted** section blank until the upload is confirmed — a
+   ledger claiming a submission that has not happened is worse than one with a
+   gap. Fill it in from the EvalBase listing once the run appears there.
 5. Add a row to the index above.
 
 Keep the folder name, the runtag in the filename, and the `run_id` inside every
