@@ -1,0 +1,45 @@
+type: task
+name: ragtime-richer-score
+python: "3.12"
+
+files:
+  - ../src:src
+  - ../scripts:scripts
+  - ../pyproject.toml:pyproject.toml
+  - ../uv.lock:uv.lock
+  - ../README.md:README.md
+
+env:
+  - HF_TOKEN=${{ secrets.hf_token }}
+  - RAGTIME_HF_BUCKET_ID
+  - RAGTIME_ARTIFACT_PREFIX
+  - RAGTIME_CACHE_NAMESPACE
+  - SCORING_PLAN_KEY
+  - SCORING_SHARD
+
+commands:
+  - |
+    set -euo pipefail
+    py="$(command -v python3)"
+    case "$py" in /*) ;; *) echo "python3 path is not absolute" >&2; exit 127 ;; esac
+    "$py" -c 'import sys; print("interpreter:", sys.executable)'
+    uv sync --no-managed-python --no-python-downloads --python "$py" --frozen
+    uv run --no-managed-python --no-python-downloads --python "$py" hf auth whoami
+    uv run --no-managed-python --no-python-downloads --python "$py" \
+      python scripts/score_remote.py --plan-key "$SCORING_PLAN_KEY" --preflight
+    uv run --no-managed-python --no-python-downloads --python "$py" \
+      python scripts/score_remote.py --plan-key "$SCORING_PLAN_KEY" \
+      --device cuda --shard "$SCORING_SHARD"
+
+resources:
+  gpu: A40,A6000,L40,L40S,RTX6000Ada,A100,H100:1:24GB..
+  memory: 12GB..
+  disk: 40GB..
+
+backends: [runpod]
+spot_policy: on-demand
+max_price: 1.50
+
+retry:
+  on_events: [no-capacity]
+  duration: 30m

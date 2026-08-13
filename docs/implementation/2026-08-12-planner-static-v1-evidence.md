@@ -948,3 +948,79 @@ run, or Runpod scoring job launched. The Framework host exposes its AMD GPU,
 but the installed PyTorch build is CUDA 12.8 and reports no CUDA device; no
 existing Flash endpoint is configured. Retrieval continues independently and
 complete topics accumulate behind the hard gate.
+
+### Deadline per-query Runpod scoring and nugget follow-on
+
+The user lifted the scoring hold and explicitly preferred the already-proven
+per-query path over a new topic-union remote worker. At sealing time, 43 topics
+were fully retrieved. The immutable private scoring wave contains 42 topics
+and 1,457 unique query strings whose snapshot retrievals each resolve to one
+durable object. Topic 2048 is deferred because its fused coverage record names
+13 source retrieval objects per task and does not satisfy the existing
+one-object-per-query worker contract.
+
+The 451 KiB plan was written and independently reread from the private bucket
+at
+`trec_ragtime_2026/experiments/per-query-scoring/v1/49/49d955e1a6bf19097600458cc24a022bfc5217ef5e8eb29a9ccd5183bbdfa8cf.json`.
+The plan SHA-256 is
+`49d955e1a6bf19097600458cc24a022bfc5217ef5e8eb29a9ccd5183bbdfa8cf`.
+
+The exact dstack preview offered Runpod A40 at $0.44/GPU-hour and RTX A6000 at
+$0.53/GPU-hour. Ten uniquely named shards (`ragtime-richer-s01` through
+`ragtime-richer-s10`) launched with a $1.50/GPU-hour hard cap: seven A40 and
+three RTX A6000, for $4.67/hour while all ten run. Several same-name launch
+collisions from the first parallel dispatch were identified by exact run ID
+and terminated; only the ten unique logical shards remain. All ten reached
+`running`, sampled logs contained zero `FAILED`, `MISSING`, or `Traceback`
+markers, and observed scoring was about 28–35 seconds/query. The corresponding
+wall-clock estimate is roughly 75–90 minutes, or about $5.84–$7.01 of Runpod
+compute if throughput holds.
+
+The follow-on tmux session `ragtime-static-nuggets` monitors those exact ten
+runs and starts four local nugget shards only when all ten finish successfully.
+Its four cache-only preflights selected 11/11/10/10 topics and each read a real
+100-document retrieval artifact. The adapter reuses `rerank_retrieval`,
+`evidence_from_reranking`, and `run_topic`; `CacheOnlyPassageScorer` makes a
+missing GPU score a failure rather than a CPU recomputation. It reuses
+`openai/gpt-4.1-mini`, which exactly reproduces the prior validated nugget
+fingerprint `c13f8d507f3dbf3667a097b3f725020cdc599ada4b648813a2501d1fab8f1802`.
+The provider stage retains the existing finite 64-call budget per topic.
+
+The new static-plan assembly seam and existing nugget stage passed 69 focused
+tests. No push, pull request, code deployment, submission, or public sharing
+was performed.
+
+### Competition closure (2026-08-13)
+
+The user reported that the competition had closed and asked to stop spending
+compute and close the workstream. The four-worker retrieval process was
+terminated, its tmux session exited, and no retrieval process remains active.
+Atomic query checkpoints and all private cache artifacts were preserved. The
+on-disk `progress.json` still says `running` because the process was
+intentionally terminated rather than allowed to rewrite a terminal manifest;
+that field is stale and must not be interpreted as a live process.
+
+The final checkpoint visible before shutdown records:
+
+- 79 of 103 topics fully retrieved;
+- 2,893 of 3,292 sealed queries successful;
+- 162 queries not reached in the stopped pass;
+- 237 query errors from the pass, predominantly organizer timeouts; and
+- 399 sealed queries unresolved in total.
+
+The first downstream scoring wave covered 42 topics and 1,457 queries. It
+finished 1,456 score artifacts, leaving one query for topic 2039 unscored.
+Seven original shards and the two long-running shards completed; the shard-4
+retry skipped its 145 cached successes but again failed to read the one target
+retrieval object from the remote worker after bounded backoff. The same object
+was readable from the owner host, so the failure remains an intermittent
+artifact-store access issue, not evidence of a malformed query or missing
+local artifact. The retry run is terminally failed, and no dstack job remains
+running.
+
+Nuggetization produced no topic bundle: its monitor exited when the original
+shard-4 run failed and was not restarted. No further retrieval retry, scoring,
+nuggetization, report generation, validation, or submission will be attempted
+for this competition unless the user explicitly reopens the workstream. No
+commit, push, pull request, deployment, or submission was performed as part of
+closure.

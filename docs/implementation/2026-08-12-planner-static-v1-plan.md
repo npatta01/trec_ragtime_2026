@@ -102,11 +102,10 @@ hierarchical information needs.
   Complete 96/96 successfully, using the next sealed variant for the nine
   historically failed topics, then rebuild and verify the all-topic coverage
   index.
-- [ ] Complete the remaining 3,165 sealed richer-plan queries. A private,
-  resumable, two-worker, zero-retry run is active in tmux as
-  `20260813T073518Z`. Its `topic-major-v1` queue finishes every remaining
-  query for one topic before advancing. Only two requests are in flight.
-  Three- and four-worker gates were slower than two; four also timed out.
+- [x] Close the competition workstream at the user's request. Retrieval was
+  intentionally stopped with 79/103 topics and 2,893/3,292 sealed queries
+  complete. All checkpoints remain preserved; no runner or remote scoring job
+  is active, and no further competition pipeline work is planned.
 
 ## Verification gates
 
@@ -122,17 +121,13 @@ hierarchical information needs.
 
 ## Current next action
 
-Do not repeat successful retrievals or regenerate plans. Baseline C and richer
-breadth supplements now both cover all 103 topics. This is one richer query per
-topic for most topics, not execution of all 3,292 sealed queries: the retrieved
-tasks initially covered 118/882 planned requirements, and only three multi-query
-topics covered every planned requirement. At the user's explicit request, the
-remaining full-plan run is now active in topic-major order. Monitor its
-owner-only `progress.json`; do not launch a duplicate runner. Downstream
-topic-union scoring is gated to topics whose successful task count exactly
-equals the sealed plan task count. Passage scoring is held: no scorer process
-or new infrastructure is active. When scoring resumes, consume complete topics
-only, deduplicate canonical document IDs across all query results, score every
-passage against every information need, and retain the maximum pair score with
-no RRF. When the first retrieval pass finishes, rerun the same checkpoint-aware
-command only if its final status records errors.
+The competition is closed and this workstream is intentionally inactive. Do
+not restart retrieval, scoring, nuggetization, report generation, or submission
+work without explicit new authorization. Preserve the existing private caches
+and checkpoints for retrospective analysis. The final retrieval checkpoint is
+79/103 complete topics and 2,893/3,292 successful sealed queries; the first
+42-topic scoring wave has 1,456/1,457 score artifacts and no nugget bundles.
+The on-disk retrieval progress status is stale because the active process was
+terminated during closure; process and tmux checks confirm that no runner is
+active. The safest optional future action is a bounded retrospective using
+existing artifacts only.

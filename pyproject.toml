@@ -43,6 +43,8 @@ runpod = ["runpod-flash>=1.18,<2"]
 [project.scripts]
 ragtime-corpus = "trec_ragtime.corpus_cli:main"
 ragtime-query-baseline = "trec_ragtime.query_baselines:main"
+ragtime-static-plan = "trec_ragtime.planner_static:main"
+ragtime-topic-score = "trec_ragtime.topic_union_cli:main"
 ragtime-cache-import = "trec_ragtime.cache_import:main"
 ragtime-retrieval-import = "trec_ragtime.retrieval_import:main"
 ragtime-nuggets = "trec_ragtime.nuggets_cli:main"
