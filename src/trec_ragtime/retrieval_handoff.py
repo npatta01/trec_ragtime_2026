@@ -200,7 +200,15 @@ def project_retrieval_handoff(
     if not nugget_bundle.nuggets or not selected_aliases:
         raise HandoffError("handoff requires retained nuggets and selected evidence")
 
-    documents_seen: dict[str, str] = {}
+    selected_document_ids = {
+        row.document_id
+        for row in nugget_bundle.evidence
+        if row.alias in selected_aliases
+    }
+    _validate_retrieval_fingerprint_lineage(retrievals)
+    documents_seen = _validate_selected_document_lineage(
+        retrievals, selected_document_ids
+    )
     evidence: list[HandoffEvidence] = []
     for row in nugget_bundle.evidence:
         if row.alias not in selected_aliases:
@@ -610,6 +618,53 @@ def _nugget_source_key_matches(source: HandoffNuggetSource) -> bool:
         )
     except (TypeError, ValueError):
         return False
+
+
+def _validate_selected_document_lineage(
+    retrievals: Mapping[int, RetrievalResult], selected_document_ids: set[str]
+) -> dict[str, str]:
+    """Prove every supplied occurrence of a selected document has one text."""
+
+    documents_seen: dict[str, str] = {}
+    for retrieval in retrievals.values():
+        if not isinstance(retrieval, RetrievalResult):
+            raise HandoffError("retrieval result has an invalid type")
+        for document in retrieval.documents:
+            if not isinstance(document, RetrievedDocument):
+                raise HandoffError("retrieval document has an invalid type")
+            if document.document_id not in selected_document_ids:
+                continue
+            text = document.report_text
+            if not isinstance(text, str) or not text:
+                raise HandoffError("selected document has no report_text")
+            previous = documents_seen.setdefault(document.document_id, text)
+            if previous != text:
+                raise HandoffError("same document disagrees across retrieval inputs")
+    return documents_seen
+
+
+def _validate_retrieval_fingerprint_lineage(
+    retrievals: Mapping[int, RetrievalResult],
+) -> None:
+    """Require one retriever/corpus fingerprint when references expose it."""
+
+    common: bytes | None = None
+    for retrieval in retrievals.values():
+        if not isinstance(retrieval, RetrievalResult):
+            raise HandoffError("retrieval result has an invalid type")
+        reference = retrieval.retrieval_artifact
+        if reference is None:
+            continue
+        fingerprint = getattr(reference, "retriever_fingerprint", None)
+        if fingerprint is None:
+            # Older in-memory fixtures only carry object_key/request_digest.
+            continue
+        if not _is_digest(fingerprint):
+            raise HandoffError("retrieval fingerprint is invalid")
+        if common is None:
+            common = fingerprint
+        elif fingerprint != common:
+            raise HandoffError("retrieval fingerprints disagree across facets")
 
 
 def _expected_nugget_id(topic_id: str, claim: str, aliases: tuple[str, ...]) -> str:

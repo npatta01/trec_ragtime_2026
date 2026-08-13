@@ -571,6 +571,22 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.assertFalse(store.local_candidate("object.mpk").exists())
         self.assertEqual(store.local_candidate("other.mpk").read_bytes(), b"other")
 
+    def test_evict_local_raises_a_sanitized_error_when_unlink_fails(self) -> None:
+        store = self.make_store()
+        candidate = store.local_candidate("object.mpk")
+        candidate.write_bytes(b"local")
+
+        with patch.object(
+            Path, "unlink", side_effect=OSError("token=secret-token")
+        ):
+            with self.assertRaisesRegex(
+                ArtifactStoreRemoteError, "could not evict local candidate"
+            ) as raised:
+                store.evict_local("object.mpk")
+
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertTrue(candidate.exists())
+
     def test_read_validated_only_repairs_artifact_validation_errors(self) -> None:
         store = self.make_store()
         store.local_candidate("object.mpk").write_bytes(b"local")
@@ -619,7 +635,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
             [("hf://buckets/owner/bucket/foo/object.mpk", "rb")],
         )
 
-    def test_local_l1_eviction_failure_warns_and_disables_without_l2(self) -> None:
+    def test_local_l1_eviction_failure_is_fatal_and_disables_l2(self) -> None:
         store = self.make_store()
         store.local_candidate("object.mpk").write_bytes(b"stale")
 
@@ -628,9 +644,27 @@ class ArtifactStoreTestCase(unittest.TestCase):
         ), patch.object(Path, "unlink", side_effect=OSError("permission denied")):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                self.assertIsNone(store.read("object.mpk"))
+                with self.assertRaises(ArtifactStoreRemoteError):
+                    store.read("object.mpk")
                 with self.assertRaises(ArtifactStoreRemoteError):
                     store.write("other.mpk", b"payload")
+        self.assert_one_sanitized_warning(caught)
+        self.assertEqual(self.api_constructed, 0)
+        self.assertEqual(self.fs_constructed, 0)
+
+    def test_strict_validated_read_never_turns_l1_eviction_failure_into_miss(
+        self,
+    ) -> None:
+        store = self.make_store()
+        store.local_candidate("object.mpk").write_bytes(b"stale")
+
+        with patch.object(
+            Path, "read_bytes", side_effect=OSError("permission denied")
+        ), patch.object(Path, "unlink", side_effect=OSError("permission denied")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with self.assertRaises(ArtifactStoreRemoteError):
+                    store.read_validated_strict("object.mpk", self.decoder)
         self.assert_one_sanitized_warning(caught)
         self.assertEqual(self.api_constructed, 0)
         self.assertEqual(self.fs_constructed, 0)

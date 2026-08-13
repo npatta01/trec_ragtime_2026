@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
 import msgspec
 
-from trec_ragtime.artifact_store import ArtifactValidationError
+from trec_ragtime.artifact_store import (
+    ArtifactStore,
+    ArtifactValidationError,
+    ArtifactStoreRemoteError,
+)
 from trec_ragtime.retrieval_handoff_cache import (
     HandoffEnvelope,
     HandoffFingerprint,
@@ -34,14 +40,48 @@ class StrictMemoryArtifactStore(MemoryArtifactStore):
         return decoder(payload)
 
 
+class RefusingEvictionArtifactStore(ArtifactStore):
+    """Artifact store test double that retains a stale L1 candidate."""
+
+    def __init__(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        super().__init__(
+            bucket_id="owner/bucket",
+            local_dir=Path(self._tempdir.name) / "artifacts",
+        )
+        self.objects: dict[str, bytes] = {}
+        self.writes: list[str] = []
+
+    def write(self, object_key: str, payload: bytes) -> bool:
+        self.writes.append(object_key)
+        self.objects[object_key] = payload
+        self.local_candidate(object_key).write_bytes(payload)
+        return True
+
+    def read_validated_strict(self, object_key, decoder):
+        candidate = self.local_candidate(object_key)
+        if not candidate.exists():
+            return None
+        return decoder(candidate.read_bytes())
+
+    def _best_effort_remove_candidate(self, candidate: Path) -> bool:
+        return False
+
+    def close(self) -> None:
+        self._tempdir.cleanup()
+
+
 class RetrievalHandoffCacheTests(unittest.TestCase):
     def setUp(self) -> None:
         self.store = StrictMemoryArtifactStore()
         self.cache = RetrievalHandoffArtifactCache(self.store)
         self.fingerprint = HandoffFingerprint()
+        self.producer_identity_digest = hashlib.sha256(b"producer-v1").digest()
         self.bundle = bundle_fixture()
         self.request = request_for_bundle(
-            self.bundle, topic_catalog_digest=hashlib.sha256(b"topics").digest()
+            self.bundle,
+            topic_catalog_digest=hashlib.sha256(b"topics").digest(),
+            producer_identity_digest=self.producer_identity_digest,
         )
 
     def test_object_key_is_namespaced_and_sharded(self) -> None:
@@ -59,6 +99,18 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
         self.assertEqual(self.store.reads, [key])
         self.assertEqual(self.cache.get(self.fingerprint, self.request), self.bundle)
 
+    def test_put_fails_when_l1_eviction_refuses_and_does_not_reread_stale_l1(self) -> None:
+        store = RefusingEvictionArtifactStore()
+        self.addCleanup(store.close)
+        cache = RetrievalHandoffArtifactCache(store)
+
+        with self.assertRaises(ArtifactStoreRemoteError):
+            cache.put(self.fingerprint, self.request, self.bundle)
+
+        self.assertEqual(
+            store.writes, [cache.object_key(self.fingerprint, self.request)]
+        )
+
     def test_reads_a_manifest_object_key_without_reconstructing_upstream_inputs(self) -> None:
         self.cache.put(self.fingerprint, self.request, self.bundle)
         key = self.cache.object_key(self.fingerprint, self.request)
@@ -68,6 +120,7 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
                 self.fingerprint,
                 key,
                 topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=self.producer_identity_digest,
             ),
             self.bundle,
         )
@@ -81,6 +134,7 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
                 self.fingerprint,
                 key,
                 topic_catalog_digest=hashlib.sha256(b"other topics").digest(),
+                producer_identity_digest=self.producer_identity_digest,
             )
         )
 
@@ -94,6 +148,11 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
         )
         self.assertIsNone(self.cache.get(changed_fp, self.request))
         self.assertIsNone(self.cache.get(self.fingerprint, changed_request))
+        changed_producer = msgspec.structs.replace(
+            self.request,
+            producer_identity_digest=hashlib.sha256(b"producer-v2").digest(),
+        )
+        self.assertIsNone(self.cache.get(self.fingerprint, changed_producer))
 
     def test_tampered_payload_is_fatal(self) -> None:
         self.cache.put(self.fingerprint, self.request, self.bundle)
@@ -111,6 +170,7 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
                 self.fingerprint,
                 foreign,
                 topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=self.producer_identity_digest,
             )
 
     def test_object_key_request_digest_must_match_the_envelope(self) -> None:
@@ -124,6 +184,7 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
                 self.fingerprint,
                 foreign_key,
                 topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=self.producer_identity_digest,
             )
 
     def test_object_key_read_rejects_a_tampered_envelope_identity(self) -> None:
@@ -140,6 +201,7 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
                 self.fingerprint,
                 key,
                 topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=self.producer_identity_digest,
             )
 
     def test_object_key_read_treats_malformed_payload_as_fatal(self) -> None:
@@ -151,6 +213,77 @@ class RetrievalHandoffCacheTests(unittest.TestCase):
                 self.fingerprint,
                 key,
                 topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=self.producer_identity_digest,
+            )
+
+    def test_object_key_read_accepts_a_topic_producer_mapping(self) -> None:
+        self.cache.put(self.fingerprint, self.request, self.bundle)
+        key = self.cache.object_key(self.fingerprint, self.request)
+        self.assertEqual(
+            self.cache.get_by_object_key(
+                self.fingerprint,
+                key,
+                topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digests={
+                    self.bundle.topic.topic_id: self.producer_identity_digest
+                },
+            ),
+            self.bundle,
+        )
+
+    def test_object_key_read_missing_topic_mapping_is_a_miss(self) -> None:
+        self.cache.put(self.fingerprint, self.request, self.bundle)
+        key = self.cache.object_key(self.fingerprint, self.request)
+        self.assertIsNone(
+            self.cache.get_by_object_key(
+                self.fingerprint,
+                key,
+                topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digests={"other-topic": self.producer_identity_digest},
+            )
+        )
+
+    def test_object_key_read_with_a_different_producer_is_a_miss(self) -> None:
+        self.cache.put(self.fingerprint, self.request, self.bundle)
+        key = self.cache.object_key(self.fingerprint, self.request)
+        self.assertIsNone(
+            self.cache.get_by_object_key(
+                self.fingerprint,
+                key,
+                topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=hashlib.sha256(b"producer-v2").digest(),
+            )
+        )
+
+    def test_object_key_read_requires_exactly_one_producer_identity(self) -> None:
+        self.cache.put(self.fingerprint, self.request, self.bundle)
+        key = self.cache.object_key(self.fingerprint, self.request)
+        with self.assertRaises(ValueError):
+            self.cache.get_by_object_key(
+                self.fingerprint,
+                key,
+                topic_catalog_digest=self.request.topic_catalog_digest,
+            )
+        with self.assertRaises(ValueError):
+            self.cache.get_by_object_key(
+                self.fingerprint,
+                key,
+                topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=self.producer_identity_digest,
+                producer_identity_digests={
+                    self.bundle.topic.topic_id: self.producer_identity_digest
+                },
+            )
+
+    def test_object_key_read_rejects_a_malformed_producer_digest(self) -> None:
+        self.cache.put(self.fingerprint, self.request, self.bundle)
+        key = self.cache.object_key(self.fingerprint, self.request)
+        with self.assertRaises(ArtifactValidationError):
+            self.cache.get_by_object_key(
+                self.fingerprint,
+                key,
+                topic_catalog_digest=self.request.topic_catalog_digest,
+                producer_identity_digest=b"short",
             )
 
     def test_bundle_request_disagreement_is_rejected_before_write(self) -> None:

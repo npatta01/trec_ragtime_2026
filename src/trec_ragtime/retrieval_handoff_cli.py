@@ -9,6 +9,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Literal
 
 import msgspec
 
@@ -32,8 +33,10 @@ from .providers import provider_settings
 from .query_baselines import default_query_plan_path, load_query_plans
 from .retrieval_handoff import (
     HandoffNuggetSource,
+    HandoffTopic,
     RetrievalHandoffBundle,
     project_retrieval_handoff,
+    topic_record,
 )
 from .retrieval_handoff_cache import (
     OBJECT_ROOT,
@@ -55,6 +58,42 @@ class _IdentityBackend:
         self.fingerprint = identity
 
 
+PRODUCER_BEHAVIOR_VERSION = "retrieval-handoff-producer-v3"
+EXPECTED_RETRIEVER_FINGERPRINT_SHA256 = (
+    "487a18b1c3ebfdb4c967e6fea15c6a522d91f5bb002841d1ea03cb766c4ee1e7"
+)
+
+
+class _ProducerFacet(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    facet_index: int
+    query: str
+    baseline: Literal["b", "c"]
+    query_index: int
+    pair_length_fingerprint: str
+
+
+class _ProducerIdentity(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    schema_version: Literal[1]
+    behavior_version: str
+    topic_id: str
+    query_plan_digest: bytes
+    retrieval_pipeline: str
+    top_k: int
+    rerank_documents: int | None
+    max_content_fallbacks: int
+    fallback_on_hf_error: bool
+    representation: Literal["report_text"]
+    retriever_fingerprint_digest: bytes
+    scorer_fingerprint: str
+    passage_chunker_runtime_fingerprint: str
+    facets: tuple[_ProducerFacet, ...]
+    nugget_fingerprint_digest: bytes
+
+    @property
+    def digest(self) -> bytes:
+        return hashlib.sha256(msgspec.msgpack.encode(self)).digest()
+
+
 def build_parser():
     parser = build_nugget_parser()
     parser.prog = "ragtime-retrieval-handoff"
@@ -65,6 +104,11 @@ def build_parser():
         default=[],
         metavar="TOPIC_ID=SHA256",
         help="override the retrieval plan digest for one refreshed topic (repeatable)",
+    )
+    parser.add_argument(
+        "--retriever-fingerprint-sha256",
+        default=EXPECTED_RETRIEVER_FINGERPRINT_SHA256,
+        help="expected canonical retrieval/corpus fingerprint",
     )
     return parser
 
@@ -86,12 +130,24 @@ def _topic_plan_digests(values: Sequence[str]) -> dict[str, str]:
     return overrides
 
 
-def _cache_only_scorer(arguments):
+def _sha256_digest(value: object, name: str) -> bytes:
+    if (
+        not isinstance(value, str)
+        or len(value) != hashlib.sha256().digest_size * 2
+        or value.lower() != value
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be lowercase SHA-256")
+    return bytes.fromhex(value)
+
+
+def _producer_scorer_config(arguments):
+    """Resolve result-affecting scorer policy without loading a model."""
+
     from .passage_scoring import LocalCrossEncoderConfig
 
     if arguments.scorer == "local":
-        config = LocalCrossEncoderConfig(device=arguments.device)
-        return config, CacheOnlyPassageScorer(config.fingerprint)
+        return LocalCrossEncoderConfig(device=arguments.device)
     if not arguments.flash_endpoint_id:
         raise ValueError("--scorer flash requires --flash-endpoint-id")
     if arguments.flash_workers < 1:
@@ -104,7 +160,89 @@ def _cache_only_scorer(arguments):
         workers=(0, arguments.flash_workers),
         concurrency=arguments.flash_concurrency or arguments.flash_workers,
     )
-    return flash.effective_model_config, CacheOnlyPassageScorer(flash.fingerprint)
+    return flash.effective_model_config
+
+
+def _cache_only_scorer(arguments, *, scorer_config=None):
+    config = scorer_config or _producer_scorer_config(arguments)
+    fingerprint = getattr(config, "fingerprint", None)
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise ValueError("scorer configuration has no fingerprint")
+    return config, CacheOnlyPassageScorer(fingerprint)
+
+
+def _producer_identity(
+    plan,
+    *,
+    plan_sha256: str,
+    arguments,
+    scorer_config,
+    nugget_fingerprint_digest: bytes,
+) -> _ProducerIdentity:
+    """Bind one handoff to the exact cold-path inputs, without upstream I/O."""
+
+    from .passage_scoring import CrossEncoderPairLengthFunction
+    from .passages import passage_chunker_runtime_fingerprint
+    from .query_baselines import PIPELINE
+
+    query_plan_digest = _sha256_digest(plan_sha256, "query plan digest")
+    retriever_fingerprint_digest = _sha256_digest(
+        arguments.retriever_fingerprint_sha256,
+        "retriever fingerprint",
+    )
+    if (
+        isinstance(arguments.top_k, bool)
+        or not isinstance(arguments.top_k, int)
+        or arguments.top_k < 1
+    ):
+        raise ValueError("--top-k must be a positive integer")
+    if arguments.rerank_documents is not None and (
+        isinstance(arguments.rerank_documents, bool)
+        or not isinstance(arguments.rerank_documents, int)
+        or arguments.rerank_documents < 1
+    ):
+        raise ValueError("--rerank-documents must be a positive integer")
+    if (
+        not isinstance(nugget_fingerprint_digest, bytes)
+        or len(nugget_fingerprint_digest) != hashlib.sha256().digest_size
+    ):
+        raise ValueError("nugget fingerprint digest must be 32 bytes")
+    scorer_fingerprint = getattr(scorer_config, "fingerprint", None)
+    if not isinstance(scorer_fingerprint, str) or not scorer_fingerprint:
+        raise ValueError("scorer configuration has no fingerprint")
+
+    facets = tuple(
+        _ProducerFacet(
+            facet_index=facet.facet_index,
+            query=facet.query,
+            baseline=facet.baseline,
+            query_index=facet.query_index,
+            pair_length_fingerprint=CrossEncoderPairLengthFunction(
+                scorer_config, facet.query
+            ).fingerprint,
+        )
+        for facet in plan_queries(plan)
+    )
+    topic_id = getattr(plan, "topic_id", None)
+    if not isinstance(topic_id, str) or not topic_id or not facets:
+        raise ValueError("query plan must identify a topic and at least one facet")
+    return _ProducerIdentity(
+        schema_version=1,
+        behavior_version=PRODUCER_BEHAVIOR_VERSION,
+        topic_id=topic_id,
+        query_plan_digest=query_plan_digest,
+        retrieval_pipeline=PIPELINE,
+        top_k=arguments.top_k,
+        rerank_documents=arguments.rerank_documents,
+        max_content_fallbacks=0,
+        fallback_on_hf_error=False,
+        representation="report_text",
+        retriever_fingerprint_digest=retriever_fingerprint_digest,
+        scorer_fingerprint=scorer_fingerprint,
+        passage_chunker_runtime_fingerprint=passage_chunker_runtime_fingerprint(),
+        facets=facets,
+        nugget_fingerprint_digest=nugget_fingerprint_digest,
+    )
 
 
 def _nugget_candidates(
@@ -192,12 +330,14 @@ def _discover_cached_handoffs(
     fingerprint: HandoffFingerprint,
     *,
     topic_catalog_digest: bytes,
-    topic_ids: Sequence[str],
-    nugget_fingerprint_digest: bytes | None = None,
+    expected_topics: Mapping[str, HandoffTopic],
+    producer_identity_digests: Mapping[str, bytes],
 ) -> dict[str, tuple[RetrievalHandoffBundle, str]]:
     """Resolve complete handoffs directly, before opening any upstream stage."""
 
-    wanted = set(topic_ids)
+    wanted = set(expected_topics)
+    if wanted != set(producer_identity_digests):
+        raise ValueError("producer identities must exactly cover selected topics")
     found: dict[str, tuple[RetrievalHandoffBundle, str]] = {}
     prefix = f"{OBJECT_ROOT}/{fingerprint.digest.hex()}"
     for object_key in store.list_keys(prefix):
@@ -205,15 +345,14 @@ def _discover_cached_handoffs(
             fingerprint,
             object_key,
             topic_catalog_digest=topic_catalog_digest,
+            producer_identity_digests=producer_identity_digests,
         )
         if bundle is None or bundle.topic.topic_id not in wanted:
             continue
-        if (
-            nugget_fingerprint_digest is not None
-            and bundle.nugget_source.fingerprint_digest
-            != nugget_fingerprint_digest
-        ):
-            continue
+        if bundle.topic != expected_topics[bundle.topic.topic_id]:
+            raise ArtifactValidationError(
+                "cached handoff topic disagrees with current catalog"
+            )
         if bundle.topic.topic_id in found:
             raise ValueError("multiple current handoffs exist for one topic")
         found[bundle.topic.topic_id] = (bundle, object_key)
@@ -221,7 +360,9 @@ def _discover_cached_handoffs(
 
 
 def _cached_outcome(
-    bundle: RetrievalHandoffBundle, object_key: str
+    bundle: RetrievalHandoffBundle,
+    object_key: str,
+    producer_identity_digest: bytes,
 ) -> HandoffOutcome:
     return HandoffOutcome(
         topic_id=bundle.topic.topic_id,
@@ -232,6 +373,7 @@ def _cached_outcome(
         full_support_count=bundle.counts.full_support,
         partial_support_count=bundle.counts.partial_support,
         citation_ready_count=bundle.counts.citation_ready,
+        producer_identity_digest=producer_identity_digest.hex(),
     )
 
 
@@ -245,6 +387,7 @@ def _prepare_source_identity(
     representation: str,
     top_k: int,
     rerank_documents: int | None,
+    expected_retriever_fingerprint: bytes,
     tokenizer_loader=None,
 ) -> tuple[tuple[NuggetInput, ...], str, dict[int, object]]:
     """Rebuild request lineage without chunking, scoring, or passage projection."""
@@ -253,6 +396,11 @@ def _prepare_source_identity(
     from .passages import PassageChunker
     from .query_baselines import PIPELINE, _query_context
 
+    if (
+        not isinstance(expected_retriever_fingerprint, bytes)
+        or len(expected_retriever_fingerprint) != hashlib.sha256().digest_size
+    ):
+        raise ValueError("expected retriever fingerprint must be 32 bytes")
     inputs: list[NuggetInput] = []
     sources: list[str] = []
     retrievals: dict[int, object] = {}
@@ -273,6 +421,13 @@ def _prepare_source_identity(
             continue
         if rerank_documents is not None:
             retrieval = _head(retrieval, rerank_documents)
+        reference = retrieval.retrieval_artifact
+        if (
+            reference is None
+            or getattr(reference, "retriever_fingerprint", None)
+            != expected_retriever_fingerprint
+        ):
+            raise ValueError("cached retrieval has an unexpected retriever fingerprint")
         chunker = PassageChunker(
             CrossEncoderPairLengthFunction(
                 scorer_config,
@@ -280,7 +435,6 @@ def _prepare_source_identity(
                 tokenizer_loader=tokenizer_loader,
             )
         )
-        reference = retrieval.retrieval_artifact
         inputs.append(
             NuggetInput(
                 facet_index=facet.facet_index,
@@ -325,6 +479,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             evidence_budget=arguments.evidence_budget,
             max_nuggets=arguments.max_nuggets,
         )
+        scorer_config = _producer_scorer_config(arguments)
+        expected_retriever_fingerprint = _sha256_digest(
+            arguments.retriever_fingerprint_sha256,
+            "retriever fingerprint",
+        )
+        producer_identity_digests = {
+            plan.topic_id: _producer_identity(
+                plan,
+                plan_sha256=plan_digests.get(
+                    plan.topic_id, arguments.plan_sha256
+                ),
+                arguments=arguments,
+                scorer_config=scorer_config,
+                nugget_fingerprint_digest=nugget_fingerprint.digest,
+            ).digest
+            for plan in plans
+        }
+        expected_topics = {
+            plan.topic_id: topic_record(topics[plan.topic_id]) for plan in plans
+        }
         store = ArtifactStore.from_env()
         handoff_cache = RetrievalHandoffArtifactCache(store)
         topic_catalog_digest = hashlib.sha256(Path(arguments.topics).read_bytes()).digest()
@@ -334,8 +508,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             handoff_cache,
             handoff_fingerprint,
             topic_catalog_digest=topic_catalog_digest,
-            topic_ids=tuple(plan.topic_id for plan in plans),
-            nugget_fingerprint_digest=nugget_fingerprint.digest,
+            expected_topics=expected_topics,
+            producer_identity_digests=producer_identity_digests,
         )
     except Exception as error:  # noqa: BLE001 - CLI reports bounded setup failures
         print(f"{type(error).__name__}: configuration is invalid", file=sys.stderr)
@@ -344,7 +518,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     work: list[HandoffWork] = []
     failures: dict[str, HandoffOutcome] = {}
     produced = {
-        topic_id: _cached_outcome(bundle, object_key)
+        topic_id: _cached_outcome(
+            bundle, object_key, producer_identity_digests[topic_id]
+        )
         for topic_id, (bundle, object_key) in cached_handoffs.items()
     }
     missing_plans = tuple(
@@ -352,7 +528,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if missing_plans:
         try:
-            scorer_config, scorer = _cache_only_scorer(arguments)
+            scorer_config, scorer = _cache_only_scorer(
+                arguments, scorer_config=scorer_config
+            )
             nugget_cache = NuggetArtifactCache(store)
             candidates = _nugget_candidates(store, nugget_fingerprint.digest)
         except Exception as error:  # noqa: BLE001 - bounded cold-path setup
@@ -363,11 +541,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             missing_plans = ()
 
     with ExitStack() as stack:
-        retriever = (
-            stack.enter_context(RagtimeRetriever.from_env())
-            if missing_plans
-            else None
-        )
+        retriever = None
+        if missing_plans:
+            try:
+                retriever = stack.enter_context(RagtimeRetriever.from_env())
+            except Exception as error:  # noqa: BLE001 - bounded cold setup
+                for plan in missing_plans:
+                    failures[plan.topic_id] = HandoffOutcome(
+                        plan.topic_id, "failed", reason=type(error).__name__
+                    )
+                missing_plans = ()
         tokenizer_loader = _shared_tokenizer_loader() if missing_plans else None
         for plan in missing_plans:
             try:
@@ -382,6 +565,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     representation="report_text",
                     top_k=arguments.top_k,
                     rerank_documents=arguments.rerank_documents,
+                    expected_retriever_fingerprint=expected_retriever_fingerprint,
                     tokenizer_loader=tokenizer_loader,
                 )
                 if not inputs:
@@ -421,7 +605,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     nugget_source=source,
                     retrievals=retrievals,  # type: ignore[arg-type]
                 )
-                work.append(HandoffWork(plan.topic_id, topic_catalog_digest, bundle))
+                work.append(
+                    HandoffWork(
+                        topic_id=plan.topic_id,
+                        topic_catalog_digest=topic_catalog_digest,
+                        producer_identity_digest=producer_identity_digests[
+                            plan.topic_id
+                        ],
+                        bundle=bundle,
+                    )
+                )
             except Exception as error:  # noqa: BLE001 - isolate one topic
                 failures[plan.topic_id] = HandoffOutcome(
                     plan.topic_id, "failed", reason=type(error).__name__

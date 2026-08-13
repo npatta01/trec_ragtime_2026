@@ -9,6 +9,7 @@ import msgspec
 from trec_ragtime.models import PipelineResult, RetrievalResult, RetrievedDocument, SearchHit
 from trec_ragtime.nuggets import NuggetSupport
 from trec_ragtime.nugget_cache import nugget_object_key
+from trec_ragtime.retrieval_cache import RetrievalArtifactReference, retrieval_object_key
 from trec_ragtime.retrieval_handoff import (
     HandoffError,
     HandoffNuggetSource,
@@ -206,6 +207,66 @@ class RetrievalHandoffTests(unittest.TestCase):
         changed = msgspec.structs.replace(self.nuggets, facets=(facet,))
         with self.assertRaisesRegex(HandoffError, "facet"):
             self.project(changed)
+
+    def test_same_document_disagreement_between_facets_fails_closed(self) -> None:
+        other = RetrievalResult(
+            PipelineResult("other facet", "ragtime2%20", (SearchHit(1, "doc-a", 0.8),), True, True, None, None, None),
+            (RetrievedDocument(1, "doc-a", 0.8, "conflicting passage", None, None, "eng", "fixture", True),),
+            retrieval_artifact=SimpleNamespace(
+                object_key="retrieval/v1/other",
+                request_digest=b"o" * 32,
+            ),
+        )
+        retrievals = dict(self.retrievals)
+        retrievals[1] = other
+        with self.assertRaisesRegex(HandoffError, "document"):
+            project_retrieval_handoff(
+                topic=self.topic,
+                nugget_bundle=self.nuggets,
+                nugget_request=self.request,
+                nugget_source=self.source,
+                retrievals=retrievals,
+            )
+
+    def test_retrieval_fingerprint_mismatch_fails_closed(self) -> None:
+        request_digest = self.request.inputs[0].request_digest
+        fingerprint_a = b"a" * 32
+        fingerprint_b = b"b" * 32
+        reference_a = RetrievalArtifactReference(
+            object_key=retrieval_object_key(fingerprint_a, request_digest),
+            request_digest=request_digest,
+            retriever_fingerprint=fingerprint_a,
+            stored_at=1.0,
+            cache_hit=True,
+        )
+        reference_b = RetrievalArtifactReference(
+            object_key=retrieval_object_key(fingerprint_b, b"q" * 32),
+            request_digest=b"q" * 32,
+            retriever_fingerprint=fingerprint_b,
+            stored_at=1.0,
+            cache_hit=True,
+        )
+        selected = self.retrievals[0]
+        retrievals = {
+            0: RetrievalResult(
+                selected.search_result,
+                selected.documents,
+                retrieval_artifact=reference_a,
+            ),
+            1: RetrievalResult(
+                PipelineResult("other facet", "ragtime2%20", (SearchHit(1, "doc-b", 0.4),), True, True, None, None, None),
+                (RetrievedDocument(1, "doc-b", 0.4, "other passage", None, None, "eng", "fixture", True),),
+                retrieval_artifact=reference_b,
+            ),
+        }
+        with self.assertRaisesRegex(HandoffError, "fingerprint"):
+            project_retrieval_handoff(
+                topic=self.topic,
+                nugget_bundle=self.nuggets,
+                nugget_request=self.request,
+                nugget_source=self.source,
+                retrievals=retrievals,
+            )
 
     def test_retrieval_identity_disagreement_fails_closed(self) -> None:
         result = self.retrievals[0]

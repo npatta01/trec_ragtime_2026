@@ -10,12 +10,14 @@
   `codex/retrieval-generation-handoff-design`.
 - The corrected warm path discovers durable handoff objects before opening any
   upstream stage; the official 103-topic pass completed as 103 cache hits in
-  1.14 seconds.
+  1.97 seconds.
 - The complete owner-only manifest is stored under the shared project cache at
   `experiments/retrieval-handoff/complete-103.json`.
-- The independent review findings covering warm reuse, strict malformed-L2
-  handling, direct manifest-key reads, request lineage, and runtime validation
-  have been addressed. Final regression verification is the remaining step.
+- The manifest covers 1,814 retained nuggets and 2,020 selected evidence rows;
+  all 103 producer identities and object keys are present.
+- The independent review findings covering exact producer identity, warm
+  reuse, strict malformed-L2 handling, direct manifest-key reads, request
+  lineage, runtime validation, and durable rereads have been addressed.
 
 **Architecture:** Reconstruct the exact merged PR #26 nugget request using cache-only retrieval and reranking seams, require its sealed nugget artifact to exist, and project its retained support links into a strict MessagePack handoff bundle. Store that derived bundle in the shared artifact store under its own complete identity, validate it before and after durable storage, and expose only a typed cache reader to generation.
 

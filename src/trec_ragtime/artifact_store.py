@@ -516,7 +516,9 @@ class ArtifactStore:
         except OSError:
             if not self._best_effort_remove_candidate(candidate):
                 self._disable_remote()
-                return None
+                raise ArtifactStoreRemoteError(
+                    "artifact store could not repair an unreadable local candidate"
+                ) from None
             return self._read_remote(object_key)
         if found:
             return cast(bytes, payload)
@@ -527,7 +529,10 @@ class ArtifactStore:
 
         object_key = self._validate_object_key(object_key)
         candidate = self.local_candidate(object_key)
-        self._best_effort_remove_candidate(candidate)
+        if not self._best_effort_remove_candidate(candidate):
+            raise ArtifactStoreRemoteError(
+                "artifact store could not evict local candidate"
+            ) from None
 
     def read_validated(
         self, object_key: str, decoder: Callable[[bytes], T]
@@ -559,7 +564,9 @@ class ArtifactStore:
         except OSError:
             if not self._best_effort_remove_candidate(candidate):
                 self._disable_remote()
-                return None
+                raise ArtifactStoreRemoteError(
+                    "artifact store could not repair an unreadable local candidate"
+                ) from None
             payload = self._read_remote(object_key)
             if payload is None:
                 return None

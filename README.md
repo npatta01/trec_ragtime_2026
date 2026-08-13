@@ -742,8 +742,17 @@ consumer artifact with the same model and scorer identity used above:
 ```bash
 uv run ragtime-retrieval-handoff \
   --model <model-id> \
+  --device cuda \
+  --retriever-fingerprint-sha256 \
+    487a18b1c3ebfdb4c967e6fea15c6a522d91f5bb002841d1ea03cb766c4ee1e7 \
+  --topic-plan-sha256 \
+    2066=e71f54e5ca59eadaa59073536f3c12f551d763c19993ba7c858624af861e3b01 \
   --manifest /absolute/path/to/retrieval-handoff-manifest.json
 ```
+
+The retriever fingerprint pins the canonical endpoint/corpus identity, and the
+topic-specific digest selects the refreshed retrieval for topic 2066. Keep both
+when consuming the current 103-topic nugget run.
 
 This command is cache-only. It reconstructs the exact retrieval, passage-score,
 and nugget identities only for a missing handoff. A warm run discovers and
@@ -769,6 +778,7 @@ bundle = handoff_cache.get_by_object_key(
     fingerprint,
     topic["object_key"],
     topic_catalog_digest=bytes.fromhex(manifest["topic_catalog_digest"]),
+    producer_identity_digest=bytes.fromhex(topic["producer_identity_digest"]),
 )
 if bundle is None:
     raise RuntimeError("retrieval handoff is incomplete")

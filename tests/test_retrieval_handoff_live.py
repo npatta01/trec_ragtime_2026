@@ -45,6 +45,10 @@ class RetrievalHandoffLiveTests(unittest.TestCase):
                         ),
                         "--device",
                         "cuda",
+                        "--retriever-fingerprint-sha256",
+                        "487a18b1c3ebfdb4c967e6fea15c6a522d91f5bb002841d1ea03cb766c4ee1e7",
+                        "--topic-plan-sha256",
+                        "2066=e71f54e5ca59eadaa59073536f3c12f551d763c19993ba7c858624af861e3b01",
                         "--manifest",
                         str(manifest_path),
                     ]
@@ -71,6 +75,9 @@ class RetrievalHandoffLiveTests(unittest.TestCase):
                     HandoffFingerprint(),
                     key,
                     topic_catalog_digest=catalog_digest,
+                    producer_identity_digest=bytes.fromhex(
+                        row["producer_identity_digest"]
+                    ),
                 )
                 self.assertIsNotNone(bundle)
                 self.assertEqual(bundle.topic.topic_id, row["topic_id"])

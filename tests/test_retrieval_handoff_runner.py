@@ -18,18 +18,23 @@ from trec_ragtime.retrieval_handoff_runner import (
     write_handoff_manifest,
 )
 
-from tests.test_nugget_cache import MemoryArtifactStore
-from tests.test_retrieval_handoff_cache import bundle_fixture
+from tests.test_retrieval_handoff_cache import (
+    StrictMemoryArtifactStore,
+    bundle_fixture,
+)
 
 
 class RetrievalHandoffRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.store = MemoryArtifactStore()
+        self.store = StrictMemoryArtifactStore()
         self.cache = RetrievalHandoffArtifactCache(self.store)
         self.fingerprint = HandoffFingerprint()
         self.digest = hashlib.sha256(b"topics").digest()
+        self.producer_identity_digest = hashlib.sha256(b"producer-v1").digest()
         self.bundle = bundle_fixture()
-        self.work = HandoffWork("2000", self.digest, self.bundle)
+        self.work = HandoffWork(
+            "2000", self.digest, self.producer_identity_digest, self.bundle
+        )
 
     def test_cold_write_then_warm_resume(self) -> None:
         cold = run_topic(self.work, fingerprint=self.fingerprint, cache=self.cache)
@@ -38,6 +43,12 @@ class RetrievalHandoffRunnerTests(unittest.TestCase):
         self.assertEqual(warm.status, "cached")
         self.assertEqual(warm.object_key, cold.object_key)
         self.assertEqual(len(self.store.writes), 1)
+        self.assertEqual(
+            cold.producer_identity_digest, self.producer_identity_digest.hex()
+        )
+        self.assertEqual(
+            warm.producer_identity_digest, self.producer_identity_digest.hex()
+        )
 
     def test_parallel_results_preserve_input_order(self) -> None:
         second_topic = msgspec.structs.replace(self.bundle.topic, topic_id="2001")
@@ -55,7 +66,12 @@ class RetrievalHandoffRunnerTests(unittest.TestCase):
             self.bundle, topic=second_topic, nuggets=second_nuggets
         )
         outcomes = run_topics(
-            (HandoffWork("2001", self.digest, second_bundle), self.work),
+            (
+                HandoffWork(
+                    "2001", self.digest, self.producer_identity_digest, second_bundle
+                ),
+                self.work,
+            ),
             fingerprint=self.fingerprint,
             cache=self.cache,
             concurrency=2,
@@ -76,6 +92,10 @@ class RetrievalHandoffRunnerTests(unittest.TestCase):
             payload = json.loads(path.read_text())
             self.assertTrue(payload["complete"])
             self.assertEqual(payload["evidence_count"], 1)
+            self.assertEqual(
+                payload["topics"][0]["producer_identity_digest"],
+                self.producer_identity_digest.hex(),
+            )
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertNotIn("grain passage", path.read_text())
 

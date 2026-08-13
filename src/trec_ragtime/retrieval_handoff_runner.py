@@ -28,6 +28,7 @@ DEFAULT_CONCURRENCY = 8
 class HandoffWork:
     topic_id: str
     topic_catalog_digest: bytes
+    producer_identity_digest: bytes
     bundle: RetrievalHandoffBundle
 
 
@@ -42,6 +43,7 @@ class HandoffOutcome:
     partial_support_count: int = 0
     citation_ready_count: int = 0
     reason: str | None = None
+    producer_identity_digest: str | None = None
 
 
 def run_topic(
@@ -56,14 +58,26 @@ def run_topic(
         if work.topic_id != work.bundle.topic.topic_id:
             raise ValueError("work topic identity disagrees with bundle")
         request = request_for_bundle(
-            work.bundle, topic_catalog_digest=work.topic_catalog_digest
+            work.bundle,
+            topic_catalog_digest=work.topic_catalog_digest,
+            producer_identity_digest=work.producer_identity_digest,
         )
         key = cache.object_key(fingerprint, request)
         cached = cache.get(fingerprint, request)
         if cached is not None:
-            return _outcome(cached, "cached", key)
+            return _outcome(
+                cached,
+                "cached",
+                key,
+                producer_identity_digest=work.producer_identity_digest,
+            )
         durable = cache.put(fingerprint, request, work.bundle)
-        return _outcome(durable, "written", key)
+        return _outcome(
+            durable,
+            "written",
+            key,
+            producer_identity_digest=work.producer_identity_digest,
+        )
     except Exception as error:  # noqa: BLE001 - isolate one topic failure
         return HandoffOutcome(work.topic_id, "failed", reason=_sanitize(error))
 
@@ -134,6 +148,8 @@ def _outcome(
     bundle: RetrievalHandoffBundle,
     status: Literal["cached", "written"],
     key: str,
+    *,
+    producer_identity_digest: bytes,
 ) -> HandoffOutcome:
     return HandoffOutcome(
         topic_id=bundle.topic.topic_id,
@@ -144,6 +160,7 @@ def _outcome(
         full_support_count=bundle.counts.full_support,
         partial_support_count=bundle.counts.partial_support,
         citation_ready_count=bundle.counts.citation_ready,
+        producer_identity_digest=producer_identity_digest.hex(),
     )
 
 
