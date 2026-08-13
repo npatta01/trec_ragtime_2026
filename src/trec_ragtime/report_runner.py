@@ -33,9 +33,15 @@ from .artifact_store import ArtifactStore, ArtifactStoreError
 from .evidence_bundle import (
     EvidenceBundle,
     EvidenceBundleError,
+    build_evidence_bundle_from_handoff,
     build_evidence_bundles,
     load_evidence_run,
     sha256_file,
+)
+from .report_handoff import (
+    HandoffSourceError,
+    load_handoff_manifest,
+    require_handoff_bundle,
 )
 from .paths import default_project_cache_dir, ensure_private_cache_dir
 from .report_cache import (
@@ -263,9 +269,65 @@ def _run_topic(
     return _TopicOutcome(task.ordinal, task.topic.topic_id, report, None)
 
 
+def _handoff_topic_matches(handoff: Any, topic: Topic) -> bool:
+    """Require the embedded official topic to match the catalog exactly."""
+
+    record = handoff.topic
+    return (
+        record.topic_id == topic.topic_id
+        and record.collection_id == topic.collection_id
+        and record.title == topic.title
+        and record.problem_statement == topic.problem_statement
+        and record.background == topic.background
+        and record.limit == topic.limit
+    )
+
+
+def _bundles_from_handoff(
+    manifest_path: Path,
+    *,
+    topics: Sequence[Topic],
+    store: Any,
+    topics_sha256: str,
+    evidence_chars: int,
+) -> tuple[tuple[EvidenceBundle, ...], tuple[Topic, ...], tuple[str, ...], dict[str, Any]]:
+    """Load one self-contained handoff bundle per topic, cache-only."""
+
+    manifest = load_handoff_manifest(manifest_path)
+    bundles: list[EvidenceBundle] = []
+    available: list[Topic] = []
+    missing: list[str] = []
+    for topic in topics:
+        entry = manifest.entry(topic.topic_id)
+        if entry is None or not entry.available:
+            missing.append(topic.topic_id)
+            continue
+        handoff = require_handoff_bundle(store, entry)
+        if not _handoff_topic_matches(handoff, topic):
+            raise ReportRunError(
+                f"handoff topic record for {topic.topic_id} does not match the"
+                " official topic catalog"
+            )
+        bundles.append(
+            build_evidence_bundle_from_handoff(
+                handoff, topics_sha256=topics_sha256, evidence_chars=evidence_chars
+            )
+        )
+        available.append(topic)
+    record = {
+        "run_schema": "retrieval_handoff_v1",
+        "manifest_path_name": manifest.path_name,
+        "handoff_fingerprint": manifest.fingerprint,
+        "topic_catalog_digest": manifest.topic_catalog_digest,
+        "handoff_complete": manifest.complete,
+    }
+    return tuple(bundles), tuple(available), tuple(missing), record
+
+
 def run_report_generation(
     *,
-    input_dir: Path | str,
+    input_dir: Path | str | None = None,
+    handoff_manifest: Path | str | None = None,
     topics_path: Path | str,
     output_root: Path | str,
     team_id: str,
@@ -298,7 +360,7 @@ def run_report_generation(
         raise ReportRunError("each worker needs its own completions client")
 
     topics_path = Path(topics_path)
-    input_dir = Path(input_dir)
+    input_dir = Path(input_dir) if input_dir is not None else None
     all_topics = load_topics(topics_path)
     if topic_ids is not None:
         wanted = set(topic_ids)
@@ -309,27 +371,59 @@ def run_report_generation(
     else:
         topics = all_topics
 
-    try:
-        evidence_run = load_evidence_run(input_dir)
-    except EvidenceBundleError as error:
-        raise ReportRunError(str(error)) from None
+    topics_sha256 = sha256_file(topics_path)
+    if handoff_manifest is not None:
+        try:
+            bundles, available, missing, input_record = _bundles_from_handoff(
+                Path(handoff_manifest),
+                topics=topics,
+                store=store,
+                topics_sha256=topics_sha256,
+                evidence_chars=settings.evidence_chars,
+            )
+        except (HandoffSourceError, EvidenceBundleError) as error:
+            raise ReportRunError(str(error)) from None
+        corpus_record: dict[str, Any] = {"dataset": None, "revision": None}
+        if not available:
+            raise ReportRunError(
+                "the handoff manifest covers none of the requested topics"
+            )
+    else:
+        if input_dir is None:
+            raise ReportRunError("either input_dir or handoff_manifest is required")
+        try:
+            evidence_run = load_evidence_run(input_dir)
+        except EvidenceBundleError as error:
+            raise ReportRunError(str(error)) from None
 
-    available = tuple(topic for topic in topics if topic.topic_id in evidence_run.topics)
-    missing = tuple(
-        topic.topic_id for topic in topics if topic.topic_id not in evidence_run.topics
-    )
-    if not available:
-        raise ReportRunError(
-            f"evidence run {evidence_run.run_id} covers none of the requested topics"
+        available = tuple(topic for topic in topics if topic.topic_id in evidence_run.topics)
+        missing = tuple(
+            topic.topic_id for topic in topics if topic.topic_id not in evidence_run.topics
         )
+        if not available:
+            raise ReportRunError(
+                f"evidence run {evidence_run.run_id} covers none of the requested topics"
+            )
 
-    bundles = build_evidence_bundles(
-        evidence_run,
-        topics=available,
-        topics_sha256=sha256_file(topics_path),
-        max_passages=settings.max_passages,
-        evidence_chars=settings.evidence_chars,
-    )
+        bundles = build_evidence_bundles(
+            evidence_run,
+            topics=available,
+            topics_sha256=topics_sha256,
+            max_passages=settings.max_passages,
+            evidence_chars=settings.evidence_chars,
+        )
+        input_record = {
+            "run_schema": evidence_run.run_schema,
+            "run_id": evidence_run.run_id,
+            "run_dir_name": evidence_run.run_dir_name,
+            "manifest_sha256": evidence_run.manifest_sha256,
+            "records_sha256": evidence_run.records_sha256,
+            "rejected_candidates": evidence_run.rejected_candidates,
+        }
+        corpus_record = {
+            "dataset": evidence_run.corpus_dataset,
+            "revision": evidence_run.corpus_revision,
+        }
     requests = tuple(
         ReportRequestIdentity.for_bundle(bundle, topic=topic, settings=settings)
         for bundle, topic in zip(bundles, available)
@@ -355,24 +449,14 @@ def run_report_generation(
             "run_desc": run_desc,
             "generator_fingerprint": fingerprint,
             "settings": _settings_record(settings),
-            "input": {
-                "run_schema": evidence_run.run_schema,
-                "run_id": evidence_run.run_id,
-                "run_dir_name": evidence_run.run_dir_name,
-                "manifest_sha256": evidence_run.manifest_sha256,
-                "records_sha256": evidence_run.records_sha256,
-                "rejected_candidates": evidence_run.rejected_candidates,
-            },
+            "input": input_record,
             "topics": {
                 "path_name": topics_path.name,
-                "sha256": sha256_file(topics_path),
+                "sha256": topics_sha256,
                 "requested": len(topics),
                 "with_evidence": len(available),
             },
-            "corpus": {
-                "dataset": evidence_run.corpus_dataset,
-                "revision": evidence_run.corpus_revision,
-            },
+            "corpus": corpus_record,
             "concurrency": concurrency,
         }
 
@@ -556,7 +640,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ragtime-report",
         description="Generate validated RAGTIME reports from a sealed evidence run.",
     )
-    parser.add_argument("--input", required=True, help="Retrieval run directory")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", help="Retrieval run directory")
+    source.add_argument(
+        "--handoff-manifest",
+        help="Manifest from ragtime-retrieval-handoff; consumes one sealed bundle per topic",
+    )
     parser.add_argument("--topics", default=DEFAULT_TOPICS_PATH, help="Official topics JSONL")
     parser.add_argument(
         "--team-id",
@@ -622,10 +711,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    input_dir = Path(args.input)
+    input_dir = Path(args.input) if args.input else None
+    handoff_manifest = Path(args.handoff_manifest) if args.handoff_manifest else None
     topics_path = Path(args.topics)
-    if not input_dir.is_dir():
+    if input_dir is not None and not input_dir.is_dir():
         print(f"input run directory not found: {input_dir}", file=sys.stderr)
+        return 2
+    if handoff_manifest is not None and not handoff_manifest.is_file():
+        print(f"handoff manifest not found: {handoff_manifest}", file=sys.stderr)
         return 2
     if not topics_path.is_file():
         print(f"topics file not found: {topics_path}", file=sys.stderr)
@@ -703,6 +796,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             result = run_report_generation(
                 input_dir=input_dir,
+                handoff_manifest=handoff_manifest,
                 topics_path=topics_path,
                 output_root=output_root,
                 team_id=team_id,

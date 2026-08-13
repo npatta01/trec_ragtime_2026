@@ -72,6 +72,7 @@ DROP_REASONS = frozenset(
         "not_nfkc",
         "over_limit_pack",
         "citation_cap",
+        "not_citable",
         "unsupported_claim",
         "handle_mismatch",
     }
@@ -718,6 +719,11 @@ def validate_report(
                 raise ReportValidationError(
                     f"sentence {position} handle {citation.handle} does not resolve to"
                     f" {citation.document_id}"
+                )
+            if not bundle.passage(citation.handle).citable:
+                raise ReportValidationError(
+                    f"sentence {position} cites {citation.handle}, which is context"
+                    " only and not citation ready"
                 )
             scores.append(_finite_score(citation.score, position=position))
             documents.append(citation.document_id)

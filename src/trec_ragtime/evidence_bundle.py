@@ -43,14 +43,22 @@ FACET_PREFIX = "F"
 
 QUERY_BASELINE_SCHEMA = "query_baseline_v1"
 CONTROL_A_SCHEMA = "control_a_v1"
-SUPPORTED_RUN_SCHEMAS = frozenset({QUERY_BASELINE_SCHEMA, CONTROL_A_SCHEMA})
+RETRIEVAL_HANDOFF_SCHEMA = "retrieval_handoff_v1"
+SUPPORTED_RUN_SCHEMAS = frozenset(
+    {QUERY_BASELINE_SCHEMA, CONTROL_A_SCHEMA, RETRIEVAL_HANDOFF_SCHEMA}
+)
 
 FACET_SOURCE_QUERY_BASELINE = "query_baseline_facet_v1"
 FACET_SOURCE_CONTROL_A = "control_a_problem_v1"
 FACET_SOURCE_TOPIC_REQUEST = "topic_request_v1"
+FACET_SOURCE_NUGGET_BUNDLE = "nugget_bundle_v1"
+SUPPORT_ASSIGNMENTS = frozenset({"support", "partial_support"})
 FACET_IMPORTANCE = frozenset({"vital", "okay"})
 
-_HANDLE_PATTERN = re.compile(r"S[1-9]\d*\Z")
+# Handles are prompt-facing and must never collide with a corpus document ID,
+# which is a long dashed UUID. Upstream handoff aliases ("e001") are preserved
+# verbatim, so this accepts any short alphanumeric token.
+_HANDLE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]{0,15}\Z")
 _FACET_PATTERN = re.compile(r"F[1-9]\d*\Z")
 
 
@@ -122,6 +130,40 @@ class EvidenceFacet:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceSupport:
+    """One judged link from a passage to a facet it attests.
+
+    ``assignment`` and ``variant_index`` come straight from the upstream nugget
+    bundle. ``citation_ready`` is the upstream policy decision: only full
+    ``support`` is citable by default, and ``partial_support`` must never be
+    silently promoted to a full citation.
+    """
+
+    facet_id: str
+    assignment: str
+    variant_index: int
+    citation_ready: bool
+
+    def __post_init__(self) -> None:
+        if not _FACET_PATTERN.fullmatch(self.facet_id or ""):
+            raise EvidenceBundleError("support facet_id must look like F1, F2, ...")
+        if self.assignment not in SUPPORT_ASSIGNMENTS:
+            raise EvidenceBundleError(
+                f"support assignment must be one of {sorted(SUPPORT_ASSIGNMENTS)}"
+            )
+        if isinstance(self.variant_index, bool) or not isinstance(self.variant_index, int):
+            raise EvidenceBundleError("variant_index must be an integer")
+        if self.variant_index < 0:
+            raise EvidenceBundleError("variant_index must be non-negative")
+        if not isinstance(self.citation_ready, bool):
+            raise EvidenceBundleError("citation_ready must be a boolean")
+        if self.citation_ready and self.assignment != "support":
+            raise EvidenceBundleError(
+                "only a full support link may be citation ready"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class EvidencePassage:
     """One allowlisted English passage the generator may cite."""
 
@@ -135,6 +177,8 @@ class EvidencePassage:
     rank: int
     retrieval_score: float
     facet_ids: tuple[str, ...]
+    support: tuple[EvidenceSupport, ...] = ()
+    citable: bool = True
 
     def __post_init__(self) -> None:
         if not _HANDLE_PATTERN.fullmatch(self.handle or ""):
@@ -155,6 +199,25 @@ class EvidencePassage:
                 raise EvidenceBundleError("facet_ids must look like F1, F2, ...")
         if len(set(self.facet_ids)) != len(self.facet_ids):
             raise EvidenceBundleError("facet_ids must be unique")
+        if not isinstance(self.citable, bool):
+            raise EvidenceBundleError("citable must be a boolean")
+        if not isinstance(self.support, tuple):
+            raise EvidenceBundleError("support must be a tuple")
+        if self.support:
+            # Derived fields cannot drift from the links they summarize.
+            credited = tuple(
+                dict.fromkeys(
+                    link.facet_id for link in self.support if link.citation_ready
+                )
+            )
+            if self.facet_ids != credited:
+                raise EvidenceBundleError(
+                    "facet_ids must be the citation-ready support facets, in order"
+                )
+            if self.citable != bool(credited):
+                raise EvidenceBundleError(
+                    "citable must reflect whether any support link is citation ready"
+                )
 
     @classmethod
     def create(
@@ -169,6 +232,8 @@ class EvidencePassage:
         rank: int,
         retrieval_score: float,
         facet_ids: Sequence[str],
+        support: Sequence["EvidenceSupport"] = (),
+        citable: bool = True,
     ) -> "EvidencePassage":
         """Build a passage, hashing its text so tampering is detectable."""
 
@@ -183,6 +248,8 @@ class EvidencePassage:
             rank=rank,
             retrieval_score=float(retrieval_score),
             facet_ids=tuple(facet_ids),
+            support=tuple(support),
+            citable=citable,
         )
 
     def verify(self) -> None:
@@ -236,6 +303,13 @@ class _FacetWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     importance: str
 
 
+class _SupportWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    facet_id: str
+    assignment: str
+    variant_index: int
+    citation_ready: bool
+
+
 class _PassageWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     handle: str
     document_id_utf8: bytes
@@ -247,6 +321,8 @@ class _PassageWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     rank: int
     retrieval_score: float
     facet_ids: tuple[str, ...]
+    support: tuple[_SupportWire, ...]
+    citable: bool
 
 
 class _SourceWire(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -325,6 +401,16 @@ def _bundle_wire(
                 rank=passage.rank,
                 retrieval_score=passage.retrieval_score,
                 facet_ids=passage.facet_ids,
+                support=tuple(
+                    _SupportWire(
+                        facet_id=link.facet_id,
+                        assignment=link.assignment,
+                        variant_index=link.variant_index,
+                        citation_ready=link.citation_ready,
+                    )
+                    for link in passage.support
+                ),
+                citable=passage.citable,
             )
             for passage in passages
         ),
@@ -497,6 +583,12 @@ class EvidenceBundle:
     @property
     def handles(self) -> tuple[str, ...]:
         return tuple(passage.handle for passage in self.passages)
+
+    @property
+    def citable_handles(self) -> tuple[str, ...]:
+        """Handles the model may cite; partial-support evidence is excluded."""
+
+        return tuple(passage.handle for passage in self.passages if passage.citable)
 
     @property
     def document_ids(self) -> tuple[str, ...]:
@@ -902,6 +994,139 @@ def build_evidence_bundles(
     return tuple(bundles)
 
 
+def build_evidence_bundle_from_handoff(
+    handoff: Any,
+    *,
+    topics_sha256: str,
+    evidence_chars: int = 0,
+) -> EvidenceBundle:
+    """Project one self-contained retrieval handoff bundle into an EvidenceBundle.
+
+    The handoff is the retrieval pipeline's consumer-facing contract: it already
+    resolved nugget support links against the retrieval artifacts, copied the
+    exact English passage text, and proved every offset and content hash. This
+    is therefore a projection and nothing more — it performs no join, no
+    rehydration, no deduplication, and issues no upstream lookup of any kind.
+
+    Upstream evidence aliases are preserved verbatim rather than renumbered,
+    because renumbering would silently change citation identity. Only full
+    ``support`` links are citable; ``partial_support`` passages are carried as
+    labeled context and earn no facet credit.
+    """
+
+    from .retrieval_handoff import RetrievalHandoffBundle, check_retrieval_handoff
+
+    if not isinstance(handoff, RetrievalHandoffBundle):
+        raise EvidenceBundleError("handoff must be a RetrievalHandoffBundle")
+    try:
+        check_retrieval_handoff(handoff)
+    except Exception as error:
+        raise EvidenceBundleError(f"handoff bundle is invalid: {error}") from None
+    _require_digest(topics_sha256, name="topics_sha256")
+    if isinstance(evidence_chars, bool) or not isinstance(evidence_chars, int) or evidence_chars < 0:
+        raise EvidenceBundleError("evidence_chars must be a non-negative integer")
+    if not handoff.nuggets:
+        raise EvidenceBundleError("handoff bundle carries no nuggets")
+    if not handoff.evidence:
+        raise EvidenceBundleError("handoff bundle carries no evidence")
+
+    facets: list[EvidenceFacet] = []
+    facet_for_nugget: dict[str, str] = {}
+    for position, nugget in enumerate(handoff.nuggets, start=1):
+        facet_id = f"{FACET_PREFIX}{position}"
+        facet_for_nugget[nugget.nugget_id] = facet_id
+        facets.append(
+            EvidenceFacet(
+                facet_id=facet_id,
+                text=nugget.claim,
+                source=FACET_SOURCE_NUGGET_BUNDLE,
+                importance=nugget.importance,
+            )
+        )
+
+    known_aliases = {row.alias for row in handoff.evidence}
+    links: dict[str, list[EvidenceSupport]] = {}
+    for nugget in handoff.nuggets:
+        facet_id = facet_for_nugget[nugget.nugget_id]
+        for link in nugget.support:
+            if link.alias not in known_aliases:
+                raise EvidenceBundleError(
+                    f"support link names alias {link.alias!r}, which is not in the"
+                    " handoff evidence table"
+                )
+            links.setdefault(link.alias, []).append(
+                EvidenceSupport(
+                    facet_id=facet_id,
+                    assignment=link.assignment,
+                    variant_index=link.variant_index,
+                    citation_ready=bool(link.citation_ready),
+                )
+            )
+
+    passages: list[EvidencePassage] = []
+    for row in handoff.evidence:
+        support = tuple(links.get(row.alias, ()))
+        credited = tuple(
+            dict.fromkeys(link.facet_id for link in support if link.citation_ready)
+        )
+        if _text_digest(row.text) != row.content_hash.hex():
+            raise EvidenceBundleError(
+                f"handoff evidence {row.alias} text does not match its content hash"
+            )
+        passages.append(
+            EvidencePassage(
+                handle=row.alias,
+                document_id=row.document_id,
+                report_text=row.text,
+                text_sha256=row.content_hash.hex(),
+                language=row.language,
+                url=None,
+                date=None,
+                rank=row.document_rank,
+                retrieval_score=row.passage_score,
+                facet_ids=credited,
+                support=support,
+                citable=bool(credited),
+            )
+        )
+
+    if not any(passage.citable for passage in passages):
+        raise EvidenceBundleError(
+            f"topic {handoff.topic.topic_id} has no citation-ready evidence"
+        )
+
+    used = {link.facet_id for passage in passages for link in passage.support}
+    kept_facets = tuple(facet for facet in facets if facet.facet_id in used)
+    if not kept_facets:
+        raise EvidenceBundleError("no facet retained any supporting evidence")
+
+    source = EvidenceBundleSource(
+        run_schema=RETRIEVAL_HANDOFF_SCHEMA,
+        run_id=handoff.behavior_version,
+        run_dir_name=handoff.nugget_source.object_key,
+        manifest_sha256=handoff.nugget_source.fingerprint_digest.hex(),
+        records_sha256=handoff.nugget_source.request_digest.hex(),
+        topics_sha256=topics_sha256,
+        corpus_dataset=None,
+        corpus_revision=None,
+        nugget_bundle_sha256=handoff.nugget_source.bundle_digest.hex(),
+    )
+
+    return EvidenceBundle.create(
+        topic_id=handoff.topic.topic_id,
+        collection_id=handoff.topic.collection_id,
+        title=handoff.topic.title,
+        problem_statement=handoff.topic.problem_statement,
+        background=handoff.topic.background,
+        character_limit=handoff.topic.limit,
+        max_passages=len(passages),
+        evidence_chars=evidence_chars,
+        facets=kept_facets,
+        passages=tuple(passages),
+        source=source,
+    )
+
+
 __all__ = [
     "CONTROL_A_SCHEMA",
     "EVIDENCE_BUNDLE_BUILDER_VERSION",
@@ -915,10 +1140,12 @@ __all__ = [
     "EvidenceBundleSource",
     "EvidenceCandidate",
     "EvidenceFacet",
+    "EvidenceSupport",
     "EvidencePassage",
     "EvidenceRun",
     "EvidenceRunTopic",
     "UnknownEvidenceHandleError",
+    "build_evidence_bundle_from_handoff",
     "build_evidence_bundles",
     "load_evidence_run",
     "sha256_file",

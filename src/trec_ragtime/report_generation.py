@@ -167,7 +167,10 @@ def build_response_format(bundle: EvidenceBundle, settings: Any) -> dict[str, An
                                 "text": {"type": "string"},
                                 "evidence": {
                                     "type": "array",
-                                    "items": {"type": "string", "enum": list(bundle.handles)},
+                                    "items": {
+                                        "type": "string",
+                                        "enum": list(bundle.citable_handles),
+                                    },
                                 },
                                 "facets": {
                                     "type": "array",
@@ -202,6 +205,8 @@ Rules you must follow exactly:
 def _format_sources(bundle: EvidenceBundle) -> str:
     blocks = []
     for passage in bundle.passages:
+        if not passage.citable:
+            continue
         meta = " ".join(
             part
             for part in (
@@ -406,6 +411,12 @@ def _screen_candidates(
         ]
         if unknown:
             drop("unknown_handle")
+            continue
+        citable = set(bundle.citable_handles)
+        if any(handle not in citable for handle in candidate.handles):
+            # Partial-support evidence is context only. Promoting it to a full
+            # citation is exactly what the upstream policy forbids.
+            drop("not_citable")
             continue
         if candidate.substantive and not candidate.handles:
             drop("missing_citation")
@@ -616,6 +627,7 @@ _REPAIR_HINTS = {
     "not_nfkc": "a sentence used non-normalized text",
     "over_limit_pack": "the report exceeded the character budget",
     "citation_cap": "a sentence listed too many sources",
+    "not_citable": "a sentence cited a source that only partially supports its claim",
     "unsupported_claim": "a sentence was not supported by its cited source",
     "handle_mismatch": "a citation did not resolve to its source",
 }
