@@ -491,7 +491,7 @@ class FlashPassageWorker:
                     target_options=target_options,
                     skip_instance_cache=True,
                 )
-                self._private_verified = False
+                self._bucket_verified = False
 
             @staticmethod
             def _validate_key(key: str) -> str:
@@ -521,16 +521,14 @@ class FlashPassageWorker:
                 digest = hashlib.sha256(remote_path.encode("utf-8")).hexdigest()
                 return local_path / digest
 
-            def _verify_private(self) -> None:
-                if self._private_verified:
+            def _verify_bucket(self) -> None:
+                if self._bucket_verified:
                     return
                 try:
                     info = self._api.bucket_info(bucket_id)
                 except Exception as error:
                     raise ValueError("worker cache bucket inspection failed") from error
-                if getattr(info, "private", None) is not True:
-                    raise ValueError("worker cache bucket is not private")
-                self._private_verified = True
+                self._bucket_verified = True
 
             def read_validated(self, key: str, decoder: object) -> object | None:
                 key = self._validate_key(key)
@@ -549,7 +547,7 @@ class FlashPassageWorker:
                             candidate.unlink(missing_ok=True)
                         except OSError as error:
                             raise ValueError("worker cache read failed") from error
-                self._verify_private()
+                self._verify_bucket()
                 try:
                     with self._filesystem.open(self._remote_path(key), "rb") as handle:
                         payload = handle.read()
@@ -566,7 +564,7 @@ class FlashPassageWorker:
                 key = self._validate_key(key)
                 if not isinstance(payload, bytes):
                     raise ValueError("worker cache write failed")
-                self._verify_private()
+                self._verify_bucket()
                 try:
                     with self._filesystem.open(self._remote_path(key), "wb") as handle:
                         handle.write(payload)

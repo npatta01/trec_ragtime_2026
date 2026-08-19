@@ -395,7 +395,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
     def test_remote_failures_raise_and_preserve_l1(self) -> None:
         """Every one of these once returned None, i.e. "not there".
 
-        A throttle, an auth failure and a misconfigured bucket are all reasons
+        A throttle, an auth failure, and a transport failure are all reasons
         the answer is unknown. Returning None conflated them with a confirmed
         absence, which is how a rate-limited run recorded 1596 unscored queries
         as missing and exited successfully.
@@ -403,7 +403,6 @@ class ArtifactStoreTestCase(unittest.TestCase):
 
         failures = (
             {"api_error": RuntimeError("Authorization: Bearer secret-token")},
-            {"private": False},
             {"download_error": OSError("server unavailable")},
         )
         self.tempdir.cleanup()
@@ -436,14 +435,12 @@ class ArtifactStoreTestCase(unittest.TestCase):
         self.fs.fail_download = None
         self.assertEqual(store.read("object.mpk"), b"remote")
 
-    def test_a_public_bucket_is_refused_and_never_written_to(self) -> None:
+    def test_a_public_bucket_can_be_read_and_written(self) -> None:
         store = self.make_store(private=False)
-        with self.assertRaises(ArtifactStoreRemoteError):
-            store.read("object.mpk")
-        with self.assertRaises(ArtifactStoreRemoteError):
-            store.write("new.mpk", b"payload")
-        self.assertEqual(self.fs_constructed, 0)
-        self.assertNotIn("owner/bucket/foo/new.mpk", self.remote)
+
+        self.assertEqual(store.read("object.mpk"), b"remote")
+        self.assertTrue(store.write("new.mpk", b"payload"))
+        self.assertEqual(self.remote["owner/bucket/foo/new.mpk"], b"payload")
 
     def test_corrupt_l1_is_evicted_and_repaired_from_l2(self) -> None:
         store = self.make_store()
@@ -500,7 +497,7 @@ class ArtifactStoreTestCase(unittest.TestCase):
         )
 
     def test_failed_write_before_filesystem_open_preserves_existing_l1(self) -> None:
-        store = self.make_store(private=False)
+        store = self.make_store(api_error=OSError("inspection failed"))
         candidate = store.local_candidate("object.mpk")
         candidate.write_bytes(b"keep")
 
