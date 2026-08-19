@@ -143,7 +143,7 @@ class ArtifactStore:
         self._filesystem_factory = filesystem_factory or fsspec.filesystem
         self._api: Any | None = None
         self._filesystem: Any | None = None
-        self._private_verified = False
+        self._bucket_verified = False
         self._remote_disabled = False
         self._remote_warning_emitted = False
 
@@ -327,8 +327,8 @@ class ArtifactStore:
                 ) from None
         return self._filesystem
 
-    def _verify_private_bucket(self) -> None:
-        if self._private_verified:
+    def _verify_bucket(self) -> None:
+        if self._bucket_verified:
             return
         # Every process calls this before its first read, and the hub does not
         # retry bucket_info, so starting a wave of workers together reliably
@@ -349,11 +349,7 @@ class ArtifactStore:
                         "failed to inspect the configured Hugging Face bucket"
                     ) from None
                 time.sleep(RETRY_BASE_SECONDS * 2**attempt)
-        if getattr(info, "private", None) is not True:
-            raise ArtifactStoreRemoteError(
-                "configured Hugging Face bucket is not private"
-            )
-        self._private_verified = True
+        self._bucket_verified = True
 
     def _disable_remote(self) -> None:
         """Disable remote operations and emit one credential-safe warning."""
@@ -433,7 +429,7 @@ class ArtifactStore:
             raise ArtifactStoreRemoteError(
                 "remote artifact access is disabled after an earlier failure"
             )
-        self._verify_private_bucket()
+        self._verify_bucket()
 
         candidate = self.local_candidate(object_key)
         remote_path = self._remote_path(object_key)
@@ -466,7 +462,7 @@ class ArtifactStore:
             raise ArtifactStoreRemoteError(
                 "remote artifact access is disabled after an earlier failure"
             )
-        self._verify_private_bucket()
+        self._verify_bucket()
         full_prefix = self._full_object_key(prefix)
         remote_prefix = f"{full_prefix}/"
         try:
@@ -616,7 +612,7 @@ class ArtifactStore:
         candidate_existed_before = False
         try:
             candidate_existed_before = candidate.exists()
-            self._verify_private_bucket()
+            self._verify_bucket()
             filesystem = self._get_filesystem()
             handle = filesystem.open(self._remote_path(object_key), "wb")
             remote_open_attempted = True

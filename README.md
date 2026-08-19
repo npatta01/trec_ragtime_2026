@@ -444,18 +444,18 @@ with RagtimeClient.from_env() as client:
     print(document.text)
 ```
 
-Private responses and Dataset Viewer fallback documents are durable typed
-artifacts in a private Hugging Face Bucket (L2), read through a disposable
+Responses and Dataset Viewer fallback documents are durable typed artifacts in
+the public archival Hugging Face Bucket (L2), read through a disposable
 owner-only `fsspec.simplecache` directory (L1). Configure the bucket with
 `RAGTIME_HF_BUCKET_ID`, an optional `RAGTIME_ARTIFACT_PREFIX`, and an optional
 absolute `RAGTIME_ARTIFACT_CACHE_DIR` (defaulting to
 `<git-common-dir>/ragtime-cache/artifacts-v1`). `HF_TOKEN` is optional when the
 normal Hugging Face authentication lookup is available. Runtime artifact
-caching is best effort: a private-bucket authentication, transport, permission,
+caching is best effort: a bucket authentication, transport, permission,
 server, or write failure emits one credential-safe warning, disables remote
 access for that store instance, and leaves the live result usable as an
 uncached response. A cache miss is therefore normal after the breaker opens.
-L1 artifacts may be discarded and rebuilt from the private bucket; a malformed
+L1 artifacts may be discarded and rebuilt from the public bucket; a malformed
 L1 candidate is repaired once from L2, and malformed or mismatched typed
 payloads are never accepted. The adapters use a strict typed `msgspec`
 MessagePack envelope, enforce identity and domain validation, and admit writes
@@ -464,9 +464,9 @@ only for complete hydrated results without hydration failures. Runner
 checkpoints may include an optional artifact reference and omit it when
 best-effort storage is unavailable; a successful reference-less checkpoint is
 usable only in-process and is recomputed on resume or restart.
-The durable Hugging Face Bucket must remain private. The complete local corpus
-remains a separate revision-pinned DuckDB database and does not use
-per-document response caching.
+The durable Hugging Face Bucket is a public archive retained through the paper
+publication period. The complete local corpus remains a separate
+revision-pinned DuckDB database and does not use per-document response caching.
 
 ### Cache OpenAI-Compatible Chat Completions
 
@@ -594,15 +594,15 @@ the bearer token.
   client sorts it by descending score and then document ID for stable ties.
 - The client canonicalizes authentication to `Authorization: Bearer <token>`
   and distinguishes a local artifact hit from the service's own `cached` field.
-- Cached private queries and responses must be treated as participant data. The
+- Cached queries and responses are archived competition artifacts. The
   L1 artifact directory is created with user-only permissions and must not be
-  committed; the durable L2 bucket must remain private.
+  committed; the durable L2 bucket is public.
 
 ### One-Time Legacy Cache Import
 
 The runtime has no SQLite cache path. If an existing legacy response database
 must be migrated, use the explicit offline importer after configuring the
-private bucket and decrypting `.env`:
+bucket and decrypting `.env`:
 
 ```bash
 sops decrypt --output .env config/secrets.sops.env

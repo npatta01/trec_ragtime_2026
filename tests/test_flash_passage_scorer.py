@@ -1367,7 +1367,7 @@ class StaticFlashWorkerTests(unittest.TestCase):
 
         self.assertEqual(response["cache"]["status"], "miss_written")
 
-    def test_default_store_uses_private_bucket_configuration_without_leaking_secrets(
+    def test_default_store_uses_bucket_configuration_without_leaking_secrets(
         self,
     ) -> None:
         policy = LocalCrossEncoderConfig(max_length=100)

@@ -6,7 +6,7 @@ The nugget stage's output for all 103 TREC RAGTIME topics, and how to read it.
 
 | | |
 |---|---|
-| Bucket | `Npatta01/trec-ragtime-2026-artifacts` (private) |
+| Bucket | `Npatta01/trec-ragtime-2026-artifacts` (public archive) |
 | Object prefix | none (`RAGTIME_ARTIFACT_PREFIX` is empty) |
 | Key layout | `nuggets/v1/<fingerprint>/<request[:2]>/<request>.mpk` |
 | Behaviour fingerprint | `c13f8d507f3dbf3667a097b3f725020cdc599ada4b648813a2501d1fab8f1802` |
