@@ -1,0 +1,70 @@
+{
+  "upstream_commit": "95faef0",
+  "run_id": "np-nugget-sol-v1",
+  "team_id": "NP",
+  "release": "preliminary, November 4, 2026",
+  "source": "results/2026-11-02",
+  "archive_sha256": "7c87a6f660ef94a1f8eb6c90859aa123d8f148ad3cb342abf887e5bc23ba545c",
+  "rows": [
+    {
+      "label": "Citation support",
+      "human_metric": "citation_support_llmfilled",
+      "auto_metric": "citation_support_micro",
+      "values": [
+        "0.9371649057649636",
+        "0.8155477319896663",
+        "0.9371649057649636",
+        "0.9573391178597253",
+        "0.7532013969732246",
+        "0.9573391178597253"
+      ]
+    },
+    {
+      "label": "Sentence support",
+      "human_metric": "sentence_support_llmfilled",
+      "auto_metric": "sentence_support_micro",
+      "values": [
+        "0.9343859945776719",
+        "0.7970588235294117",
+        "0.934385994577672",
+        "0.958139534883721",
+        "0.7549824150058617",
+        "0.958139534883721"
+      ]
+    },
+    {
+      "label": "Nugget coverage",
+      "human_metric": "nugget_coverage_llmfilled",
+      "auto_metric": "nugget_coverage_micro",
+      "values": [
+        "0.4343016028569662",
+        "0.3580638123890718",
+        "0.4763253950970214",
+        "0.39156626506024095",
+        "0.3534136546184739",
+        "0.4939759036144578"
+      ]
+    },
+    {
+      "label": "F1",
+      "human_metric": "f1_llmfilled",
+      "auto_metric": "f1_micro",
+      "values": [
+        "0.5714623238115263",
+        "0.4653240973679949",
+        "0.6093292112788198",
+        "0.5559361441531212",
+        "0.4436089591745555",
+        "0.6120897273227837"
+      ]
+    }
+  ],
+  "column_order": [
+    "human_our_run",
+    "human_median",
+    "human_max",
+    "auto_our_run",
+    "auto_median",
+    "auto_max"
+  ]
+}
