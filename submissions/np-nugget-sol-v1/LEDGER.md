@@ -88,6 +88,16 @@ This is the only report-generation run submitted for the track.
 
 ---
 
+## Organizer results received
+
+The user-supplied `ragtime2026-results.1102.NP_Labs.tgz` reports scores for this
+run under `almost-human` (17 topics) and `autoargue` (34 topics). See the
+[results record](../../results/2026-11-02/README.md) for the original archives,
+separate metric summaries, provenance, and verification. The 34 autoargue
+reports preserve this submission's response text and citations exactly.
+This result record supplements the historical EvalBase state above; it does
+not establish a final ranked leaderboard or scores for all 103 topics.
+
 ## 2. The file
 
 | | |

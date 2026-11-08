@@ -1,0 +1,219 @@
+{
+  "run_id": "np-nugget-sol-v1",
+  "team_id": "NP",
+  "recorded_on": "2026-11-07",
+  "sources": [
+    {
+      "path": "sources/ragtime2026-results.1102.NP_Labs.tgz",
+      "sha256": "7c87a6f660ef94a1f8eb6c90859aa123d8f148ad3cb342abf887e5bc23ba545c",
+      "members": [
+        {
+          "path": "ragtime2026-results.1102.NP_Labs/repgen.almost-human.17-topics/np-nugget-sol-v1.judgments.tsv",
+          "bytes": 191778,
+          "sha256": "21ef3d961c922ecb2624cfd058c843cb07c8002e89f5594378cb2eff43c70638"
+        },
+        {
+          "path": "ragtime2026-results.1102.NP_Labs/repgen.almost-human.17-topics/np-nugget-sol-v1.scores.tsv",
+          "bytes": 18786,
+          "sha256": "7af26958d1a0e9bd9629c5a828a5af6e4e344d8bdfdce3ee603d64118d08ccf6"
+        },
+        {
+          "path": "ragtime2026-results.1102.NP_Labs/repgen.almost-human.17-topics/score-stats.tsv",
+          "bytes": 27266,
+          "sha256": "7ea3f33a9d2279b5d7449dcbc21355f3e9fd329b4ea0688211a1646221121a5b"
+        },
+        {
+          "path": "ragtime2026-results.1102.NP_Labs/repgen.autoargue.34-topics/np-nugget-sol-v1.judgments.jsonl",
+          "bytes": 1809784,
+          "sha256": "64925e43c0bb5620ee905b5a7cc719ee6a628752328f04f7ce08658074bc9df1"
+        },
+        {
+          "path": "ragtime2026-results.1102.NP_Labs/repgen.autoargue.34-topics/np-nugget-sol-v1.scores.tsv",
+          "bytes": 31769,
+          "sha256": "74ba10331b5a6d7217f32e36d12dbd4a485d326e8b55ce876b8084d2a8617c7e"
+        },
+        {
+          "path": "ragtime2026-results.1102.NP_Labs/repgen.autoargue.34-topics/score-stats.tsv",
+          "bytes": 45825,
+          "sha256": "d8e8a7d8e744ef6f97187ece7214fb78c26f1b77f4e9b7f4b2f5b859bd7c7bb1"
+        }
+      ]
+    },
+    {
+      "path": "sources/nuggets_1101.tgz",
+      "sha256": "8e8c81b1183bb37087d8067332ca0de0ff937cea0f728a0429fcc947a46da338",
+      "members": [
+        {
+          "path": "nuggets_1101/2001.json",
+          "bytes": 40676,
+          "sha256": "25853ab45e0ff5da933cee0ca2d87ccc2b2607fecbaeb794778a21c85ac0a89d"
+        },
+        {
+          "path": "nuggets_1101/2006.json",
+          "bytes": 101885,
+          "sha256": "e636d0b91fb9e0cb5adccfbbca5cae55c06b316e37074766ad8d0a1df49338e5"
+        },
+        {
+          "path": "nuggets_1101/2007.json",
+          "bytes": 16376,
+          "sha256": "a3aa17a31df7388417fe20f0b5e688d284595b66b5429b77a9b70cd6ebf95aa1"
+        },
+        {
+          "path": "nuggets_1101/2008.json",
+          "bytes": 221940,
+          "sha256": "68b4b02c32de0f12b8d576efd3ac05f450bee320c5bcf6e2f02acffc72d2b354"
+        },
+        {
+          "path": "nuggets_1101/2011.json",
+          "bytes": 57300,
+          "sha256": "e4fdf923d6381dd0603ee00ef3b5e1a55b225f63acbc5863792ed2e088dea2b5"
+        },
+        {
+          "path": "nuggets_1101/2014.json",
+          "bytes": 25261,
+          "sha256": "be704de8835b69811e06d58423cc01675eb7b8facd4c0d5444e8b108179ae35a"
+        },
+        {
+          "path": "nuggets_1101/2017.json",
+          "bytes": 104717,
+          "sha256": "27e4d4eca00c9306aaf8450c296ba74d696a7a755119d07841dab96f0bdff369"
+        },
+        {
+          "path": "nuggets_1101/2025.json",
+          "bytes": 122644,
+          "sha256": "98d49cdeea24a404aff8ad43d664c50774ae640c2a5b7818c6b7134e9a495b42"
+        },
+        {
+          "path": "nuggets_1101/2030.json",
+          "bytes": 53662,
+          "sha256": "266c8fa540768a97073dc24c13ef046e952c929235a7ab48356c980005d1bdd0"
+        },
+        {
+          "path": "nuggets_1101/2031.json",
+          "bytes": 50527,
+          "sha256": "1e44514af2b5b837fd3644c8c1e62e9cac5db5ffc749c1942165a17f115c086d"
+        },
+        {
+          "path": "nuggets_1101/2036.json",
+          "bytes": 79811,
+          "sha256": "ed2bc66be779407cbde047a3d7b59f6e06751f881816e4ffef52fb82842b9276"
+        },
+        {
+          "path": "nuggets_1101/2039.json",
+          "bytes": 296319,
+          "sha256": "f50a5398661d79def097da0b2ec5726252dc2fe9c4a3ed0f638b6b273ce01053"
+        },
+        {
+          "path": "nuggets_1101/2041.json",
+          "bytes": 69834,
+          "sha256": "f0e6544942337502b90b634668ffb10c725eac5a69df8ca30d3505b8007fa758"
+        },
+        {
+          "path": "nuggets_1101/2046.json",
+          "bytes": 16243,
+          "sha256": "c27a1da17711751e1670acd2082dd51e3f83329f06b3d1f19c54ab4dea6d86db"
+        },
+        {
+          "path": "nuggets_1101/2048.json",
+          "bytes": 37353,
+          "sha256": "d5cfeedc933141bdae21cec9862191306aa9b4b790d50aadb7e08b67a8ccfbd7"
+        },
+        {
+          "path": "nuggets_1101/2052.json",
+          "bytes": 26109,
+          "sha256": "50c6c929b265f4bcdf18bb6eee047d7b93824ef2907f92e6a3a6b352a87f4343"
+        },
+        {
+          "path": "nuggets_1101/2053.json",
+          "bytes": 30063,
+          "sha256": "3c0e81d33e380e25b9d89db460f056f816fda3f54b704a721e32225473ebc964"
+        },
+        {
+          "path": "nuggets_1101/2055.json",
+          "bytes": 26482,
+          "sha256": "e87fd0485a055b51e169db5b71e3660c7c78fb3dfef5410562a9c2bdc3f6e4f4"
+        },
+        {
+          "path": "nuggets_1101/2057.json",
+          "bytes": 115727,
+          "sha256": "c7d336ca73c9c213ef6c24436479f1316e30d94528b20839d75f5380f14d425f"
+        },
+        {
+          "path": "nuggets_1101/2059.json",
+          "bytes": 15938,
+          "sha256": "8ad22daff41c2eda55809371fa88e97261c72be3b6e341e55c127f8154041790"
+        },
+        {
+          "path": "nuggets_1101/2062.json",
+          "bytes": 22494,
+          "sha256": "0fb61f1865ab0edb04df2943563749e13341e1a10740c8dd9b1e978601f3689d"
+        },
+        {
+          "path": "nuggets_1101/2063.json",
+          "bytes": 82320,
+          "sha256": "79be8e1a5f70e78ebba3c6f4ce35cc1f79fdb3ddbdcc6bfde6c8d3c93cb7ed5b"
+        },
+        {
+          "path": "nuggets_1101/2064.json",
+          "bytes": 67013,
+          "sha256": "910304717eb880cd2d443edad212c65ff9b39c3565b31be41908aca16445c4f7"
+        },
+        {
+          "path": "nuggets_1101/2066.json",
+          "bytes": 28070,
+          "sha256": "cd0b6706dae2ef05aaa678a38fe6760f3345510624836b0d0eb29a10800efdf3"
+        },
+        {
+          "path": "nuggets_1101/2069.json",
+          "bytes": 13508,
+          "sha256": "a81d2010a39c98cc545a3fc00ef3178d42acb41f3cbae51e41aa6b7475649a7e"
+        },
+        {
+          "path": "nuggets_1101/2071.json",
+          "bytes": 444450,
+          "sha256": "122ea89d3a33884c69039731be3812c3c8c7ac398afb07ea6dd81d433e01d967"
+        },
+        {
+          "path": "nuggets_1101/2077.json",
+          "bytes": 10261,
+          "sha256": "d023e2ce0d6590d60f3d522a09e70a0d3399a606199823f673b4554caa44d220"
+        },
+        {
+          "path": "nuggets_1101/2078.json",
+          "bytes": 10070,
+          "sha256": "16d1faab53f07d2f61df5efe33443bab479ccb79085350d7bb7057855300e1e8"
+        },
+        {
+          "path": "nuggets_1101/2079.json",
+          "bytes": 9824,
+          "sha256": "db6f02e438b9f614327e77c6af3a26c63f1cebbd742b24ab65de75e3fb30390c"
+        },
+        {
+          "path": "nuggets_1101/2087.json",
+          "bytes": 188777,
+          "sha256": "b6b9819e92312dbcd692d43a8fac51dc958747d7ba42305ecca1174322a4e98b"
+        },
+        {
+          "path": "nuggets_1101/2091.json",
+          "bytes": 20585,
+          "sha256": "c964c7cf41a6f417b74281973cdc3c6c7f0e141aad757ad13368bade172b7328"
+        },
+        {
+          "path": "nuggets_1101/2096.json",
+          "bytes": 12585,
+          "sha256": "bed45fdf40d8e96bd986d4af6e15d122298bd45e7a955b8c660958c51d9dbfbb"
+        },
+        {
+          "path": "nuggets_1101/2097.json",
+          "bytes": 29698,
+          "sha256": "02f0dd6bcb70dd37af1355e8af421b2e0f5a1d574189b461b25b526f5a4a20aa"
+        },
+        {
+          "path": "nuggets_1101/2098.json",
+          "bytes": 47466,
+          "sha256": "39e23fad14cd71cb09400b05d8166bde2647855a5509b7be9bcfa9b9de91ab25"
+        }
+      ]
+    }
+  ]
+}

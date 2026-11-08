@@ -13,6 +13,13 @@ should be reproducible and auditable from its folder alone.
 | --- | --- | --- | --- | --- | --- |
 | [`np-nugget-sol-v1`](np-nugget-sol-v1/) | Report generation | 103 / 103 | **submitted 2026-08-13** | AutoJudge `ragtime26` `--strict`: 103/103 ✅ | [LEDGER.md](np-nugget-sol-v1/LEDGER.md) |
 
+## Organizer results
+
+The results for `np-nugget-sol-v1` are recorded in
+[results/2026-11-02](../results/2026-11-02/README.md), with the original organizer
+archives, score tables, and offline verification. The two evaluations cover
+17 and 34 topics respectively; the submission itself contains 103 topics.
+
 ## Layout
 
 ```

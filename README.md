@@ -16,6 +16,12 @@ seam.
 3. Use the optional notebook helper with participant credentials when you are
    ready to query the private RAGTIME retrieval service.
 
+## Organizer Results
+
+The supplied November results for `np-nugget-sol-v1`, including the original
+archives and separate 17-topic and 34-topic score summaries, are recorded in
+[results/2026-11-02](results/2026-11-02/README.md).
+
 ## Run the Notebook
 
 Install [uv](https://docs.astral.sh/uv/) and run:
