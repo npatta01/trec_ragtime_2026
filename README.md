@@ -5,8 +5,13 @@ sentence-level citations to the original news articles.
 
 [Project site](https://npatta01.github.io/trec_ragtime_2026/) ·
 [Notebook paper (PDF)](paper/ragtime2026-np-draft.pdf) ·
-[Workshop slides](https://npatta01.github.io/trec_ragtime_2026/slides/ragtime2026.html) ·
-[92-second video](https://npatta01.github.io/trec_ragtime_2026/#film)
+[Workshop slides](https://npatta01.github.io/trec_ragtime_2026/slides/ragtime2026.html)
+
+## Video walkthrough
+
+https://github.com/user-attachments/assets/5ef5199d-f8cc-4b30-83a5-b731e5ab65fd
+
+[Captions and transcript](https://npatta01.github.io/trec_ragtime_2026/#film)
 
 ## Approach
 
