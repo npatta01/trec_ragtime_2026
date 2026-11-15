@@ -1,0 +1,54 @@
+WEBVTT
+
+00:00:00.550 --> 00:00:07.995
+At TREC RAGTIME 2026, NP Labs turned multilingual
+news into short English reports with citations.
+
+00:00:08.195 --> 00:00:13.187
+One topic asked how African penguin populations
+changed and what could protect them.
+
+00:00:13.567 --> 00:00:19.114
+DeepSeek produced eight English queries. One looked
+for conservation measures and fishing restrictions.
+
+00:00:19.314 --> 00:00:25.351
+The organizers’ search returned 100 hits per query
+across English, Spanish, Russian, and Chinese.
+
+00:00:25.731 --> 00:00:32.430
+Mixedbread reranked the English article text. News24
+rose from sixteenth to first for the fishing query.
+
+00:00:32.630 --> 00:00:39.201
+We selected 24 distinct articles across the ranked
+lists and kept 19 extracted claims for this topic.
+
+00:00:39.581 --> 00:00:47.709
+The supported claims guided GPT-5.6 Sol. The report
+cited News24 for a 2008 experiment.
+
+00:00:47.909 --> 00:00:54.757
+The study found that fishing restrictions slowed
+annual population decline from about 7% to 5%.
+
+00:00:55.137 --> 00:01:01.771
+For this topic, AutoARGUE supported all 36 citations
+and credited 10 of 16 reference nuggets.
+
+00:01:01.971 --> 00:01:09.139
+Selected articles contained all six missing details.
+All six were absent from the candidates Nuggetizer
+returned.
+
+00:01:09.339 --> 00:01:16.209
+News24 gave an estimate of 13,200 breeding pairs in
+2019 that the report missed.
+
+00:01:16.629 --> 00:01:23.989
+Across 34 topics, preliminary AutoARGUE scored our
+citation support at 95.73%.
+
+00:01:24.189 --> 00:01:29.970
+The report set covered 39.16% of reference nuggets
+across those same topics.
