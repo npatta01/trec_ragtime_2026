@@ -1,26 +1,43 @@
-# TREC RAGTIME 2026 Reference and Mini Viewer
+# NP Labs at TREC RAGTIME 2026
 
-This repository is a small working companion for TREC RAGTIME 2026. It combines
-an at-a-glance track reference with a runnable notebook that previews the
-RAGTIME2 data without downloading the full collection. Passage reranking starts
-with the local scorer; the optional Flash path is only an explicit transport
-seam.
+**Select the Evidence, Then Write** is our report-generation system for TREC RAGTIME 2026. It uses the organizers’ search endpoint and English translations to find evidence in English, Spanish, Russian, and Chinese news. Each report answers a research request in English and cites the original articles.
 
-## Start Here
+[Project page](https://npatta01.github.io/trec_ragtime_2026/) ·
+[Notebook paper (PDF)](paper/ragtime2026-np-draft.pdf) ·
+[Workshop slides (HTML)](https://npatta01.github.io/trec_ragtime_2026/slides/ragtime2026.html) ·
+[Workshop slides (PDF)](slides/ragtime2026.pdf) ·
+[Watch the 92-second video](https://npatta01.github.io/trec_ragtime_2026/#film)
 
-1. Read the [hosted quick reference and reproduction playbook](https://npatta01.github.io/trec_ragtime_2026/reports/2026-quick-reference-and-2025-reproduction-playbook/)
-   for the dataset layout, retrieval API, submission formats, timeline, and
-   useful 2025 system context.
-2. Open the [mini data viewer](notebooks/ragtime2_mini_viewer.ipynb) to inspect
-   live original-language and machine-translated samples from Hugging Face.
-3. Use the optional notebook helper with participant credentials when you are
-   ready to query the private RAGTIME retrieval service.
+[<img src="assets/ragtime-approach.jpg" alt="Approach video poster featuring an African penguin on a rocky shore" width="640">](https://npatta01.github.io/trec_ragtime_2026/#film)
+
+The video follows an African penguin conservation request from its search queries to the cited report and the organizer’s coverage judgments. [MP4](assets/ragtime-approach.mp4) · [English captions](assets/ragtime-approach.vtt) · [Video source](paper/approach-film/README.md)
+
+## Approach
+
+1. **Plan queries.** DeepSeek V4 Flash turns the request and requester background into one broad query and several focused queries, all in English.
+2. **Search and rerank.** We request 100 hits per query from the organizers’ four-language index. A Mixedbread cross-encoder reranks English originals and supplied translations for each query.
+3. **Extract nuggets.** We take up to 24 distinct articles in rounds across query lists. Nuggetizer extracts claims and labels each article’s support. We merge similar claims and retain up to 20 per topic.
+4. **Write with citations.** Claims backed by at least one full-support source guide GPT-5.6 Sol. The English report fits within 5,000 characters and cites original article IDs.
 
 ## Organizer Results
 
-The supplied November results for `np-nugget-sol-v1`, including the original
-archives and separate 17-topic and 34-topic score summaries, are recorded in
-[results/2026-11-02](results/2026-11-02/README.md).
+NP Labs submitted one run, **`np-nugget-sol-v1`**, with 103 topic records. The preliminary November 4 release includes an automated AutoARGUE assessment of 34 topics and a mostly-human assessment of 17 of those topics, using AutoARGUE judgments to fill gaps.
+
+| Measure | AutoARGUE (34 topics, micro) | Mostly human (17 topics, LLM-filled) |
+| --- | ---: | ---: |
+| Citation support | 95.73% | 93.72% |
+| Nugget coverage | 39.16% | 43.43% |
+| F1 | 55.59% | 57.15% |
+
+Citation support measures whether the cited article backs the sentence. Nugget coverage measures the share of organizer reference facts the report addresses. Citation support matched the reported maximum across 29 runs in each assessment. [Organizer score notes](results/2026-11-02/README.md) · [Submission ledger](submissions/np-nugget-sol-v1/LEDGER.md)
+
+On the penguin topic, AutoARGUE credited **10 of 16 reference nuggets** and judged **36 of 36 citations** supported. Selected articles contained all six missing details, including the cited News24 article’s estimate of 13,200 breeding pairs in 2019. All six details were absent from the candidates Nuggetizer returned. [Penguin coverage analysis](https://npatta01.github.io/trec_ragtime_2026/slides/ragtime2026.html#/coverage-gaps)
+
+## Start Here
+
+- [Track reference and 2025 reproduction playbook](https://npatta01.github.io/trec_ragtime_2026/reports/2026-quick-reference-and-2025-reproduction-playbook/) covers the data, API, submission formats, and earlier systems.
+- [RAGTIME2 mini data viewer](notebooks/ragtime2_mini_viewer.ipynb) loads original-language and translated examples from Hugging Face, with an optional participant search example.
+- [Pipeline implementation](src/trec_ragtime/) contains the reusable retrieval, reranking, extraction, and writing code.
 
 ## Run the Notebook
 

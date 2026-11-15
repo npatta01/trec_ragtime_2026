@@ -1,76 +1,179 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Project landing page for the TREC RAGTIME 2026 reference, reproduction playbook, and mini data viewer.">
-  <title>TREC RAGTIME 2026 Companion</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f4f7f9;
-      --paper: #ffffff;
-      --ink: #17202a;
-      --muted: #596775;
-      --line: #d8e1ea;
-      --accent: #0f766e;
-      --accent-dark: #0a5b55;
-      --soft: #e7f4f2;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--ink); }
-    a { color: var(--accent-dark); font-weight: 800; text-underline-offset: 0.16em; }
-    .skip-link { position: absolute; top: 12px; left: 16px; transform: translateY(-180%); padding: 10px 12px; border-radius: 6px; background: var(--ink); color: #fff; }
-    .skip-link:focus { transform: translateY(0); }
-    main { width: min(1040px, calc(100% - 32px)); margin: 0 auto; padding: 64px 0; }
-    header { max-width: 780px; margin-bottom: 32px; }
-    .kicker { margin: 0 0 10px; color: var(--accent); font-size: 0.8rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
-    h1, h2 { margin: 0; line-height: 1.12; }
-    h1 { font-size: clamp(2.4rem, 7vw, 5rem); }
-    h2 { font-size: 1.3rem; }
-    .lede { margin: 18px 0 0; color: var(--muted); font-size: 1.08rem; line-height: 1.65; }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
-    article { display: flex; min-height: 230px; flex-direction: column; padding: 26px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); box-shadow: 0 16px 40px rgba(31, 45, 61, 0.07); }
-    article:first-child { border-top: 5px solid var(--accent); }
-    article p { color: var(--muted); line-height: 1.6; }
-    .action { align-self: flex-start; margin-top: auto; padding: 10px 14px; border-radius: 8px; background: var(--accent); color: #fff; text-decoration: none; }
-    .action:hover, .action:focus-visible { background: var(--accent-dark); }
-    .secondary { background: var(--soft); color: var(--accent-dark); }
-    .secondary:hover, .secondary:focus-visible { background: #d4ebe7; }
-    footer { margin-top: 28px; color: var(--muted); font-size: 0.92rem; }
-    @media (max-width: 700px) {
-      main { padding: 40px 0; }
-      .grid { grid-template-columns: 1fr; }
-      article { min-height: 0; }
-    }
-  </style>
+  <meta name="description" content="NP Labs at TREC RAGTIME 2026. See how we selected evidence from a multilingual news collection and wrote short, cited English reports.">
+  <title>TREC RAGTIME 2026 · NP Labs</title>
+  <link rel="stylesheet" href="assets/site.css">
 </head>
-<body>
-  <a class="skip-link" href="#resources">Skip to project resources</a>
-  <main>
-    <header>
-      <p class="kicker">Working companion</p>
-      <h1>TREC RAGTIME 2026</h1>
-      <p class="lede">Reference material and a lightweight notebook for exploring the RAGTIME2 collection, understanding the current track, and learning from the strongest 2025 system patterns.</p>
-    </header>
+<body id="top">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="topbar">
+    <div class="shell topbar-inner">
+      <a class="brand" href="#top">
+        <span class="brand-mark" aria-hidden="true">NP</span>
+        <span>TREC RAGTIME 2026</span>
+      </a>
+      <nav aria-label="Project navigation">
+        <a href="#film">Video</a>
+        <a href="#approach">Approach</a>
+        <a href="#results">Results</a>
+        <a href="#resources">Resources</a>
+        <a href="https://github.com/npatta01/trec_ragtime_2026">GitHub</a>
+      </nav>
+    </div>
+  </header>
 
-    <section id="resources" class="grid" aria-label="Project resources">
-      <article>
-        <h2>Track Reference and Reproduction Playbook</h2>
-        <p>Review the 2026 dataset, search API, submission formats, schedule, and scoring notes, followed by a practical synthesis of eight 2025 system families.</p>
-        <a class="action" href="reports/2026-quick-reference-and-2025-reproduction-playbook/">Open the report</a>
-      </article>
-      <article>
-        <h2>RAGTIME2 Mini Data Viewer</h2>
-        <p>Inspect bounded original-language and machine-translated samples from Hugging Face, with an optional private retrieval API example.</p>
-        <a class="action secondary" href="https://github.com/npatta01/trec_ragtime_2026/blob/main/notebooks/ragtime2_mini_viewer.ipynb">Open the notebook</a>
-      </article>
+  <main id="main" tabindex="-1">
+    <section class="hero" aria-labelledby="project-title">
+      <div class="shell hero-inner">
+        <div>
+          <p class="eyebrow">NP Labs · NIST TREC 2026</p>
+          <h1 id="project-title">Select the evidence,<br>then write</h1>
+          <p class="lede">We turned research requests into short English reports with citations. We used the organizers’ search endpoint and supplied translations, then reranked articles and extracted claims to guide each report.</p>
+          <div class="actions">
+            <a class="button primary" href="paper/ragtime2026-np-draft.pdf">Read the paper (PDF)</a>
+            <a class="button" href="#film">Watch the video</a>
+            <a class="button" href="slides/ragtime2026.html">Workshop slides</a>
+          </div>
+        </div>
+        <figure class="hero-figure">
+          <img class="hero-art" src="slides/art/african-penguin.jpg" width="1080" height="1080"
+               alt="Illustration of an African penguin standing on a rocky shore">
+          <figcaption>Workshop example · African penguin conservation</figcaption>
+        </figure>
+      </div>
     </section>
 
-    <footer>
-      <p>Source code and setup instructions are available in the <a href="https://github.com/npatta01/trec_ragtime_2026">GitHub repository</a>.</p>
-    </footer>
+    <section id="film" class="section" aria-labelledby="film-title">
+      <div class="shell">
+        <h2 id="film-title">From a penguin query to a cited report</h2>
+        <p class="section-intro">Follow one News24 article from its search rank to the submitted report, then see how AutoARGUE scored it.</p>
+        <figure class="film">
+          <video controls playsinline preload="metadata" poster="assets/ragtime-approach.jpg"
+                 width="1600" height="900" aria-label="RAGTIME approach and penguin report example">
+            <source src="assets/ragtime-approach.mp4" type="video/mp4">
+            <track src="assets/ragtime-approach.vtt" kind="captions" srclang="en" label="English">
+            <a href="assets/ragtime-approach.mp4">Watch the video (MP4)</a>
+          </video>
+          <figcaption>
+            92 seconds · Synthetic narration · <a href="assets/ragtime-approach.vtt">English captions (VTT)</a> ·
+            <a href="assets/ragtime-approach.mp4" download>Download MP4</a>
+          </figcaption>
+        </figure>
+        <details class="transcript">
+          <summary>Video transcript</summary>
+          <p>At TREC RAGTIME 2026, NP Labs turned multilingual news into short English reports with citations. One topic asked how African penguin populations changed and what could protect them.</p>
+          <p>DeepSeek produced eight English queries. One looked for conservation measures and fishing restrictions. The organizers’ search returned 100 hits per query across English, Spanish, Russian, and Chinese.</p>
+          <p>Mixedbread reranked the English article text. News24 rose from sixteenth to first for the fishing query. We selected 24 distinct articles across the ranked lists and kept 19 extracted claims for this topic.</p>
+          <p>The supported claims guided GPT-5.6 Sol. The report cited News24 for a 2008 experiment. The study found that fishing restrictions slowed annual population decline from about 7% to 5%.</p>
+          <p>For this topic, AutoARGUE supported all 36 citations and credited 10 of 16 reference nuggets. Selected articles contained all six missing details. All six were absent from the candidates Nuggetizer returned. News24 gave an estimate of 13,200 breeding pairs in 2019 that the report missed.</p>
+          <p>Across 34 topics, preliminary AutoARGUE scored our citation support at 95.73%. The report set covered 39.16% of reference nuggets across those same topics.</p>
+        </details>
+      </div>
+    </section>
+
+    <section id="approach" class="section" aria-labelledby="approach-title">
+      <div class="shell">
+        <h2 id="approach-title">How the report is built</h2>
+        <ol class="pipeline" role="list" aria-label="Submitted report generation pipeline">
+          <li class="card">
+            <h3>Plan queries</h3>
+            <p>DeepSeek turns the request and requester background into one broad query and several focused queries, all in English.</p>
+          </li>
+          <li class="card">
+            <h3>Search and rerank</h3>
+            <p>We request 100 hits per query from the organizers’ four-language index. We rerank English originals and supplied translations with Mixedbread.</p>
+          </li>
+          <li class="card">
+            <h3>Extract nuggets</h3>
+            <p>Select up to 24 distinct articles round-robin. Nuggetizer extracts claims and labels article support. We merge similar claims and retain up to 20.</p>
+          </li>
+          <li class="card violet">
+            <h3>Write and cite</h3>
+            <p>Claims with full support guide GPT-5.6 Sol. The final report is capped at 5,000 characters and cites original article IDs.</p>
+          </li>
+        </ol>
+        <p class="section-link"><a href="paper/ragtime2026-np-draft.pdf">Method and settings in the notebook paper</a></p>
+      </div>
+    </section>
+
+    <section id="results" class="section" aria-labelledby="results-title">
+      <div class="shell">
+        <h2 id="results-title">Preliminary organizer results</h2>
+        <p class="section-intro">We submitted one run, <code>np-nugget-sol-v1</code>, with 103 topic records. AutoARGUE scored 34 topics automatically. The mostly-human assessment used human judgments where available and AutoARGUE judgments to fill gaps on 17 of those topics.</p>
+        <div class="card scorecard">
+          <table>
+            <caption class="sr-only">Preliminary scores for the same submission under two evaluations</caption>
+            <thead>
+              <tr>
+                <th scope="col">Measure</th>
+                <th scope="col">AutoARGUE<span>34 topics · Micro</span></th>
+                <th scope="col">Mostly human<span>17 topics · LLM-filled</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">Citation support</th><td>95.73%</td><td>93.72%</td></tr>
+              <tr><th scope="row">Nugget coverage</th><td>39.16%</td><td>43.43%</td></tr>
+              <tr><th scope="row">F1</th><td>55.59%</td><td>57.15%</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="section-note">Citation support measures whether each cited article backs its sentence. Nugget coverage measures the share of organizer reference facts the report addresses. Our citation support matched the reported maximum across 29 runs in each evaluation.</p>
+        <p class="section-link"><a href="https://github.com/npatta01/trec_ragtime_2026/blob/main/results/2026-11-02/README.md">Organizer score notes</a></p>
+
+        <aside class="case-study" aria-labelledby="case-title">
+          <div>
+            <p class="eyebrow">Topic 2014 · AutoARGUE</p>
+            <h3 id="case-title">What the penguin report missed</h3>
+          </div>
+          <div>
+            <p>AutoARGUE credited <strong>10 of 16</strong> reference nuggets and judged all <strong>36 citations</strong> supported. The selected articles contained all six details missing from the report, including News24’s estimate of <strong>13,200 breeding pairs in 2019</strong>. All six were absent from Nuggetizer’s returned candidates.</p>
+            <p class="section-link"><a href="slides/ragtime2026.html#/coverage-gaps">See the six gaps in the workshop slides</a></p>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="resources" class="section" aria-labelledby="resources-title">
+      <div class="shell">
+        <h2 id="resources-title">Project resources</h2>
+        <div class="grid">
+          <article class="card violet">
+            <h3>Paper and workshop</h3>
+            <ul class="links">
+              <li><a href="paper/ragtime2026-np-draft.pdf">Notebook paper (PDF)</a></li>
+              <li><a href="slides/ragtime2026.html">Workshop slides (HTML)</a></li>
+              <li><a href="slides/ragtime2026.pdf">Workshop slides (PDF)</a></li>
+            </ul>
+          </article>
+          <article class="card green">
+            <h3>Run and evaluation</h3>
+            <ul class="links">
+              <li><a href="https://github.com/npatta01/trec_ragtime_2026/blob/main/submissions/np-nugget-sol-v1/LEDGER.md">Submission ledger</a></li>
+              <li><a href="https://github.com/npatta01/trec_ragtime_2026/blob/main/paper/organizer-results-table.json">Preliminary score table (JSON)</a></li>
+              <li><a href="https://docs.google.com/document/d/1XqypNTHxIdazxfnUebrp-EsUuGNhodhQGrJIDnYGaB4/edit">Official track guidelines</a></li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Code and data</h3>
+            <ul class="links">
+              <li><a href="https://github.com/npatta01/trec_ragtime_2026/tree/main/src/trec_ragtime">Pipeline implementation</a></li>
+              <li><a href="https://github.com/npatta01/trec_ragtime_2026/blob/main/notebooks/ragtime2_mini_viewer.ipynb">RAGTIME2 mini data viewer</a></li>
+              <li><a href="reports/2026-quick-reference-and-2025-reproduction-playbook/">Track reference and reproduction playbook</a></li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
   </main>
+
+  <footer>
+    <div class="shell footer-inner">
+      <p>NP Labs · Nidhin Pattaniyil, Tanwir Zaman, Semih Yagli</p>
+      <a href="https://github.com/npatta01/trec_ragtime_2026#readme">Repository README</a>
+    </div>
+  </footer>
 </body>
 </html>

@@ -1,0 +1,69 @@
+[
+  {
+    "id": "intro",
+    "text": "At TREC RAGTIME 2026, NP Labs turned multilingual news into short English reports with citations.",
+    "spoken": "At Treck Rag Time twenty twenty-six, N P Labs turned multilingual news into short English reports with citations."
+  },
+  {
+    "id": "request",
+    "text": "One topic asked how African penguin populations changed and what could protect them."
+  },
+  {
+    "id": "plan",
+    "text": "DeepSeek produced eight English queries. One looked for conservation measures and fishing restrictions.",
+    "gap": 0.38
+  },
+  {
+    "id": "search",
+    "text": "The organizers’ search returned 100 hits per query across English, Spanish, Russian, and Chinese.",
+    "spoken": "The organizers' search returned a hundred hits per query across English, Spanish, Russian, and Chinese."
+  },
+  {
+    "id": "rank",
+    "text": "Mixedbread reranked the English article text. News24 rose from sixteenth to first for the fishing query.",
+    "spoken": "Mixed Bread reranked the English article text. News Twenty Four rose from sixteenth to first for the fishing query.",
+    "gap": 0.38
+  },
+  {
+    "id": "select",
+    "text": "We selected 24 distinct articles across the ranked lists and kept 19 extracted claims for this topic.",
+    "spoken": "We selected twenty-four distinct articles across the ranked lists and kept nineteen extracted claims for this topic."
+  },
+  {
+    "id": "write",
+    "text": "The supported claims guided GPT-5.6 Sol. The report cited News24 for a 2008 experiment.",
+    "spoken": "The supported claims guided G P T five point six Sol. The report cited News Twenty Four for a two thousand eight experiment.",
+    "gap": 0.38
+  },
+  {
+    "id": "finding",
+    "text": "The study found that fishing restrictions slowed annual population decline from about 7% to 5%.",
+    "spoken": "The study found that fishing restrictions slowed annual population decline from about seven percent to five percent."
+  },
+  {
+    "id": "case",
+    "text": "For this topic, AutoARGUE supported all 36 citations and credited 10 of 16 reference nuggets.",
+    "spoken": "For this topic, Auto Argue supported all thirty-six citations and credited ten of sixteen reference nuggets.",
+    "gap": 0.38
+  },
+  {
+    "id": "gap",
+    "text": "Selected articles contained all six missing details. All six were absent from the candidates Nuggetizer returned."
+  },
+  {
+    "id": "same",
+    "text": "News24 gave an estimate of 13,200 breeding pairs in 2019 that the report missed.",
+    "spoken": "News Twenty Four gave an estimate of thirteen thousand two hundred breeding pairs in twenty nineteen that the report missed."
+  },
+  {
+    "id": "results",
+    "text": "Across 34 topics, preliminary AutoARGUE scored our citation support at 95.73%.",
+    "spoken": "Across thirty-four topics, preliminary Auto Argue scored our citation support at ninety-five point seven three percent.",
+    "gap": 0.42
+  },
+  {
+    "id": "end",
+    "text": "The report set covered 39.16% of reference nuggets across those same topics.",
+    "spoken": "The report set covered thirty-nine point one six percent of reference nuggets across those same topics."
+  }
+]
