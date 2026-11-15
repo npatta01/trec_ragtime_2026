@@ -9,7 +9,7 @@ sentence-level citations to the original news articles.
 
 ## Video walkthrough
 
-[<img src="assets/ragtime-approach.jpg" alt="Play the 92-second African penguin walkthrough" width="560">](https://npatta01.github.io/trec_ragtime_2026/#film)
+https://github.com/user-attachments/assets/5ef5199d-f8cc-4b30-83a5-b731e5ab65fd
 
 [Captions and transcript](https://npatta01.github.io/trec_ragtime_2026/#film)
 
