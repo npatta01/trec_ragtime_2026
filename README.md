@@ -5,8 +5,13 @@ sentence-level citations to the original news articles.
 
 [Project site](https://npatta01.github.io/trec_ragtime_2026/) ·
 [Notebook paper (PDF)](paper/ragtime2026-np-draft.pdf) ·
-[Workshop slides](https://npatta01.github.io/trec_ragtime_2026/slides/ragtime2026.html) ·
-[92-second video](https://npatta01.github.io/trec_ragtime_2026/#film)
+[Workshop slides](https://npatta01.github.io/trec_ragtime_2026/slides/ragtime2026.html)
+
+## Video walkthrough
+
+[<img src="assets/ragtime-approach.jpg" alt="Play the 92-second African penguin walkthrough" width="560">](https://npatta01.github.io/trec_ragtime_2026/#film)
+
+[Captions and transcript](https://npatta01.github.io/trec_ragtime_2026/#film)
 
 ## Approach
 
