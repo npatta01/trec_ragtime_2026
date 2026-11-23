@@ -1,8 +1,10 @@
 # TREC RAGTIME 2026 talk
 
-[Self-contained HTML deck](ragtime2026.html) · [PDF slides](ragtime2026.pdf)
+[Self-contained HTML deck](ragtime2026.html) · [PDF slides (29 pages)](ragtime2026.pdf)
 
-The opening illustration shows a request and news in four languages becoming a cited English report. The talk follows Topic 2014, African penguin conservation, from the original request and DeepSeek queries to the organizer scores. Advance with the right arrow to reveal the supplied English translation and the proposed coverage check. Press **S** for speaker notes and **Esc** for an overview. Use the appearance button or press **D** to cycle Auto, Dark, Light, and Storybook. The PDF shows both versions of the translated excerpt.
+The PDF preserves the presentation layout and includes all 28 slides. The translation slide appears on consecutive pages: the original Chinese excerpt, followed by the supplied English translation.
+
+The opening illustration shows a request and news in four languages becoming a cited English report. The talk follows Topic 2014, African penguin conservation, from the original request and DeepSeek queries to the organizer scores. Advance with the right arrow to reveal the supplied English translation and the proposed coverage check. Press **S** for speaker notes and **Esc** for an overview. Use the appearance button or press **D** to cycle Auto, Dark, Light, and Storybook.
 
 Edit `ragtime2026.qmd` and `ragtime.scss`. Build the self-contained browser deck from the repository root.
 
